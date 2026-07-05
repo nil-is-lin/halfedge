@@ -315,7 +315,8 @@ $$V' = 12 + 20 = 32, \quad F' = 60, \quad E' = 90, \quad V'-E'+F' = 32-90+60 = 2
   \item \textbf{孤立顶点}：valence $=0$ 时保持原位置；
   \item \textbf{无效 ID}：所有 \texttt{mesh.get\_*} 返回 \texttt{None} 时跳过；
   \item \textbf{空网格}：$n_{\text{orig}}=0$ 或 $n_{\text{faces}}=0$ 时直接返回；
-  \item \textbf{非三角面}：面边界环长度 $\neq 3$ 时跳过该面；
+  \item \textbf{非三角面}：面边界环长度 $\neq 3$ 时跳过该面，并通过 \texttt{eprintln!}
+        输出警告到 stderr（含跳过面数与替代建议 \texttt{catmull\_clark\_subdivide}）；
   \item \textbf{拓扑断开}：半边无 twin 时跳过该边；
   \item \textbf{退化边}：$i_o = i_t$（自环）时跳过。
 \end{itemize}
@@ -361,11 +362,14 @@ $$V' = 12 + 20 = 32, \quad F' = 60, \quad E' = 90, \quad V'-E'+F' = 32-90+60 = 2
   \midrule
   \multicolumn{2}{l}{\textit{空网格}} \\
   \texttt{sqrt3\_empty\_mesh} & 空网格返回空网格 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{非三角面跳过 + 警告}} \\
+  \texttt{sqrt3\_skips\_non\_triangle\_with\_warning} & 单四边形面输入：跳过，输出 0 面（stderr 警告） \\
   \bottomrule
 \end{longtable}
 }
 
-共 15 个单元测试，全部通过。全库 \texttt{cargo test} 共 371 个用例，0 失败。
+共 16 个单元测试，全部通过。全库 \texttt{cargo test} 共 498 个用例，0 失败。
 
 \section{设计取舍}
 

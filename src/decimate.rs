@@ -106,7 +106,13 @@ impl Quadric {
     /// [ q01 q11 q12 ] [y] = [-q13]
     /// [ q02 q12 q22 ] [z]   [-q23]
     /// ```
-    /// 用 Cramer 法则求解。矩阵奇异（$|\det| < 10^{-12}$）时返回 `None`。
+    /// 用 Cramer 法则求解。矩阵奇异时返回 `None`。
+    ///
+    /// **奇异性判定**：使用相对于矩阵 Frobenius 范数的阈值
+    /// $|\det A| < \varepsilon \cdot \|A\|_F^3$（$\varepsilon = 10^{-12}$），
+    /// 而非绝对阈值 $10^{-12}$。绝对阈值在矩阵元素量级较大时
+    /// （如多次 decimation 累积后元素 $\sim 10^4$，$\det \sim 10^{12}$）
+    /// 会失效：把本应可解的系统误判为奇异。
     fn find_optimal_position(&self) -> Option<[f64; 3]> {
         let q = &self.data;
         let (q00, q01, q02, q03) = (q[0], q[1], q[2], q[3]);
@@ -116,7 +122,17 @@ impl Quadric {
         let det = q00 * (q11 * q22 - q12 * q12) - q01 * (q01 * q22 - q12 * q02)
             + q02 * (q01 * q12 - q11 * q02);
 
-        if det.abs() < 1e-12 {
+        // 相对阈值：以 Frobenius 范数的立方为矩阵规模尺度
+        // 对称矩阵 |A|_F² = q00² + 2(q01² + q02² + q12²) + q11² + q22²
+        let norm_sq = q00 * q00
+            + 2.0 * (q01 * q01 + q02 * q02 + q12 * q12)
+            + q11 * q11
+            + q22 * q22;
+        if norm_sq == 0.0 {
+            return None; // 零矩阵，奇异
+        }
+        let scale = norm_sq * norm_sq.sqrt(); // = ||A||_F^3
+        if det.abs() < 1e-12 * scale {
             return None;
         }
 
@@ -301,11 +317,14 @@ pub fn decimate_qem(mesh: &mut MeshStorage, target_faces: usize) -> Result<usize
         }
 
         // 过期条目检测（代价已更新）
+        // 使用相对容差 1e-9 * max(|heap|, |stored|, 1)：
+        // 绝对阈值在大坐标网格上（cost ~ 1e6）会把合法条目误判为过期
         let (stored_cost, stored_pos) = match cost_map.get(&he_id) {
             Some(&c) => c,
             None => continue,
         };
-        if (heap_cost - stored_cost).abs() > 1e-9 {
+        let tol = 1e-9 * heap_cost.abs().max(stored_cost.abs()).max(1.0);
+        if (heap_cost - stored_cost).abs() > tol {
             continue;
         }
 

@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use crate::io::build_mesh_from_vertices_and_faces;
+use crate::linalg::vec3;
 use crate::storage::MeshStorage;
 
 // ============================================================
@@ -82,7 +83,7 @@ const ICOSA_FACES: [[u32; 3]; 20] = [
 /// # 用途
 /// 仅用于测试与调试。生产场景请使用更高效的网格生成器。
 pub fn build_icosphere(subdivisions: usize) -> MeshStorage {
-    let mut vertices: Vec<[f64; 3]> = ICOSA_VERTICES.iter().map(|p| normalize(*p)).collect();
+    let mut vertices: Vec<[f64; 3]> = ICOSA_VERTICES.iter().map(|p| vec3::normalize(*p)).collect();
     let mut faces: Vec<[u32; 3]> = ICOSA_FACES.to_vec();
 
     for _ in 0..subdivisions {
@@ -133,20 +134,11 @@ fn midpoint(
         (pa[1] + pb[1]) * 0.5,
         (pa[2] + pb[2]) * 0.5,
     ];
-    let mid_normalized = normalize(mid);
+    let mid_normalized = vec3::normalize(mid);
     let idx = vertices.len() as u32;
     vertices.push(mid_normalized);
     cache.insert(key, idx);
     idx
-}
-
-#[inline]
-fn normalize(p: [f64; 3]) -> [f64; 3] {
-    let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-    if len < 1e-12 {
-        return p;
-    }
-    [p[0] / len, p[1] / len, p[2] / len]
 }
 
 // ============================================================

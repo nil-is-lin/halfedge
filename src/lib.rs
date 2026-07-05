@@ -21,6 +21,8 @@
 //! - [`connectivity`]：连通分量分析（面连通 / 顶点连通，BFS）。
 //! - [`orientation`]：面朝向一致性检测（`are_normals_consistent`/
 //!   `is_orientable`）与修复（`fix_orientations`）。
+//! - [`predicates`]：Shewchuk 鲁棒几何谓词（`orient2d` / `orient3d` /
+//!   `incircle` / `insphere`），自适应精度浮点运算，退化情况下保证符号精确。
 //! - [`weld`]：顶点焊接（按距离阈值合并邻近顶点）。
 //! - [`validate`]：拓扑自检（twin/next/悬空 ID/退化/流形约束的完整校验）。
 //! - [`io`]：OBJ 加载/保存（支持 n-gon）+ PLY ASCII 加载/保存 +
@@ -42,18 +44,23 @@ pub mod conformal;
 pub mod connectivity;
 pub mod decimate;
 pub mod deformation;
+pub mod direction_field;
 pub mod export;
 pub mod geodesics;
 pub mod geometry;
 pub mod ids;
+pub mod intrinsic;
 pub mod io;
 pub mod linalg;
 pub mod orientation;
 pub mod parameterization;
+pub mod predicates;
 pub mod primitives;
 pub mod property;
 pub mod query;
 pub mod remesh;
+pub mod repair;
+pub mod sdf;
 pub mod storage;
 pub mod subdiv;
 pub mod test_util;
@@ -83,6 +90,11 @@ pub use connectivity::{
 };
 pub use decimate::{decimate_qem, decimate_to_vertices};
 pub use deformation::{DeformationConstraint, arap_deformation, laplacian_deformation};
+pub use direction_field::{
+    FaceLocalFrame, Singularity, build_face_local_frames, compute_transport_angles,
+    detect_singularities, smoothest_cross_field, smoothest_frame_field, smoothest_nrosy,
+    smoothest_vector_field,
+};
 pub use export::mesh_to_vertex_index_buffers;
 pub use geodesics::{
     dijkstra_geodesic, dijkstra_multi_source_geodesic, dijkstra_shortest_path,
@@ -101,6 +113,10 @@ pub use geometry::{
     vertex_curvature, vertex_normal, vertex_normals_par,
 };
 pub use ids::{EdgeId, FaceId, HalfEdgeId, VertexId};
+pub use intrinsic::{
+    IntrinsicDelaunayStats, compute_intrinsic_lengths, intrinsic_cotan_weight, intrinsic_delaunay,
+    is_intrinsic_delaunay_edge,
+};
 pub use io::{
     MeshError, ObjError, PlyError, StlError, build_mesh_from_polygons,
     build_mesh_from_vertices_and_faces, format_obj, format_ply, format_stl_ascii,
@@ -113,11 +129,23 @@ pub use orientation::{are_normals_consistent, fix_orientations, is_orientable};
 pub use parameterization::{
     harmonic_parameterization, lscm, mvc_parameterization, tutte_embedding,
 };
+pub use predicates::{
+    incircle, insphere, is_ccw2d, is_collinear2d, is_convex_vertex2d, is_coplanar, orient2d,
+    orient3d, point_in_triangle_2d, signed_area2d, tet_signed_volume, triangle_area_2d,
+};
 pub use primitives::{
     build_cone, build_cube, build_cylinder, build_grid, build_torus, build_uv_sphere,
 };
 pub use property::{MeshProperties, PropertyHandle, PropertyStore};
 pub use remesh::{RemeshStats, isotropic_remesh, quick_remesh, remesh_to_length};
+pub use repair::{
+    RepairStats, detect_nonmanifold_edges, detect_nonmanifold_vertices, fill_all_holes, fill_hole,
+    remove_degenerate_faces, remove_face, remove_isolated_vertices, repair_mesh,
+};
+pub use sdf::{
+    McParams, Sdf, SdfBox, SdfCapsule, SdfDifference, SdfIntersection, SdfSmoothUnion, SdfSphere,
+    SdfTorus, SdfTranslate, SdfUnion, march_field, march_sdf,
+};
 pub use storage::{Face, HalfEdge, MeshStorage, Vertex};
 pub use subdiv::catmull_clark::catmull_clark_subdivide;
 pub use subdiv::loop_subdivide;
@@ -132,5 +160,5 @@ pub use traversal::{
     is_boundary_edge, is_boundary_vertex, is_closed,
 };
 pub use triangulation::{ear_clipping, ear_clipping_3d, fan_triangulation, fan_triangulation_3d};
-pub use validate::{ValidationError, check_topology, validate_topology};
+pub use validate::{ValidationError, check_topology, validate_first_error, validate_topology};
 pub use weld::weld_vertices;

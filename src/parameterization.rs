@@ -267,25 +267,106 @@ pub fn harmonic_parameterization(mesh: &MeshStorage) -> Option<Vec<[f64; 2]>> {
 
 /// Least Squares Conformal Maps（Lévy et al. 2002）。
 ///
-/// 固定 2 个顶点到 (0,0) 和 (1,0)，其余顶点自由求解。
+/// 固定 2 个**边界**顶点到 (0,0) 和 (1,0)，其余顶点自由求解。
 /// 不需要固定整个边界，适合任意边界形状。
+///
+/// # 边界顶点选取
+///
+/// 从最长的边界环中选取两个**几何距离最远**的边界顶点钉住，
+/// 以改善数值条件数（Lévy 2002 §4.2）。若网格为闭合曲面（无边界），
+/// 返回 `None`——LSCM 要求至少存在一条边界环。
 pub fn lscm(mesh: &MeshStorage) -> Option<Vec<[f64; 2]>> {
     let n = mesh.vertex_count();
     if n < 2 || mesh.face_count() == 0 {
         return None;
     }
 
-    let (laplacian, _v_idx) = build_full_cotan_laplacian(mesh);
+    let (laplacian, v_idx) = build_full_cotan_laplacian(mesh);
 
-    // 固定前两个顶点
+    // 收集有序边界顶点（取最长边界环）
+    let ordered_boundary = order_boundary_vertices(mesh);
+    if ordered_boundary.len() < 2 {
+        // 闭合网格或边界退化：LSCM 需要至少 2 个边界顶点
+        return None;
+    }
+
+    // 选取边界上几何距离最远的两个顶点（O(B^2)，B 为边界顶点数）。
+    // 对小边界（B < 1000）可接受；大边界可用「先取最远点对种子再细化」的
+    // 近似算法，但实际网格很少需要。
+    let (pin_a, pin_b) = pick_farthest_pair(mesh, &ordered_boundary)?;
+
     let mut fixed_uv = HashMap::new();
-    fixed_uv.insert(0, [0.0, 0.0]);
-    if n > 1 {
-        fixed_uv.insert(1, [1.0, 0.0]);
+    if let Some(&idx_a) = v_idx.get(&pin_a) {
+        fixed_uv.insert(idx_a, [0.0, 0.0]);
+    }
+    if let Some(&idx_b) = v_idx.get(&pin_b) {
+        fixed_uv.insert(idx_b, [1.0, 0.0]);
+    }
+    if fixed_uv.len() < 2 {
+        return None;
     }
 
     let (a, rhs_u, rhs_v) = apply_dirichlet(laplacian, n, &fixed_uv)?;
     solve_param_system(&a, &rhs_u, &rhs_v, n)
+}
+
+/// 从顶点列表中选取几何距离最远的两个顶点。
+fn pick_farthest_pair(
+    mesh: &MeshStorage,
+    verts: &[VertexId],
+) -> Option<(VertexId, VertexId)> {
+    if verts.len() < 2 {
+        return None;
+    }
+    // 简化：先取 verts[0] 与最远点 p1，再取 p1 与最远点 p2。
+    // 这是「最远点对」的 O(B) 近似（真实最优为 O(B log B) 旋转卡壳，或 O(B^2) 暴力）。
+    // 对 LSCM 钉点用途足够：仅需两点足够远以改善条件数，不要求精确最优。
+    let pos_of = |v: VertexId| -> Option<[f64; 3]> {
+        mesh.get_vertex(v).map(|vd| vd.position)
+    };
+
+    let p0 = verts[0];
+    let p0_pos = pos_of(p0)?;
+
+    // 第一轮：找离 p0 最远的点 p1
+    let mut p1 = p0;
+    let mut best_dist_sq = -1.0f64;
+    for &v in verts {
+        if let Some(pos) = pos_of(v) {
+            let d = dist_sq(p0_pos, pos);
+            if d > best_dist_sq {
+                best_dist_sq = d;
+                p1 = v;
+            }
+        }
+    }
+
+    // 第二轮：找离 p1 最远的点 p2
+    let p1_pos = pos_of(p1)?;
+    let mut p2 = p1;
+    let mut best_dist_sq = -1.0f64;
+    for &v in verts {
+        if let Some(pos) = pos_of(v) {
+            let d = dist_sq(p1_pos, pos);
+            if d > best_dist_sq {
+                best_dist_sq = d;
+                p2 = v;
+            }
+        }
+    }
+
+    if p1 == p2 {
+        return None;
+    }
+    Some((p1, p2))
+}
+
+#[inline]
+fn dist_sq(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let dz = b[2] - a[2];
+    dx * dx + dy * dy + dz * dz
 }
 
 // ============================================================
@@ -484,21 +565,87 @@ mod tests {
         assert!(result.is_some(), "LSCM should succeed on a simple quad");
         let uv = result.unwrap();
         assert_eq!(uv.len(), 4);
-        // 固定顶点检查
-        assert!(
-            (uv[0][0] - 0.0).abs() < 0.1,
-            "v0 pinned to (0,0), got ({},{})",
-            uv[0][0],
-            uv[0][1]
+
+        // 所有 UV 应为有限值
+        for v in &uv {
+            assert!(v[0].is_finite(), "u 有限值, got {}", v[0]);
+            assert!(v[1].is_finite(), "v 有限值, got {}", v[1]);
+        }
+
+        // 应有恰好 2 个顶点被钉在 (0,0) 和 (1,0)（边界最远点对）
+        let n_pinned_zero = uv
+            .iter()
+            .filter(|p| (p[0].abs() < 1e-6) && (p[1].abs() < 1e-6))
+            .count();
+        let n_pinned_one = uv
+            .iter()
+            .filter(|p| ((p[0] - 1.0).abs() < 1e-6) && (p[1].abs() < 1e-6))
+            .count();
+        assert_eq!(
+            n_pinned_zero, 1,
+            "应有 1 个顶点钉在 (0,0), 实际 {}",
+            n_pinned_zero
         );
-        assert!((uv[0][1] - 0.0).abs() < 0.1);
-        assert!(
-            (uv[1][0] - 1.0).abs() < 0.1,
-            "v1 pinned to (1,0), got ({},{})",
-            uv[1][0],
-            uv[1][1]
+        assert_eq!(
+            n_pinned_one, 1,
+            "应有 1 个顶点钉在 (1,0), 实际 {}",
+            n_pinned_one
         );
-        assert!((uv[1][1] - 0.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_lscm_returns_none_on_closed_mesh() {
+        // LSCM 需要边界环；闭合网格应返回 None
+        let mesh = crate::test_util::build_icosphere(1);
+        // icosphere 是闭合网格
+        let result = lscm(&mesh);
+        assert!(
+            result.is_none(),
+            "闭合网格无边界，LSCM 应返回 None, 实际得到 Some"
+        );
+    }
+
+    #[test]
+    fn test_lscm_pinned_vertices_are_boundary() {
+        // 验证钉住的是边界顶点而非内部顶点
+        // 构造：1 个内部顶点 + 4 个边界顶点的扇形
+        let mut mesh = MeshStorage::new();
+        let center = mesh.add_vertex(crate::storage::Vertex::new([0.5, 0.5, 0.0]));
+        let v0 = mesh.add_vertex(crate::storage::Vertex::new([0.0, 0.0, 0.0]));
+        let v1 = mesh.add_vertex(crate::storage::Vertex::new([1.0, 0.0, 0.0]));
+        let v2 = mesh.add_vertex(crate::storage::Vertex::new([1.0, 1.0, 0.0]));
+        let v3 = mesh.add_vertex(crate::storage::Vertex::new([0.0, 1.0, 0.0]));
+        // 4 个三角形构成以 center 为内部顶点的扇形
+        crate::topology_ops::add_triangle(&mut mesh, center, v0, v1).unwrap();
+        crate::topology_ops::add_triangle(&mut mesh, center, v1, v2).unwrap();
+        crate::topology_ops::add_triangle(&mut mesh, center, v2, v3).unwrap();
+        crate::topology_ops::add_triangle(&mut mesh, center, v3, v0).unwrap();
+
+        // center 是内部顶点（不在边界上）
+        assert!(!is_boundary_vertex(&mesh, center));
+        for &v in &[v0, v1, v2, v3] {
+            assert!(is_boundary_vertex(&mesh, v));
+        }
+
+        let result = lscm(&mesh);
+        assert!(result.is_some(), "LSCM 应成功");
+        let uv = result.unwrap();
+        assert_eq!(uv.len(), 5);
+
+        // 内部顶点 center 的索引在某些位置，但不应被钉在 (0,0) 或 (1,0)
+        // 找到 center 在结果中的索引
+        let v_idx = build_vertex_index(&mesh);
+        let center_idx = *v_idx.get(&center).unwrap();
+        let center_uv = uv[center_idx];
+        // center 不应被钉在 (0,0) 或 (1,0)
+        let is_pinned_zero = (center_uv[0].abs() < 1e-6) && (center_uv[1].abs() < 1e-6);
+        let is_pinned_one =
+            ((center_uv[0] - 1.0).abs() < 1e-6) && (center_uv[1].abs() < 1e-6);
+        assert!(
+            !is_pinned_zero && !is_pinned_one,
+            "内部顶点不应被钉住, center uv = {:?}",
+            center_uv
+        );
     }
 
     #[test]

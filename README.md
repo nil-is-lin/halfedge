@@ -28,6 +28,11 @@ A half-edge mesh data structure library for Rust, providing comprehensive tools 
 - **Orientation**: consistency detection & repair
 - **BVH**: bounding volume hierarchy (AABB tree) for ray / nearest query
 - **Sparse linear algebra**: symmetric system builder + conjugate gradient
+- **Intrinsic Delaunay**: intrinsic edge flips for Delaunay triangulation (Fisher 2007)
+- **Direction fields**: N-RoSy fields via covariant Laplacian eigenvalue (Knoppel 2013)
+- **SDF & Marching Cubes**: signed distance functions + isosurface extraction (Lorensen 1987)
+- **Mesh repair**: hole filling, degenerate face removal, isolated vertex cleanup
+- **Robust predicates**: Shewchuk orient2d / orient3d / incircle / insphere
 - **Parallelism**: rayon-based parallel iterators
 
 ## Quick start
@@ -78,6 +83,11 @@ add_triangle(&mut mesh, v0, v1, v2).unwrap();
 | `builtin_attrs` | Newtype wrappers for vertex normal / UV / color / face normal |
 | `validate` | Topology self-check (twin / next / manifold / degeneracy) |
 | `linalg` | Sparse linear algebra (symmetric system + conjugate gradient) |
+| `intrinsic` | Intrinsic Delaunay triangulation (edge flips) |
+| `direction_field` | N-RoSy direction fields (covariant Laplacian eigenvalue) |
+| `sdf` | SDF primitives, CSG operations, Marching Cubes |
+| `repair` | Hole filling, degenerate face removal, isolated vertex cleanup |
+| `predicates` | Shewchuk robust geometric predicates (orient2d / orient3d / incircle / insphere) |
 | `test_util` | Test fixtures (`build_icosphere`) |
 
 ## Examples
@@ -123,11 +133,18 @@ The right-side UI panel switches between 5 operations and their parameters at ru
 - **Eager & lazy iterators**: pre-collected `Vec` versions (allow `&mut mesh` during iteration) and lazy versions (zero heap allocation, hold `&MeshStorage` borrow)
 - **Robust degeneracy guards**: all panic paths covered (empty collections, zero-length, division by zero, index out of bounds, `unwrap`)
 - **Symmetric sparse system builder**: `SparseSystem::add` writes both `(i,j)` and `(j,i)` for symmetric matrices
-- **394 unit tests** covering all modules
+- **477 unit tests** covering all modules
 
 ## Documentation
 
 Each module has a companion LaTeX design document in [`docs/`](docs/) (compiled to PDF) with algorithm derivations, TikZ flowcharts, and complexity analysis.
+
+A Chinese tutorial website built with [mdbook](https://rust-lang.github.io/mdBook/) is in [`book/`](book/). Build it locally:
+
+```sh
+cargo install mdbook
+mdbook serve book --open
+```
 
 API documentation: <https://docs.rs/halfedge>
 

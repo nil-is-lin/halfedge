@@ -1,0 +1,280 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 方向场模块设计文档} \\ \large \texttt{src/direction\_field.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{direction\_field.rs} 实现 N-RoSy（N 重旋转对称）方向场，
+基于 Knöppel et al. (2013/2015) 的协变拉普拉斯特征值方法。
+最光滑方向场通过求解协变拉普拉斯 $L^\nabla_N$ 的最小特征向量得到。
+
+\subsection{N-RoSy 类型}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}clll@{}}
+  \toprule
+  $N$ & 名称 & 等价类 & 应用 \\
+  \midrule
+  1 & 切向量场 & $d \sim d$ & 流场可视化 \\
+  2 & 交叉场 & $d \sim -d$ & 主曲率方向 \\
+  4 & 帧场 & $d \sim R_{\pi/2}d$ & 四边形网格化 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{4.2cm}l@{}}
+  \toprule
+  \textbf{函数} & \textbf{功能} & \textbf{返回值} \\
+  \midrule
+  \texttt{smoothest\_nrosy} & 最光滑 N-RoSy 场 & \texttt{HashMap<FaceId, f64>} \\
+  \texttt{smoothest\_vector\_field} & N=1 便捷函数 & 同上 \\
+  \texttt{smoothest\_cross\_field} & N=2 便捷函数 & 同上 \\
+  \texttt{smoothest\_frame\_field} & N=4 便捷函数 & 同上 \\
+  \texttt{detect\_singularities} & 检测奇异点 & \texttt{Vec<Singularity>} \\
+  \texttt{build\_face\_local\_frames} & 面局部坐标系 & \texttt{HashMap<...Frame>} \\
+  \texttt{compute\_transport\_angles} & 平行转移角 & \texttt{HashMap<(usize,usize), f64>} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{核心算法}
+
+\subsection{面局部坐标系}
+
+对每个面 $f$，选择局部坐标系 $(e_1^f, e_2^f, n^f)$：
+\begin{enumerate}
+  \item $n^f$ = 面法向（叉积归一化）
+  \item $e_1^f$ = 最短边方向在切平面上的投影（归一化）
+  \item $e_2^f = n^f \times e_1^f$
+\end{enumerate}
+
+N-RoSy 场用角度 $\theta^f$ 表示，方向为
+$d^f = \cos(\theta^f) \cdot e_1^f + \sin(\theta^f) \cdot e_2^f$。
+
+\subsection{平行转移角}
+
+对共享边 $e$ 的两个面 $f_i, f_j$，将 $f_j$ 的参考方向
+$e_1^{f_j}$ 绕共享边旋转（Rodrigues 公式）到 $f_i$ 切平面，
+得到 $e_1^{f_j,\parallel}$，转移角：
+\[
+  \delta_{ij} = \text{atan2}\!\big(
+    (n_i \times e_1^{f_j,\parallel}) \cdot e_1^i,\;
+    e_1^i \cdot e_1^{f_j,\parallel}
+  \big)
+\]
+
+Rodrigues 旋转公式：
+\[
+  R(\mathbf{k}, \alpha)\mathbf{v} =
+  \mathbf{v}\cos\alpha + (\mathbf{k} \times \mathbf{v})\sin\alpha
+  + \mathbf{k}(\mathbf{k} \cdot \mathbf{v})(1 - \cos\alpha)
+\]
+
+\subsection{协变拉普拉斯}
+
+对 N-RoSy 场的复数表示 $z^f = e^{iN\theta^f}$，
+协变拉普拉斯 $L^\nabla_N$ 为 $|F| \times |F|$ 的复埃尔米特矩阵：
+\[
+  (L^\nabla_N)_{ij} = \begin{cases}
+    \displaystyle\sum_{k \in \mathcal{N}(i)} w_{ik} & i = j \\
+    -w_{ij} \, e^{iN\delta_{ij}} & (f_i, f_j) \text{ 相邻}
+  \end{cases}
+\]
+其中 $w_{ij} = \frac{1}{2}(\cot\alpha_{ij} + \cot\beta_{ij})$ 为余切权重。
+
+实数化为 $2|F| \times 2|F|$ 的实对称矩阵：
+\[
+  L^\nabla_{\mathbb{R}} = \begin{pmatrix}
+    \text{Re}(L^\nabla) & -\text{Im}(L^\nabla) \\
+    -\text{Im}(L^\nabla) & \text{Re}(L^\nabla)
+  \end{pmatrix}
+\]
+
+\subsection{主算法流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.65cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：输入网格 $M$，对称阶数 $N$};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. 构建面局部坐标系 $(e_1^f, e_2^f, n^f)$};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 计算相邻面间平行转移角 $\delta_{ij}$};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {3. 构建协变拉普拉斯 $L^\nabla_N$（实数化）};
+  \node[proc, below=of p3, fill=yellow!15] (p4) {4. 逆幂迭代求最小特征向量 $\mathbf{z}$};
+  \node[proc, below=of p4, fill=green!12] (p5) {5. 提取角度 $\theta^f = \text{atan2}(\text{Im}(z^f), \text{Re}(z^f)) / N$};
+  \node[startend, below=of p5, fill=green!12] (e) {输出：每面角度 $\theta^f$};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{逆幂迭代}
+
+求 $L^\nabla_N$ 最小特征向量：
+
+\begin{lstlisting}
+x = random_init()
+for iter in 1..max_iter:
+    y = CG_solve(L^Nabla + eps*I, x)
+    x = y / ||y||
+    if ||x_old - x|| < tol: break
+\end{lstlisting}
+
+正则化 $\epsilon = 10^{-8}$ 使矩阵正定，CG 收敛。
+
+\subsection{奇异点检测}
+
+绕顶点 $v$ 的一环邻域面累加角度差：
+\[
+  \text{index}(v) = \frac{1}{2\pi N}
+  \sum_{(f_i, f_j) \in \text{ring}(v)}
+  \text{wrap}\!\big(N\theta^{f_j} - N\theta^{f_i} - N\delta_{ij}\big)
+\]
+
+指数 $|\text{index}| > 0.01$ 的顶点为奇异点。
+Poincaré-Hopf 定理保证 $\sum_v \text{index}(v) = N \cdot \chi(M)$。
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{阶段} & \textbf{时间复杂度} & \textbf{备注} \\
+  \midrule
+  面局部坐标系   & $O(F)$            & 每面一次 \\
+  转移角计算     & $O(E)$            & 每半边一次 \\
+  协变拉普拉斯构建 & $O(E)$          & 稀疏矩阵 \\
+  逆幂迭代       & $O(k \cdot E)$    & $k$ 次迭代，每次 CG $O(E)$ \\
+  奇异点检测     & $O(V \cdot \bar{d})$ & $\bar{d}$ = 平均度数 \\
+  \midrule
+  \textbf{总计}  & $O(k \cdot E)$    & $k \approx 10$--$100$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item 面法向为零时跳过该面（退化三角形）；
+  \item 最短边平行于法向时选择任意正交方向；
+  \item Rodrigues 旋转结果投影到切平面消除数值误差；
+  \item 余切权重为负时取 $\max(0, w)$，或回退到 $0.5$；
+  \item 孤立面添加 $10^{-6}$ 正则化对角元；
+  \item 逆幂迭代正则化 $\epsilon = 10^{-8}$ 防止奇异矩阵；
+  \item $N = 0$ 或空网格直接返回空结果。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{smoothest\_vector\_field\_grid} & 平面网格 1-RoSy 非空且角度合理 \\
+  \texttt{smoothest\_cross\_field\_icosphere} & icosphere 2-RoSy 角度合理 \\
+  \texttt{smoothest\_frame\_field\_grid} & 平面网格 4-RoSy 非空 \\
+  \texttt{smoothest\_field\_empty} & 空网格不 panic \\
+  \texttt{smoothest\_field\_single\_triangle} & 单三角形返回 1 个角度 \\
+  \texttt{rodrigues\_rotation\_90deg} & Rodrigues 旋转 90° 正确 \\
+  \texttt{face\_local\_frame\_orthogonal} & 面局部坐标系正交归一 \\
+  \texttt{wrap\_angle\_test} & 角度归一化正确 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 8 个单元测试；项目整体 \texttt{cargo test} 共 468 个用例。
+
+\section{设计权衡}
+
+\begin{itemize}
+  \item \textbf{面基 vs 顶点基}：
+        选择面基表示（每面一个角度），因为参数化和四边形网格化
+        都用面基场。顶点基需额外定义顶点法向和切平面。
+
+  \item \textbf{逆幂迭代 vs Lanczos}：
+        逆幂迭代实现简单，用现有 CG 求解器即可。
+        Lanczos 更高效但实现复杂。对中小规模网格（$< 100$K 面），
+        逆幂迭代足够。
+
+  \item \textbf{确定性伪随机初始化}：
+        逆幂迭代的初始向量使用固定种子的伪随机序列，
+        保证结果可复现。
+
+  \item \textbf{实数化 vs 复数矩阵}：
+        实数化后可用现有 \texttt{SparseSystem} 和 \texttt{conjugate\_gradient}，
+        无需引入复数稀疏矩阵库。
+
+  \item \textbf{奇异点检测阈值}：
+        使用 $0.01$ 作为指数阈值，避免浮点噪声导致的误检。
+\end{itemize}
+
+\end{document}

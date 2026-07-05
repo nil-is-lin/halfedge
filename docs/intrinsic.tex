@@ -1,0 +1,306 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 内蕴 Delaunay 三角剖分设计文档} \\ \large \texttt{src/intrinsic.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{intrinsic.rs} 实现内蕴 Delaunay 三角剖分（Intrinsic Delaunay
+Triangulation, IDT），基于 Fisher, Springborn, Schröder \& Desbrun (2007)
+的边翻转算法。IDT 保证所有内部边的余切拉普拉斯权重非负，
+从而保证离散 Laplace-Beltrami 算子的正定性。
+
+\subsection{与外蕴 Delaunay 的区别}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{5.5cm}p{5.5cm}@{}}
+  \toprule
+  & \textbf{外蕴 Delaunay} & \textbf{内蕴 Delaunay} \\
+  \midrule
+  判据 & 外接圆包含对角顶点（3D 空间） & $\alpha_C + \alpha_D > \pi$（内蕴度量） \\
+  几何依据 & 嵌入空间中的圆 & 曲面上的边长度量 \\
+  收敛性 & 不保证 & 保证（Bobenko \& Springborn 2007） \\
+  保持性 & 修改顶点位置 & 仅修改连接关系，保持内蕴度量 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{5cm}l@{}}
+  \toprule
+  \textbf{函数} & \textbf{功能} & \textbf{返回值} \\
+  \midrule
+  \texttt{intrinsic\_delaunay} & IDT 主入口 & \texttt{IntrinsicDelaunayStats} \\
+  \texttt{compute\_intrinsic\_lengths} & 初始化内蕴边长 & \texttt{HashMap<HalfEdgeId, f64>} \\
+  \texttt{is\_intrinsic\_delaunay\_edge} & 单边 Delaunay 判据 & \texttt{bool} \\
+  \texttt{intrinsic\_cotan\_weight} & 内蕴余切权重 & \texttt{f64} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{核心算法}
+
+\subsection{内蕴 Delaunay 判据}
+
+设内部边 $e = AB$，两侧三角形为 $ABC$ 和 $ABD$，
+$C$、$D$ 为对角顶点。定义 $\alpha_C$、$\alpha_D$ 为 $C$、$D$ 处的内角。
+
+\textbf{Delaunay 条件}：
+\[
+  \alpha_C + \alpha_D \leq \pi
+  \quad \Longleftrightarrow \quad
+  \cot\alpha_C + \cot\alpha_D \geq 0
+\]
+
+当 $\cot\alpha_C + \cot\alpha_D < 0$ 时，翻转边 $AB \to CD$ 能改善
+Delaunay 性质。
+
+用边长表达：
+\[
+  \cot\alpha_C = \frac{l_{CA}^2 + l_{BC}^2 - l_{AB}^2}{4 \cdot \text{Area}(ABC)},
+  \quad
+  \cot\alpha_D = \frac{l_{AD}^2 + l_{BD}^2 - l_{AB}^2}{4 \cdot \text{Area}(ABD)}
+\]
+
+其中三角形面积由 Heron 公式：
+\[
+  \text{Area}(a,b,c) = \sqrt{s(s-a)(s-b)(s-c)},
+  \quad s = \frac{a+b+c}{2}
+\]
+
+\subsection{翻转后新边长度}
+
+边 $e = AB$ 被翻转为 $CD$ 后，新边的内蕴长度 $l_{CD}$ 由余弦定理计算：
+\[
+  l_{CD}^2 = l_{CA}^2 + l_{AD}^2
+  - 2 \cdot l_{CA} \cdot l_{AD} \cdot \cos\!\left(\angle A_{ABC} + \angle A_{ABD}\right)
+\]
+
+其中：
+\[
+  \angle A_{ABC} = \arccos\frac{l_{AB}^2 + l_{CA}^2 - l_{BC}^2}{2 \cdot l_{AB} \cdot l_{CA}},
+  \quad
+  \angle A_{ABD} = \arccos\frac{l_{AB}^2 + l_{AD}^2 - l_{BD}^2}{2 \cdot l_{AB} \cdot l_{AD}}
+\]
+
+\textbf{关键性质}：翻转不改变已有边的内蕴长度，只有新边 $CD$ 的长度需要计算。
+这是内蕴三角化的核心——度量只取决于曲面本身，不取决于三角化方式。
+
+\subsection{主算法流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.65cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：输入网格 $M$};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. 计算初始内蕴边长 $l_e = \|p_i - p_j\|$};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 所有内部边入队 $Q$};
+  \node[proc, below=of p2, fill=blue!8] (p3) {3. 取出边 $e = AB$};
+  \node[dec, below=of p3] (d1) {$\cot\alpha_C + \cot\alpha_D < 0$？};
+  \node[proc, right=1.6cm of d1, fill=yellow!15] (skip) {跳过，取下一条边};
+  \node[proc, below=of d1, fill=yellow!15] (p4) {4. 计算新边长度 $l_{CD}$（余弦定理）};
+  \node[proc, below=of p4, fill=yellow!15] (p5) {5. 执行拓扑翻转 \texttt{flip\_edge}，更新 $l_{CD}$};
+  \node[proc, below=of p5, fill=yellow!15] (p6) {6. 受影响邻接边重新入队 $Q$};
+  \node[dec, below=of p6] (d2) {$Q$ 空？};
+  \node[startend, below=of d2, fill=green!12] (e) {输出 Delaunay 三角化};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {否} (skip);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {是} (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (d2);
+  \draw[op] (d2.west) -- ++(-1.5,0) |- (p3.west)
+        node[pos=0.25, left, font=\scriptsize] {否};
+  \draw[op] (d2) -- node[right, font=\scriptsize] {是} (e);
+  \draw[op] (skip.north) |- (d2.east);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{收敛性}
+
+Bobenko \& Springborn (2007) 证明：定义 Dirichlet 能量
+\[
+  E_D(\mathcal{T}) = \frac{1}{4} \sum_{e \in E(\mathcal{T})}
+  \left(\cot\alpha_C(e) + \cot\alpha_D(e)\right) \cdot l_e^2
+\]
+每次合法翻转使 $E_D$ 严格递减，而 $E_D \geq 0$ 且可能的三角化数目有限，
+故算法在有限步内终止。设安全上限为 $\text{max\_iterations} = 10 \cdot |E|$。
+
+\section{内蕴边长系统}
+
+\subsection{初始化}
+
+内蕴边长初始化为 3D 欧氏距离：
+\begin{lstlisting}
+pub fn compute_intrinsic_lengths(mesh: &MeshStorage)
+    -> HashMap<HalfEdgeId, f64>
+{
+    let mut lengths = HashMap::new();
+    for he in mesh.halfedge_ids() {
+        if let Some(l) = edge_length(mesh, he) {
+            lengths.insert(he, l);
+        }
+    }
+    lengths
+}
+\end{lstlisting}
+
+twin 对的两个半边具有相同的长度。
+
+\subsection{翻转后更新}
+
+翻转 $AB \to CD$ 后，\texttt{flip\_edge} 保留半边 ID，
+仅修改连接关系。更新 \texttt{intrinsic\_lengths}：
+\begin{lstlisting}
+intrinsic_lengths.insert(he, l_cd);     // he: D->C
+intrinsic_lengths.insert(twin, l_cd);   // twin: C->D
+\end{lstlisting}
+
+已有边（$AC$, $CB$, $BD$, $DA$）的内蕴长度不变。
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{阶段} & \textbf{时间复杂度} & \textbf{备注} \\
+  \midrule
+  初始边长计算     & $O(E)$              & 每条半边一次 \texttt{edge\_length} \\
+  队列初始化       & $O(E)$              & 遍历所有无向边 \\
+  单次翻转         & $O(1)$              & 余弦定理 + \texttt{flip\_edge} \\
+  总翻转次数       & $O(E)$              & 实际经验值 \\
+  受影响边入队     & $O(1)$ per flip     & 最多 8 条邻接边 \\
+  \midrule
+  \textbf{总计}   & $O(E)$（实际）      & 安全上限 $10E$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item 退化三角形（面积 $< 10^{-14}$）视为满足 Delaunay 条件，不翻转；
+  \item \texttt{acos} 输入用 \texttt{clamp(-1.0, 1.0)} 保护，防止 NaN；
+  \item \texttt{l\_cd\_sq.max(0.0).sqrt()} 防止负数开方；
+  \item 最大迭代次数 $10 \cdot |E|$ 防止意外无限循环；
+  \item 翻转前检查 \texttt{contains\_halfedge} 和 \texttt{is\_interior\_edge}，
+        防止操作已删除或边界半边；
+  \item \texttt{flip\_edge} 失败时跳过（\texttt{DegenerateTriangle} 等）。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{intrinsic\_delaunay\_grid} & grid 翻转后所有边满足 Delaunay \\
+  \texttt{intrinsic\_delaunay\_icosphere\_no\_flip} & icosphere IDT 正确 \\
+  \texttt{intrinsic\_delaunay\_flat\_quad} & 扁平四边形翻转后满足 Delaunay \\
+  \texttt{is\_delaunay\_equilateral} & 等边三角形满足 Delaunay \\
+  \texttt{triangle\_area\_heron} & Heron 公式正确性 \\
+  \texttt{flipped\_length\_diamond} & 菱形翻转后新边长度 $= 2$ \\
+  \texttt{intrinsic\_lengths\_match\_euclidean} & 初始长度与欧氏距离一致 \\
+  \texttt{cotan\_weight\_nonnegative\_after\_delaunay} & 翻转后余切权重 $\geq 0$ \\
+  \texttt{intrinsic\_delaunay\_empty} & 空网格不 panic \\
+  \texttt{intrinsic\_delaunay\_single\_triangle} & 单三角形无内部边不翻转 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 10 个单元测试；项目整体 \texttt{cargo test} 共 460 个用例。
+
+\section{设计权衡}
+
+\begin{itemize}
+  \item \textbf{独立 HashMap vs 属性系统}：
+        选择 \texttt{HashMap<HalfEdgeId, f64>} 存储内蕴边长，
+        因为 IDT 算法需要频繁读写边长，属性系统的间接开销较大。
+        缺点是需手动维护与网格拓扑的同步。
+
+  \item \textbf{余切判据 vs 角度判据}：
+        使用 $\cot\alpha_C + \cot\alpha_D < 0$ 而非
+        $\alpha_C + \alpha_D > \pi$，因为余切可直接从边长计算，
+        无需调用 \texttt{acos}（数值更稳定）。
+
+  \item \textbf{VecDeque + HashSet 队列}：
+        使用 BFS 式队列而非优先队列，因为 IDT 不需要优先级
+        （任何不满足条件的边都可以翻转，顺序不影响结果）。
+        HashSet 避免同一条边重复入队。
+
+  \item \textbf{与 remesh::flip\_for\_valence 的区别}：
+        remesh 翻转以优化顶点度数（外蕴目标），
+        IDT 翻转以优化内蕴几何性质。两者不应混用。
+
+  \item \textbf{安全上限 10E}：
+        理论上翻转次数 $O(E)$，但设 $10E$ 安全上限防止极端情况。
+\end{itemize}
+
+\end{document}

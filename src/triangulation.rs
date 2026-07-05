@@ -1,6 +1,13 @@
 //! 多边形三角化模块
 //!
 //! 提供二维多边形三角化算法。
+//!
+//! ## 鲁棒性
+//! 所有的方向判定（凸顶点、点在三角形内、多边形环绕方向）均通过
+//! [`crate::predicates`] 模块的 Shewchuk 鲁棒谓词实现，保证在共线、
+//! 共点等退化情况下给出精确的符号判定。
+
+use crate::predicates::{is_convex_vertex2d, orient2d, point_in_triangle_2d};
 
 // ============================================================
 // 2D 向量工具
@@ -8,39 +15,23 @@
 
 type V2 = [f64; 2];
 
-fn v2_sub(a: V2, b: V2) -> V2 {
-    [a[0] - b[0], a[1] - b[1]]
-}
-fn v2_cross(a: V2, b: V2) -> f64 {
-    a[0] * b[1] - a[1] * b[0]
-}
-
-/// 三角形 (a,b,c) 的有向面积（正 = CCW）。
-fn signed_area(a: V2, b: V2, c: V2) -> f64 {
-    0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
-}
-
-/// 点 p 是否在三角形 (a,b,c) 内部（含边界）。
-fn point_in_triangle(p: V2, a: V2, b: V2, c: V2) -> bool {
-    let area = signed_area(a, b, c).abs();
-    let a1 = signed_area(p, b, c).abs();
-    let a2 = signed_area(a, p, c).abs();
-    let a3 = signed_area(a, b, p).abs();
-    (a1 + a2 + a3 - area).abs() < 1e-12 * area.max(1e-12)
-}
-
 /// 多边形是否 CCW（逆时针）。
+///
+/// 使用 Shewchuk 鲁棒 `orient2d` 累加各三角形有向面积：当总面积为正
+/// 时多边形呈 CCW。退化多边形（面积 = 0）返回 `false`。
 fn is_ccw(poly: &[V2]) -> bool {
     let n = poly.len();
     if n < 3 {
         return false;
     }
-    let mut sum = 0.0;
-    for i in 0..n {
-        let j = (i + 1) % n;
-        sum += (poly[j][0] - poly[i][0]) * (poly[j][1] + poly[i][1]);
+    // 以第一个顶点为基准，累加 (v0, vi, vi+1) 的 orient2d
+    // orient2d > 0 表示 CCW，总和 > 0 表示多边形 CCW
+    let v0 = poly[0];
+    let mut sum = 0.0f64;
+    for i in 1..n - 1 {
+        sum += orient2d(v0, poly[i], poly[i + 1]);
     }
-    sum < 0.0
+    sum > 0.0
 }
 
 // ============================================================
@@ -128,18 +119,19 @@ pub fn ear_clipping(polygon: &[[f64; 2]]) -> Vec<[usize; 3]> {
             let c = verts[indices[next]];
 
             // 检查顶点 i 是否为凸顶点（内角 < 180°）
-            let cross = v2_cross(v2_sub(b, a), v2_sub(c, a));
-            if cross <= 0.0 {
+            // 使用鲁棒 orient2d：b 是凸顶点当且仅当 orient2d(a, b, c) > 0
+            if !is_convex_vertex2d(a, b, c) {
                 continue; // 凹顶点或共线，跳过
             }
 
             // 检查三角形 (a,b,c) 内是否包含其他顶点
+            // 使用鲁棒 point_in_triangle_2d
             let mut is_ear = true;
             for j in 0..m {
                 if j == prev || j == i || j == next {
                     continue;
                 }
-                if point_in_triangle(verts[indices[j]], a, b, c) {
+                if point_in_triangle_2d(verts[indices[j]], a, b, c) {
                     is_ear = false;
                     break;
                 }

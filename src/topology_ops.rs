@@ -75,13 +75,27 @@ impl std::error::Error for TopologyError {}
 // 校验
 // ============================================================
 
-/// 校验网格是否满足流形三角曲面不变量。
+/// 校验网格是否满足流形三角曲面不变量（**轻量级，首错返回**）。
 ///
 /// 检查项：
 /// 1. 每条半边的 `twin` 互指；
 /// 2. `twin.vertex` 与自身 `vertex` 不同（无自环）；
 /// 3. `next/prev` 互为反问（若 `next = X`，则 `X.prev = self`）；
 /// 4. 每个面的边界环长度为 3（三角网格）。
+///
+/// # 何时使用此函数
+///
+/// **专用于拓扑操作（split/flip/collapse 等）内部的前后置断言**：
+/// - 复用 `TopologyError` 类型，便于在操作函数中 `?` 传播；
+/// - 仅校验 4 项核心不变量，速度快；
+/// - 遇到首个错误即返回，不收集全部违例。
+///
+/// # 何时使用其他验证函数
+///
+/// - 需要**结构化错误类型**（`ValidationError`）或**全部违例**：
+///   见 [`crate::validate::validate_topology`] / [`crate::validate::check_topology`]。
+/// - 需要**快速失败 + 结构化错误**：见 [`crate::validate::validate_first_error`]。
+/// - 三者的对比表与决策树见 `validate` 模块文档。
 pub fn validate_mesh(mesh: &MeshStorage) -> Result<(), TopologyError> {
     let all_he: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
 
@@ -245,10 +259,10 @@ pub fn split_edge(mesh: &mut MeshStorage, he: HalfEdgeId) -> Result<VertexId, To
     let f1 = h.face.ok_or(TopologyError::NoFace(h_id))?;
     let n1 = h
         .next
-        .ok_or_else(|| TopologyError::Inconsistent("h.next is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("h.next 为 None".into()))?;
     let p1 = h
         .prev
-        .ok_or_else(|| TopologyError::Inconsistent("h.prev is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("h.prev 为 None".into()))?;
     let c = mesh
         .get_halfedge(n1)
         .ok_or(TopologyError::InvalidHalfEdge(n1))?
@@ -259,10 +273,10 @@ pub fn split_edge(mesh: &mut MeshStorage, he: HalfEdgeId) -> Result<VertexId, To
         let f2 = twin.face.unwrap();
         let n2 = twin
             .next
-            .ok_or_else(|| TopologyError::Inconsistent("twin.next is None".into()))?;
+            .ok_or_else(|| TopologyError::Inconsistent("twin.next 为 None".into()))?;
         let p2 = twin
             .prev
-            .ok_or_else(|| TopologyError::Inconsistent("twin.prev is None".into()))?;
+            .ok_or_else(|| TopologyError::Inconsistent("twin.prev 为 None".into()))?;
         let d = mesh
             .get_halfedge(n2)
             .ok_or(TopologyError::InvalidHalfEdge(n2))?
@@ -485,16 +499,16 @@ pub fn flip_edge(mesh: &mut MeshStorage, he: HalfEdgeId) -> Result<(), TopologyE
 
     let n1 = h
         .next
-        .ok_or_else(|| TopologyError::Inconsistent("h.next is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("h.next 为 None".into()))?;
     let p1 = h
         .prev
-        .ok_or_else(|| TopologyError::Inconsistent("h.prev is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("h.prev 为 None".into()))?;
     let n2 = twin
         .next
-        .ok_or_else(|| TopologyError::Inconsistent("twin.next is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("twin.next 为 None".into()))?;
     let p2 = twin
         .prev
-        .ok_or_else(|| TopologyError::Inconsistent("twin.prev is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("twin.prev 为 None".into()))?;
 
     let c = mesh
         .get_halfedge(n1)
@@ -655,16 +669,16 @@ fn collapse_edge_impl(
 
     let n1 = h
         .next
-        .ok_or_else(|| TopologyError::Inconsistent("h.next is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("h.next 为 None".into()))?;
     let p1 = h
         .prev
-        .ok_or_else(|| TopologyError::Inconsistent("h.prev is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("h.prev 为 None".into()))?;
     let n2 = twin
         .next
-        .ok_or_else(|| TopologyError::Inconsistent("twin.next is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("twin.next 为 None".into()))?;
     let p2 = twin
         .prev
-        .ok_or_else(|| TopologyError::Inconsistent("twin.prev is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("twin.prev 为 None".into()))?;
 
     let c = mesh
         .get_halfedge(n1)
@@ -711,22 +725,22 @@ fn collapse_edge_impl(
         .get_halfedge(p1)
         .ok_or(TopologyError::InvalidHalfEdge(p1))?
         .twin
-        .ok_or_else(|| TopologyError::Inconsistent("p1.twin is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("p1.twin 为 None".into()))?;
     let n1_twin = mesh
         .get_halfedge(n1)
         .ok_or(TopologyError::InvalidHalfEdge(n1))?
         .twin
-        .ok_or_else(|| TopologyError::Inconsistent("n1.twin is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("n1.twin 为 None".into()))?;
     let n2_twin = mesh
         .get_halfedge(n2)
         .ok_or(TopologyError::InvalidHalfEdge(n2))?
         .twin
-        .ok_or_else(|| TopologyError::Inconsistent("n2.twin is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("n2.twin 为 None".into()))?;
     let p2_twin = mesh
         .get_halfedge(p2)
         .ok_or(TopologyError::InvalidHalfEdge(p2))?
         .twin
-        .ok_or_else(|| TopologyError::Inconsistent("p2.twin is None".into()))?;
+        .ok_or_else(|| TopologyError::Inconsistent("p2.twin 为 None".into()))?;
 
     // ---------- 3. 创建新顶点 K ----------
 
@@ -938,21 +952,18 @@ pub fn extrude_face(
     }
 
     // ---------- 4. 退化侧面检查 ----------
-    // 侧面三角形 T1_i = (vi+1, vi, vi'), 面积 = 0.5 * |edge_i × offset|
-    // 其中 edge_i = pos[(i+1)%3] - pos[i]
+    // 侧面三角形 T1_i = (v_{i+1}, v_i, v_i')，退化 ⟺ 三顶点共线
+    // ⟺ (v_i - v_{i+1}) 与 offset 共线 ⟺ |edge_i × offset| = 0
+    // 用 Shewchuk 鲁棒谓词精确判定（无浮点阈值）
     for i in 0..3 {
-        let edge = [
-            pos[(i + 1) % 3][0] - pos[i][0],
-            pos[(i + 1) % 3][1] - pos[i][1],
-            pos[(i + 1) % 3][2] - pos[i][2],
+        let a = pos[(i + 1) % 3];
+        let b = pos[i];
+        let c = [
+            pos[i][0] + offset[0],
+            pos[i][1] + offset[1],
+            pos[i][2] + offset[2],
         ];
-        let cross = [
-            edge[1] * offset[2] - edge[2] * offset[1],
-            edge[2] * offset[0] - edge[0] * offset[2],
-            edge[0] * offset[1] - edge[1] * offset[0],
-        ];
-        let area = 0.5 * (cross[0].powi(2) + cross[1].powi(2) + cross[2].powi(2)).sqrt();
-        if area < 1e-12 {
+        if crate::predicates::is_triangle_degenerate_3d(a, b, c) {
             return Err(TopologyError::DegenerateTriangle);
         }
     }
@@ -1269,7 +1280,8 @@ pub fn extrude_region(
     }
 
     // ---------- 6. 退化侧面检查 ----------
-    // 每条边界半边 h(v_o→v_t) 的侧面面积 = 0.5 * |edge × offset|
+    // 侧面三角形 (v_o, v_t, v_o + offset)，退化 ⟺ 三顶点共线
+    // ⟺ (pos_t - pos_o) 与 offset 共线。用 Shewchuk 鲁棒谓词精确判定
     for &(_h, v_o, v_t, _f) in &boundary_hes {
         let pos_o = mesh
             .get_vertex(v_o)
@@ -1279,18 +1291,12 @@ pub fn extrude_region(
             .get_vertex(v_t)
             .ok_or_else(|| TopologyError::Inconsistent(format!("顶点 {:?} 不存在", v_t)))?
             .position;
-        let edge = [
-            pos_t[0] - pos_o[0],
-            pos_t[1] - pos_o[1],
-            pos_t[2] - pos_o[2],
+        let pos_o_up = [
+            pos_o[0] + offset[0],
+            pos_o[1] + offset[1],
+            pos_o[2] + offset[2],
         ];
-        let cross = [
-            edge[1] * offset[2] - edge[2] * offset[1],
-            edge[2] * offset[0] - edge[0] * offset[2],
-            edge[0] * offset[1] - edge[1] * offset[0],
-        ];
-        let area = 0.5 * (cross[0].powi(2) + cross[1].powi(2) + cross[2].powi(2)).sqrt();
-        if area < 1e-12 {
+        if crate::predicates::is_triangle_degenerate_3d(pos_o, pos_t, pos_o_up) {
             return Err(TopologyError::DegenerateTriangle);
         }
     }
@@ -1510,34 +1516,31 @@ pub fn add_triangle(
     }
 
     // ---------- 4. 为每条边找或创建 twin ----------
-    // 对每条新边 he: src→dst，查找已有半边中方向为 dst→src 且可配对的。
+    // 一次性建立边索引：key = (origin, tip) = (twin.vertex, he.vertex)，
+    // 仅收录 twin 为边界半边的内部半边。后续 3 次查找 O(1)。
+    let mut boundary_twin_map: HashMap<(VertexId, VertexId), HalfEdgeId> = HashMap::new();
+    for ehe in mesh.halfedge_ids() {
+        if ehe == h0 || ehe == h1 || ehe == h2 {
+            continue;
+        }
+        let h = match mesh.get_halfedge(ehe) {
+            Some(h) => h,
+            None => continue,
+        };
+        if let Some(twin_id) = h.twin
+            && let Some(twin_data) = mesh.get_halfedge(twin_id)
+            && twin_data.face.is_none()
+        {
+            // h 从 twin_data.vertex → h.vertex，且 twin 是边界半边
+            boundary_twin_map.insert((twin_data.vertex, h.vertex), ehe);
+        }
+    }
+
+    // 对每条新边 he: src→dst，查找已有半边中方向为 dst→src 且 twin 为边界的。
     let edges = [(h0, v0, v1), (h1, v1, v2), (h2, v2, v0)];
     for (he, src, dst) in edges {
-        // 寻找已有半边 E 满足：E 从 dst→src（即 E.vertex == src 且 E.twin 存在时 twin.vertex == dst）
-        // 且 E 的 twin 当前是边界半边（twin.face == None）或 E 本身无 twin
-        let existing: Option<HalfEdgeId> = {
-            let mut found = None;
-            for ehe in mesh.halfedge_ids() {
-                if ehe == h0 || ehe == h1 || ehe == h2 {
-                    continue;
-                }
-                let h = mesh.get_halfedge(ehe).unwrap();
-                // E 的方向：destination = h.vertex。source 由 twin 推断。
-                if h.vertex != src {
-                    continue;
-                }
-                if let Some(twin_id) = h.twin
-                    && let Some(twin_data) = mesh.get_halfedge(twin_id)
-                    && twin_data.vertex == dst
-                    && twin_data.face.is_none()
-                {
-                    // E 从 dst→src（twin 从 src→dst），且 twin 是边界半边
-                    found = Some(ehe);
-                    break;
-                }
-            }
-            found
-        };
+        // 查找 key = (dst, src)：即从 dst→src 的内部半边，其 twin（src→dst）为边界
+        let existing: Option<HalfEdgeId> = boundary_twin_map.get(&(dst, src)).copied();
 
         match existing {
             Some(ex) => {

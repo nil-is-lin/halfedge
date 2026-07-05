@@ -61,6 +61,66 @@
 
 \subsection{与 \texttt{topology\_ops::validate\_mesh} 的区别}
 
+库中存在\textbf{四个语义相关}的验证函数。下表给出明确的取舍标准：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}lllll@{}}
+  \toprule
+  \textbf{函数} & \textbf{错误类型} & \textbf{返回方式} & \textbf{校验项} & \textbf{适用场景} \\
+  \midrule
+  \texttt{topology\_ops::validate\_mesh}
+    & \texttt{TopologyError}
+    & 首错返回
+    & 仅 twin / next-prev / 三角面环
+    & 拓扑操作内部断言（split/flip/collapse） \\
+  \texttt{validate::validate\_topology}
+    & \texttt{Vec<ValidationError>}
+    & 收集全部
+    & 全部 8 项
+    & 诊断 / 调试：需要所有违例 \\
+  \texttt{validate::check\_topology}
+    & \texttt{Result<(), Vec>}
+    & \texttt{Result} 包装
+    & 同 \texttt{validate\_topology}
+    & 入口检查：作为前置 / 后置条件，\texttt{?} 传播 \\
+  \texttt{validate::validate\_first\_error}
+    & \texttt{Option<ValidationError>}
+    & 首错返回
+    & 同 \texttt{validate\_topology}（但底层复用）
+    & 快速失败但需结构化错误 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{决策树}
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  dec/.style={diamond, draw, aspect=2.2, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4.0cm},
+  proc/.style={draw, rounded corners=2pt, minimum width=5.0cm, minimum height=0.7cm, align=center, font=\small, fill=green!12},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[dec, below=of s] (d1) {在 \texttt{topology\_ops} 内部？};
+  \node[proc, below left=0.6cm and 0.2cm of d1] (m) {\texttt{validate\_mesh}（TopologyError）};
+  \node[dec, below right=0.6cm and 0.2cm of d1] (d2) {需要看到所有错误？};
+  \node[proc, below=0.4cm of d2] (vt) {\texttt{validate\_topology}（Vec）};
+  \node[dec, below right=0.6cm and 0.2cm of d2] (d3) {需要 \texttt{?} 传播？};
+  \node[proc, below=0.4cm of d3] (ct) {\texttt{check\_topology}（Result）};
+  \node[proc, right=0.4cm of d3] (vf) {\texttt{validate\_first\_error}（Option）};
+  \draw[op] (s) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\scriptsize] {是} (m);
+  \draw[op] (d1) -| node[above, near start, font=\scriptsize] {否} (d2);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {是} (vt);
+  \draw[op] (d2) -| node[above, near start, font=\scriptsize] {否} (d3);
+  \draw[op] (d3) -- node[right, font=\scriptsize] {是} (ct);
+  \draw[op] (d3) -- node[above, font=\scriptsize] {否} (vf);
+\end{tikzpicture}
+\end{center}
+
+\paragraph{旧表（仅 \texttt{validate\_mesh} vs \texttt{validate\_topology}）}
 \begin{center}
 \renewcommand{\arraystretch}{1.18}
 \begin{tabular}{@{}lll@{}}
@@ -129,7 +189,21 @@
 
 \texttt{validate\_topology(mesh)} 依次调用 8 个子校验函数，所有错误汇入
 \texttt{Vec<ValidationError>}。便捷包装 \texttt{check\_topology} 返回
-\texttt{Result<(), Vec>}。
+\texttt{Result<(), Vec>}，\texttt{validate\_first\_error} 返回
+\texttt{Option<ValidationError>}（首个违例或 \texttt{None}）。
+
+\paragraph{\texttt{validate\_first\_error} 的实现取舍}
+当前实现为 \texttt{validate\_topology(mesh).into\_iter().next()}，即\textbf{底层
+仍跑完全部 8 项校验}，仅在返回时取首元素。这是\textbf{有意的}简化：
+\begin{itemize}
+  \item 真正的早返回性能由 \texttt{topology\_ops::validate\_mesh} 提供（仅 4 项校验）；
+  \item 需要结构化错误（\texttt{ValidationError}）又需要早返回的场景极少，
+        现有实现的额外开销仅是\textbf{一次性} \texttt{Vec} 分配；
+  \item 若未来确有性能需求，可将 8 个子校验函数重构为
+        \texttt{FnMut(ValidationError) -> ControlFlow} 模式，
+        \texttt{validate\_topology} 与 \texttt{validate\_first\_error} 共用同一份
+        早返回逻辑。
+\end{itemize}
 
 \begin{center}
 \resizebox{\textwidth}{!}{%
@@ -290,6 +364,8 @@ $h.\mathrm{face} = f$。
   \texttt{detects\_vertex\_halfedge\_inconsistency}  & 检测入口 origin 不匹配 \\
   \texttt{topology\_ops\_preserve\_validity}         & split 后仍通过校验 \\
   \texttt{flip\_preserves\_full\_validity}           & flip 后仍通过校验 \\
+  \texttt{validate\_first\_error\_passes\_on\_clean\_mesh}    & 干净网格返回 \texttt{None} \\
+  \texttt{validate\_first\_error\_returns\_some\_on\_invalid\_mesh} & 错误网格返回首个违例 \\
   \bottomrule
 \end{tabular}
 \end{center}

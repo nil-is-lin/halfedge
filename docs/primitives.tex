@@ -171,6 +171,12 @@ $xz$ 平面 $y = 0$，$x \in [-w/2, +w/2]$，$z \in [-d/2, +d/2]$，按 $s_x \ti
 \texttt{mesh.reserve(v, he, f)}，半边容量按 \texttt{faces * 6}（每三角面 3 内部 + 3 潜在边界 twin）
 预分配，使构建期间 rehash 次数为 0。
 
+\section{数据丢弃警告}
+
+所有 \texttt{add\_triangle} 调用使用 \texttt{.expect("图元构建不应失败")}
+而非静默丢弃错误。图元构建是确定性过程，\texttt{add\_triangle} 失败表明
+内部逻辑 bug，应立即 panic 而非返回不完整网格。
+
 \section{复杂度}
 
 \begin{center}

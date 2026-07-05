@@ -361,7 +361,12 @@ fn loop_beta(n: usize) -> f64 {
   \item \textbf{内部边拓扑不完整}（\texttt{next} / \texttt{twin.next} 缺失）：
         退化为边界边公式；
   \item \texttt{loop\_beta(0)} 守卫除零，返回 $0$；
-  \item \textbf{空网格}：返回空网格，不 panic。
+  \item \textbf{空网格}：返回空网格，不 panic；
+  \item \textbf{非三角面}：Loop 细分仅支持三角形。若输入含非三角面
+        （如四边形），这些面会被\textbf{跳过}并通过 \texttt{eprintln!}
+        输出警告到 stderr，含跳过面数与替代建议（\texttt{catmull\_clark\_subdivide}）。
+        三角面照常细分。详见 \texttt{loop\_subdivide\_skips\_non\_triangle\_with\_warning}
+        与 \texttt{loop\_subdivide\_mixed\_mesh\_keeps\_only\_triangles} 测试。
 \end{itemize}
 
 \section{复杂度分析}
@@ -410,12 +415,15 @@ fn loop_beta(n: usize) -> f64 {
   \texttt{loop\_beta\_zero\_valence\_returns\_zero}        & $\beta(0) = 0$（不 panic） \\
   \texttt{loop\_subdivide\_multiple\_iterations\_stay\_valid} & 连续 3 次细分拓扑校验通过 \\
   \texttt{loop\_subdivide\_empty\_mesh}                    & 空网格细分返回空网格 \\
+  \midrule
+  \texttt{loop\_subdivide\_skips\_non\_triangle\_with\_warning} & 单四边形面输入：跳过，输出 0 面（stderr 警告） \\
+  \texttt{loop\_subdivide\_mixed\_mesh\_keeps\_only\_triangles} & 三角形 + 四边形混合输入：仅三角形细分为 4 面 \\
   \bottomrule
 \end{tabular}
 \end{center}
 
-共 15 个单元测试，全部通过。\texttt{cargo test} 全模块共 371 个用例，0 失败 / 0 警告。
-细分模块（含 \texttt{catmull\_clark} 11 个与 \texttt{sqrt3} 15 个子模块测试）合计 41 个测试。
+共 17 个单元测试，全部通过。\texttt{cargo test} 全模块共 498 个用例，0 失败 / 0 警告。
+细分模块（含 \texttt{catmull\_clark} 11 个与 \texttt{sqrt3} 16 个子模块测试）合计 44 个测试。
 
 \section{示例输出}
 

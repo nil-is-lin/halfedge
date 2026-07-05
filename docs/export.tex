@@ -206,6 +206,13 @@ $O(V + F)$：每个顶点与每个面常数时间。
         因阶段 1 已收集所有顶点）：\texttt{filter\_map} 静默跳过。
 \end{itemize}
 
+\subsection{数据丢弃警告}
+
+跳过非三角面时不再静默，会通过 \texttt{eprintln!} 输出警告：
+\begin{center}
+\texttt{[halfedge::mesh\_to\_vertex\_index\_buffers] 警告：跳过 N 个非三角面}
+\end{center}
+
 \section{测试覆盖}
 
 \begin{center}

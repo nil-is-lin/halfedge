@@ -118,8 +118,19 @@ pub fn build_mesh_from_vertices_and_faces(
 
     // 2. 为每个面创建 3 条内部半边
     let mut edge_map: HashMap<(u32, u32), HalfEdgeId> = HashMap::new();
+    let n_verts = v_ids.len();
     for face_idx in faces {
         let [i0, i1, i2] = *face_idx;
+        // 越界检查：公开构建函数不应静默 panic
+        if (i0 as usize) >= n_verts
+            || (i1 as usize) >= n_verts
+            || (i2 as usize) >= n_verts
+        {
+            panic!(
+                "build_mesh_from_vertices_and_faces: 面索引 [{}, {}, {}] 越界（顶点总数 {}）",
+                i0, i1, i2, n_verts
+            );
+        }
         let v0 = v_ids[i0 as usize];
         let v1 = v_ids[i1 as usize];
         let v2 = v_ids[i2 as usize];
@@ -271,10 +282,22 @@ pub fn build_mesh_from_polygons(vertices: &[[f64; 3]], faces: &[Vec<u32>]) -> Me
 
     // 2. 为每个面创建 k 条内部半边
     let mut edge_map: HashMap<(u32, u32), HalfEdgeId> = HashMap::new();
+    let n_verts = v_ids.len();
+    let mut skipped_degenerate: u32 = 0;
     for face_idx in faces {
         let k = face_idx.len();
         if k < 3 {
+            skipped_degenerate += 1;
             continue; // 退化面，跳过
+        }
+        // 越界检查：公开构建函数不应静默 panic
+        for idx in face_idx {
+            if (*idx as usize) >= n_verts {
+                panic!(
+                    "build_mesh_from_polygons: 面索引 {} 越界（顶点总数 {}）",
+                    idx, n_verts
+                );
+            }
         }
         // 创建 k 条半边
         let mut he_ids: Vec<HalfEdgeId> = Vec::with_capacity(k);
@@ -384,6 +407,12 @@ pub fn build_mesh_from_polygons(vertices: &[[f64; 3]], faces: &[Vec<u32>]) -> Me
         if let Some(p) = prev_bh {
             mesh.get_halfedge_mut(*bh).unwrap().prev = Some(p);
         }
+    }
+
+    if skipped_degenerate > 0 {
+        eprintln!(
+            "[halfedge::build_mesh_from_polygons] 警告：跳过 {skipped_degenerate} 个退化面（顶点数 < 3）"
+        );
     }
 
     mesh
@@ -517,6 +546,7 @@ pub fn format_obj(mesh: &MeshStorage) -> String {
         let p = mesh.get_vertex(v_id).unwrap().position;
         out.push_str(&format!("v {:.6} {:.6} {:.6}\n", p[0], p[1], p[2]));
     }
+    let mut skipped: u32 = 0;
     for f_id in mesh.face_ids() {
         let verts: Vec<u32> = FaceHalfEdges::new(mesh, f_id)
             .filter_map(|he| mesh.get_halfedge(he))
@@ -524,6 +554,7 @@ pub fn format_obj(mesh: &MeshStorage) -> String {
             .filter_map(|v| v_index.get(&v).copied())
             .collect();
         if verts.len() < 3 {
+            skipped += 1;
             continue; // 跳过退化面
         }
         out.push('f');
@@ -533,11 +564,14 @@ pub fn format_obj(mesh: &MeshStorage) -> String {
         }
         out.push('\n');
     }
+    if skipped > 0 {
+        eprintln!("[halfedge::format_obj] 警告：跳过 {skipped} 个退化面（顶点数 < 3）");
+    }
     out
 }
 
 // ============================================================
-// PLY I/O
+// PLY I/O（ASCII + 二进制小端）
 // ============================================================
 
 /// PLY 解析/序列化错误。
@@ -551,9 +585,9 @@ pub enum PlyError {
 impl fmt::Display for PlyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "IO error: {e}"),
-            Self::Parse { line, msg } => write!(f, "PLY parse error at line {line}: {msg}"),
-            Self::Unsupported(s) => write!(f, "Unsupported PLY feature: {s}"),
+            Self::Io(e) => write!(f, "IO 错误: {e}"),
+            Self::Parse { line, msg } => write!(f, "第 {line} 行 PLY 解析错误: {msg}"),
+            Self::Unsupported(s) => write!(f, "不支持的 PLY 特性: {s}"),
         }
     }
 }
@@ -566,79 +600,327 @@ impl From<std::io::Error> for PlyError {
     }
 }
 
-/// 加载 PLY 文件（ASCII 格式）。
-pub fn load_ply<P: AsRef<Path>>(path: P) -> Result<MeshStorage, PlyError> {
-    let text = fs::read_to_string(path)?;
-    parse_ply(&text)
+/// PLY 数据格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlyFormat {
+    Ascii,
+    BinaryLittleEndian,
+    #[allow(dead_code)]
+    BinaryBigEndian,
 }
 
-/// 解析 PLY ASCII 文本。
-pub fn parse_ply(text: &str) -> Result<MeshStorage, PlyError> {
-    let mut lines = text.lines().enumerate();
-    let mut vertex_count: usize = 0;
-    let mut _face_count: usize = 0;
-    let mut in_header = true;
-    let mut vertices: Vec<[f64; 3]> = Vec::new();
-    let mut faces: Vec<Vec<u32>> = Vec::new();
+/// PLY 标量类型与字节宽度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlyType {
+    Char,
+    UChar,
+    Short,
+    UShort,
+    Int,
+    UInt,
+    Float,
+    Double,
+}
 
-    for (line_no, raw) in &mut lines {
-        let line = raw.trim();
-        if line.is_empty() || (in_header && line.starts_with("comment")) {
-            continue;
+impl PlyType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "char" | "int8" => Some(Self::Char),
+            "uchar" | "uint8" => Some(Self::UChar),
+            "short" | "int16" => Some(Self::Short),
+            "ushort" | "uint16" => Some(Self::UShort),
+            "int" | "int32" => Some(Self::Int),
+            "uint" | "uint32" => Some(Self::UInt),
+            "float" | "float32" => Some(Self::Float),
+            "double" | "float64" => Some(Self::Double),
+            _ => None,
         }
-        if in_header {
-            if line == "end_header" {
-                in_header = false;
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 && parts[0] == "element" {
-                if parts[1] == "vertex" {
-                    vertex_count = parts[2].parse().map_err(|_| PlyError::Parse {
-                        line: line_no + 1,
-                        msg: "invalid vertex count".into(),
-                    })?;
-                } else if parts[1] == "face" {
-                    _face_count = parts[2].parse().map_err(|_| PlyError::Parse {
-                        line: line_no + 1,
-                        msg: "invalid face count".into(),
-                    })?;
-                }
-            }
-        } else {
-            if vertices.len() < vertex_count {
-                let coords: Vec<f64> = line
-                    .split_whitespace()
-                    .take(3)
-                    .map(|s| {
-                        s.parse::<f64>().map_err(|_| PlyError::Parse {
-                            line: line_no + 1,
-                            msg: format!("invalid vertex coordinate: {s}"),
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
-                if coords.len() >= 3 {
-                    vertices.push([coords[0], coords[1], coords[2]]);
-                }
-            } else {
-                let indices: Vec<u32> = line
-                    .split_whitespace()
-                    .skip(1) // skip the count prefix
-                    .map(|s| {
-                        s.parse::<u32>().map_err(|_| PlyError::Parse {
-                            line: line_no + 1,
-                            msg: format!("invalid face index: {s}"),
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
-                if indices.len() >= 3 {
-                    faces.push(indices);
-                }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Char | Self::UChar => 1,
+            Self::Short | Self::UShort => 2,
+            Self::Int | Self::UInt | Self::Float => 4,
+            Self::Double => 8,
+        }
+    }
+
+    /// 以小端字节读取该类型并返回 f64（用于顶点坐标）。
+    fn read_le_as_f64(&self, bytes: &[u8]) -> Result<f64, PlyError> {
+        match self {
+            Self::Char => bytes
+                .first()
+                .map(|b| (*b as i8) as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::UChar => bytes
+                .first()
+                .map(|b| *b as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Short => bytes
+                .get(0..2)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 2]| i16::from_le_bytes(arr) as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::UShort => bytes
+                .get(0..2)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 2]| u16::from_le_bytes(arr) as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Int => bytes
+                .get(0..4)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 4]| i32::from_le_bytes(arr) as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::UInt => bytes
+                .get(0..4)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 4]| u32::from_le_bytes(arr) as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Float => bytes
+                .get(0..4)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 4]| f32::from_le_bytes(arr) as f64)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Double => bytes
+                .get(0..8)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 8]| f64::from_le_bytes(arr))
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+        }
+    }
+
+    /// 以小端字节读取该类型并返回 u32（用于面索引）。
+    fn read_le_as_u32(&self, bytes: &[u8]) -> Result<u32, PlyError> {
+        match self {
+            Self::Char => bytes
+                .first()
+                .map(|b| (*b as i8) as u32)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::UChar => bytes
+                .first()
+                .map(|b| *b as u32)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Short => bytes
+                .get(0..2)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 2]| i16::from_le_bytes(arr) as u32)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::UShort => bytes
+                .get(0..2)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 2]| u16::from_le_bytes(arr) as u32)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Int => bytes
+                .get(0..4)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 4]| i32::from_le_bytes(arr) as u32)
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::UInt => bytes
+                .get(0..4)
+                .and_then(|s| s.try_into().ok())
+                .map(|arr: [u8; 4]| u32::from_le_bytes(arr))
+                .ok_or_else(|| PlyError::Unsupported("字节流意外结束".into())),
+            Self::Float | Self::Double => {
+                Err(PlyError::Unsupported("浮点类型用作索引类型".into()))
             }
         }
     }
 
-    Ok(build_mesh_from_polygons(&vertices, &faces))
+    /// 将 f64 写为该类型的小端字节。
+    fn write_le_from_f64(&self, v: f64) -> Vec<u8> {
+        match self {
+            Self::Char => (v as i8).to_le_bytes().to_vec(),
+            Self::UChar => (v as u8).to_le_bytes().to_vec(),
+            Self::Short => (v as i16).to_le_bytes().to_vec(),
+            Self::UShort => (v as u16).to_le_bytes().to_vec(),
+            Self::Int => (v as i32).to_le_bytes().to_vec(),
+            Self::UInt => (v as u32).to_le_bytes().to_vec(),
+            Self::Float => (v as f32).to_le_bytes().to_vec(),
+            Self::Double => v.to_le_bytes().to_vec(),
+        }
+    }
+
+    /// 将 u32 写为该类型的小端字节。
+    fn write_le_from_u32(&self, v: u32) -> Vec<u8> {
+        match self {
+            Self::Char => (v as i8).to_le_bytes().to_vec(),
+            Self::UChar => (v as u8).to_le_bytes().to_vec(),
+            Self::Short => (v as i16).to_le_bytes().to_vec(),
+            Self::UShort => (v as u16).to_le_bytes().to_vec(),
+            Self::Int => (v as i32).to_le_bytes().to_vec(),
+            Self::UInt => v.to_le_bytes().to_vec(),
+            Self::Float | Self::Double => (v as f32).to_le_bytes().to_vec(),
+        }
+    }
+}
+
+/// PLY header 解析结果。
+struct PlyHeader {
+    format: PlyFormat,
+    vertex_count: usize,
+    /// 顶点属性 (name, type)，按出现顺序。
+    vertex_props: Vec<(String, PlyType)>,
+    face_count: usize,
+    /// 面索引 list 的 (count_type, index_type)，None 表示无面。
+    face_list: Option<(PlyType, PlyType)>,
+}
+
+/// 解析 PLY header 文本部分。返回 header 与剩余二进制起始偏移。
+fn parse_ply_header(text_or_bytes: &[u8]) -> Result<(PlyHeader, usize), PlyError> {
+    // 找到 "end_header\n" 的字节偏移
+    let needle = b"end_header\n";
+    let end_pos = text_or_bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .ok_or_else(|| PlyError::Parse {
+            line: 0,
+            msg: "缺少 'end_header' 行".into(),
+        })?;
+
+    let header_str =
+        std::str::from_utf8(&text_or_bytes[..end_pos]).map_err(|_| PlyError::Parse {
+            line: 0,
+            msg: "PLY 头部不是有效 UTF-8".into(),
+        })?;
+
+    let mut format = PlyFormat::Ascii;
+    let mut vertex_count: usize = 0;
+    let mut face_count: usize = 0;
+    let mut vertex_props: Vec<(String, PlyType)> = Vec::new();
+    let mut face_list: Option<(PlyType, PlyType)> = None;
+    let mut current_element: Option<String> = None;
+
+    for (line_no, line) in header_str.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("comment") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        match parts[0] {
+            "ply" | "end_header" => {}
+            "format" => {
+                if parts.len() < 2 {
+                    return Err(PlyError::Parse {
+                        line: line_no + 1,
+                        msg: "format 行缺少类型".into(),
+                    });
+                }
+                format = match parts[1] {
+                    "ascii" => PlyFormat::Ascii,
+                    "binary_little_endian" => PlyFormat::BinaryLittleEndian,
+                    "binary_big_endian" => PlyFormat::BinaryBigEndian,
+                    other => {
+                        return Err(PlyError::Unsupported(format!(
+                            "未知 PLY 格式: {other}"
+                        )));
+                    }
+                };
+            }
+            "element" => {
+                if parts.len() < 3 {
+                    return Err(PlyError::Parse {
+                        line: line_no + 1,
+                        msg: "element 行缺少名称或计数".into(),
+                    });
+                }
+                let name = parts[1].to_string();
+                let count: usize = parts[2].parse().map_err(|_| PlyError::Parse {
+                    line: line_no + 1,
+                    msg: format!("无效的 element 计数: {}", parts[2]),
+                })?;
+                match name.as_str() {
+                    "vertex" => {
+                        vertex_count = count;
+                        current_element = Some("vertex".into());
+                    }
+                    "face" => {
+                        face_count = count;
+                        current_element = Some("face".into());
+                    }
+                    _ => {
+                        current_element = Some(name);
+                    }
+                }
+            }
+            "property" => {
+                let elem = match &current_element {
+                    Some(e) => e.as_str(),
+                    None => continue,
+                };
+                if elem == "vertex" {
+                    if parts.len() < 3 {
+                        return Err(PlyError::Parse {
+                            line: line_no + 1,
+                            msg: "vertex property 行过短".into(),
+                        });
+                    }
+                    let ty = PlyType::from_str(parts[1]).ok_or_else(|| {
+                        PlyError::Unsupported(format!("未知类型: {}", parts[1]))
+                    })?;
+                    let name = parts[2].to_string();
+                    vertex_props.push((name, ty));
+                } else if elem == "face" {
+                    // property list <count_type> <index_type> <name>
+                    if parts.len() >= 5 && parts[1] == "list" {
+                        let ct = PlyType::from_str(parts[2]).ok_or_else(|| {
+                            PlyError::Unsupported(format!("未知类型: {}", parts[2]))
+                        })?;
+                        let it = PlyType::from_str(parts[3]).ok_or_else(|| {
+                            PlyError::Unsupported(format!("未知类型: {}", parts[3]))
+                        })?;
+                        face_list = Some((ct, it));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let bin_offset = end_pos + needle.len();
+    Ok((
+        PlyHeader {
+            format,
+            vertex_count,
+            vertex_props,
+            face_count,
+            face_list,
+        },
+        bin_offset,
+    ))
+}
+
+/// 加载 PLY 文件（自动判别 ASCII / 二进制）。
+pub fn load_ply<P: AsRef<Path>>(path: P) -> Result<MeshStorage, PlyError> {
+    let bytes = fs::read(path)?;
+    parse_ply_bytes(&bytes)
+}
+
+/// 解析 PLY 字节流（自动判别 ASCII / 二进制）。
+pub fn parse_ply_bytes(bytes: &[u8]) -> Result<MeshStorage, PlyError> {
+    let (header, bin_offset) = parse_ply_header(bytes)?;
+    match header.format {
+        PlyFormat::Ascii => {
+            // 将全文件转字符串走 ASCII 路径
+            let text = std::str::from_utf8(bytes).map_err(|_| PlyError::Parse {
+                line: 0,
+                msg: "PLY ASCII 文件不是有效 UTF-8".into(),
+            })?;
+            parse_ply_ascii_with_header(text, &header)
+        }
+        PlyFormat::BinaryLittleEndian => parse_ply_binary_le(&bytes[bin_offset..], &header),
+        PlyFormat::BinaryBigEndian => {
+            Err(PlyError::Unsupported("不支持大端 PLY".into()))
+        }
+    }
+}
+
+/// 解析 PLY ASCII 文本（保留旧入口，内部委托给 \texttt{parse\_ply\_bytes}）。
+pub fn parse_ply(text: &str) -> Result<MeshStorage, PlyError> {
+    parse_ply_bytes(text.as_bytes())
 }
 
 /// 将网格序列化为 PLY ASCII 文本。
@@ -666,11 +948,13 @@ pub fn format_ply(mesh: &MeshStorage) -> String {
         let p = mesh.get_vertex(v).unwrap().position;
         out.push_str(&format!("{:.6} {:.6} {:.6}\n", p[0], p[1], p[2]));
     }
+    let mut skipped: u32 = 0;
     for f in &f_ids {
         let verts: Vec<usize> = FaceVertices::new(mesh, *f)
             .filter_map(|v| index_map.get(&v).copied())
             .collect();
         if verts.len() < 3 {
+            skipped += 1;
             continue;
         }
         out.push_str(&verts.len().to_string());
@@ -680,6 +964,9 @@ pub fn format_ply(mesh: &MeshStorage) -> String {
         }
         out.push('\n');
     }
+    if skipped > 0 {
+        eprintln!("[halfedge::format_ply] 警告：跳过 {skipped} 个退化面（顶点数 < 3）");
+    }
     out
 }
 
@@ -687,6 +974,242 @@ pub fn format_ply(mesh: &MeshStorage) -> String {
 pub fn save_ply<P: AsRef<Path>>(mesh: &MeshStorage, path: P) -> Result<(), PlyError> {
     let text = format_ply(mesh);
     fs::write(path, text)?;
+    Ok(())
+}
+
+/// 使用已解析 header 解析 PLY ASCII 文本。跳过 header 行直接读取数据。
+fn parse_ply_ascii_with_header(text: &str, header: &PlyHeader) -> Result<MeshStorage, PlyError> {
+    // 找到 end_header 行
+    let mut end_line: Option<usize> = None;
+    for (i, line) in text.lines().enumerate() {
+        if line.trim() == "end_header" {
+            end_line = Some(i);
+            break;
+        }
+    }
+    let start_line = end_line.ok_or_else(|| PlyError::Parse {
+        line: 0,
+        msg: "缺少 'end_header' 行".into(),
+    })? + 1;
+
+    // 找到顶点 x/y/z 属性的索引（属性可能不止 3 个）
+    let x_idx = header
+        .vertex_props
+        .iter()
+        .position(|(n, _)| n == "x")
+        .unwrap_or(0);
+    let y_idx = header
+        .vertex_props
+        .iter()
+        .position(|(n, _)| n == "y")
+        .unwrap_or(1);
+    let z_idx = header
+        .vertex_props
+        .iter()
+        .position(|(n, _)| n == "z")
+        .unwrap_or(2);
+
+    let mut vertices: Vec<[f64; 3]> = Vec::with_capacity(header.vertex_count);
+    let mut faces: Vec<Vec<u32>> = Vec::with_capacity(header.face_count);
+
+    for (i, raw) in text.lines().enumerate().skip(start_line) {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if vertices.len() < header.vertex_count {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                return Err(PlyError::Parse {
+                    line: i + 1,
+                    msg: "vertex 行字段数少于 3".into(),
+                });
+            }
+            let parse = |s: &str| -> Result<f64, PlyError> {
+                s.parse::<f64>().map_err(|_| PlyError::Parse {
+                    line: i + 1,
+                    msg: format!("无效顶点坐标: {s}"),
+                })
+            };
+            let x = parse(parts[x_idx])?;
+            let y = parse(parts[y_idx])?;
+            let z = parse(parts[z_idx])?;
+            vertices.push([x, y, z]);
+        } else if header.face_count > 0 {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            // 第一个 token 是面顶点数，剩余是索引
+            let count: usize = parts[0].parse().map_err(|_| PlyError::Parse {
+                line: i + 1,
+                msg: format!("无效面顶点数: {}", parts[0]),
+            })?;
+            if parts.len() < count + 1 {
+                return Err(PlyError::Parse {
+                    line: i + 1,
+                    msg: "face 行索引数少于声明值".into(),
+                });
+            }
+            let mut indices: Vec<u32> = Vec::with_capacity(count);
+            for k in 0..count {
+                let idx: u32 = parts[1 + k].parse().map_err(|_| PlyError::Parse {
+                    line: i + 1,
+                    msg: format!("无效面索引: {}", parts[1 + k]),
+                })?;
+                indices.push(idx);
+            }
+            // 退化面（< 3 索引）交给 build_mesh_from_polygons 统一警告并跳过
+            faces.push(indices);
+        }
+    }
+
+    Ok(build_mesh_from_polygons(&vertices, &faces))
+}
+
+/// 解析 PLY 二进制小端数据（end_header 之后的字节）。
+fn parse_ply_binary_le(data: &[u8], header: &PlyHeader) -> Result<MeshStorage, PlyError> {
+    let mut vertices: Vec<[f64; 3]> = Vec::with_capacity(header.vertex_count);
+    let mut faces: Vec<Vec<u32>> = Vec::with_capacity(header.face_count);
+
+    // 找到 x/y/z 属性
+    let x_idx = header
+        .vertex_props
+        .iter()
+        .position(|(n, _)| n == "x")
+        .unwrap_or(0);
+    let y_idx = header
+        .vertex_props
+        .iter()
+        .position(|(n, _)| n == "y")
+        .unwrap_or(1);
+    let z_idx = header
+        .vertex_props
+        .iter()
+        .position(|(n, _)| n == "z")
+        .unwrap_or(2);
+
+    // 计算每顶点字节数
+    let vertex_stride: usize = header.vertex_props.iter().map(|(_, t)| t.size()).sum();
+    if vertex_stride == 0 && header.vertex_count > 0 {
+        return Err(PlyError::Unsupported("顶点无属性".into()));
+    }
+
+    let mut offset = 0usize;
+    for _ in 0..header.vertex_count {
+        if offset + vertex_stride > data.len() {
+            return Err(PlyError::Parse {
+                line: 0,
+                msg: "二进制顶点数据意外结束".into(),
+            });
+        }
+        let mut field_offsets: Vec<usize> = Vec::with_capacity(header.vertex_props.len());
+        let mut cur = offset;
+        for (_, ty) in &header.vertex_props {
+            field_offsets.push(cur);
+            cur += ty.size();
+        }
+        let x = header.vertex_props[x_idx]
+            .1
+            .read_le_as_f64(&data[field_offsets[x_idx]..])?;
+        let y = header.vertex_props[y_idx]
+            .1
+            .read_le_as_f64(&data[field_offsets[y_idx]..])?;
+        let z = header.vertex_props[z_idx]
+            .1
+            .read_le_as_f64(&data[field_offsets[z_idx]..])?;
+        vertices.push([x, y, z]);
+        offset += vertex_stride;
+    }
+
+    // 读面
+    if let Some((ct, it)) = header.face_list {
+        for _ in 0..header.face_count {
+            if offset + ct.size() > data.len() {
+                return Err(PlyError::Parse {
+                    line: 0,
+                    msg: "二进制面计数意外结束".into(),
+                });
+            }
+            let count = ct.read_le_as_u32(&data[offset..])? as usize;
+            offset += ct.size();
+            if offset + it.size() * count > data.len() {
+                return Err(PlyError::Parse {
+                    line: 0,
+                    msg: "二进制面索引意外结束".into(),
+                });
+            }
+            let mut indices: Vec<u32> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let idx = it.read_le_as_u32(&data[offset..])?;
+                offset += it.size();
+                indices.push(idx);
+            }
+            // 退化面（< 3 索引）交给 build_mesh_from_polygons 统一警告并跳过
+            faces.push(indices);
+        }
+    }
+
+    Ok(build_mesh_from_polygons(&vertices, &faces))
+}
+
+/// 序列化网格为二进制 PLY 字节流（小端，float 顶点 + uchar/int 面索引）。
+pub fn format_ply_binary(mesh: &MeshStorage) -> Vec<u8> {
+    let v_ids: Vec<VertexId> = mesh.vertex_ids().collect();
+    let f_ids: Vec<FaceId> = mesh.face_ids().collect();
+    let mut index_map: std::collections::HashMap<VertexId, usize> =
+        std::collections::HashMap::new();
+    for (i, &v) in v_ids.iter().enumerate() {
+        index_map.insert(v, i);
+    }
+
+    let mut header = String::new();
+    header.push_str("ply\n");
+    header.push_str("format binary_little_endian 1.0\n");
+    header.push_str(&format!("element vertex {}\n", v_ids.len()));
+    header.push_str("property float x\n");
+    header.push_str("property float y\n");
+    header.push_str("property float z\n");
+    header.push_str(&format!("element face {}\n", f_ids.len()));
+    header.push_str("property list uchar int vertex_indices\n");
+    header.push_str("end_header\n");
+
+    let mut out: Vec<u8> = Vec::with_capacity(header.len() + v_ids.len() * 12 + f_ids.len() * 16);
+    out.extend_from_slice(header.as_bytes());
+
+    let float_ty = PlyType::Float;
+    for &v in &v_ids {
+        let p = mesh.get_vertex(v).unwrap().position;
+        for c in &p {
+            out.extend(float_ty.write_le_from_f64(*c));
+        }
+    }
+    let uchar_ty = PlyType::UChar;
+    let int_ty = PlyType::Int;
+    let mut skipped: u32 = 0;
+    for f in &f_ids {
+        let verts: Vec<usize> = FaceVertices::new(mesh, *f)
+            .filter_map(|v| index_map.get(&v).copied())
+            .collect();
+        if verts.len() < 3 {
+            skipped += 1;
+            continue;
+        }
+        out.extend(uchar_ty.write_le_from_u32(verts.len() as u32));
+        for vi in &verts {
+            out.extend(int_ty.write_le_from_u32(*vi as u32));
+        }
+    }
+    if skipped > 0 {
+        eprintln!("[halfedge::format_ply_binary] 警告：跳过 {skipped} 个退化面（顶点数 < 3）");
+    }
+    out
+}
+
+/// 将网格保存为二进制 PLY 文件。
+pub fn save_ply_binary<P: AsRef<Path>>(mesh: &MeshStorage, path: P) -> Result<(), PlyError> {
+    let bytes = format_ply_binary(mesh);
+    fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -717,14 +1240,14 @@ pub enum StlError {
 impl fmt::Display for StlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "IO error: {e}"),
-            Self::Parse { line, msg } => write!(f, "STL parse error at line {line}: {msg}"),
+            Self::Io(e) => write!(f, "IO 错误: {e}"),
+            Self::Parse { line, msg } => write!(f, "第 {line} 行 STL 解析错误: {msg}"),
             Self::BadBinarySize { actual, expected } => write!(
                 f,
-                "STL binary size mismatch: actual {actual} bytes, expected {expected} bytes"
+                "STL 二进制大小不匹配：实际 {actual} 字节，期望 {expected} 字节"
             ),
             Self::NotTriangular { face_verts } => {
-                write!(f, "STL face vertex count {face_verts} ≠ 3")
+                write!(f, "STL 面顶点数 {face_verts} ≠ 3")
             }
         }
     }
@@ -762,7 +1285,7 @@ pub fn parse_stl_bytes(bytes: &[u8]) -> Result<MeshStorage, StlError> {
     // 否则按 ASCII 解析
     let text = std::str::from_utf8(bytes).map_err(|_| StlError::Parse {
         line: 0,
-        msg: "file is not valid UTF-8".into(),
+        msg: "文件不是有效 UTF-8".into(),
     })?;
     parse_stl_ascii(text)
 }
@@ -808,21 +1331,21 @@ pub fn parse_stl_ascii(text: &str) -> Result<MeshStorage, StlError> {
                 if parts.len() < 4 {
                     return Err(StlError::Parse {
                         line: i + 1,
-                        msg: "vertex line needs 3 coordinates".into(),
+                        msg: "vertex 行需要 3 个坐标".into(),
                     });
                 }
                 let coords: [f64; 3] = [
                     parts[1].parse().map_err(|_| StlError::Parse {
                         line: i + 1,
-                        msg: format!("invalid x: {}", parts[1]),
+                        msg: format!("无效 x 坐标: {}", parts[1]),
                     })?,
                     parts[2].parse().map_err(|_| StlError::Parse {
                         line: i + 1,
-                        msg: format!("invalid y: {}", parts[2]),
+                        msg: format!("无效 y 坐标: {}", parts[2]),
                     })?,
                     parts[3].parse().map_err(|_| StlError::Parse {
                         line: i + 1,
-                        msg: format!("invalid z: {}", parts[3]),
+                        msg: format!("无效 z 坐标: {}", parts[3]),
                     })?,
                 ];
                 // 用位模式做精确去重（与 binary 路径一致）
@@ -923,9 +1446,11 @@ pub fn format_stl_ascii(mesh: &MeshStorage) -> String {
     use crate::geometry::face_normal;
     let mut out = String::with_capacity(mesh.face_count() * 80);
     out.push_str("solid halfedge\n");
+    let mut skipped: u32 = 0;
     for f in mesh.face_ids() {
         let verts: Vec<VertexId> = crate::traversal::FaceVertices::new(mesh, f).collect();
         if verts.len() != 3 {
+            skipped += 1;
             continue;
         }
         let p0 = mesh
@@ -953,6 +1478,9 @@ pub fn format_stl_ascii(mesh: &MeshStorage) -> String {
         }
         out.push_str("    endloop\n  endfacet\n");
     }
+    if skipped > 0 {
+        eprintln!("[halfedge::format_stl_ascii] 警告：跳过 {skipped} 个非三角面");
+    }
     out.push_str("endsolid halfedge\n");
     out
 }
@@ -977,11 +1505,13 @@ pub fn format_stl_binary(mesh: &MeshStorage) -> Vec<u8> {
     let n = mesh.face_count() as u32;
     out.extend_from_slice(&n.to_le_bytes());
 
+    let mut skipped: u32 = 0;
     for f in mesh.face_ids() {
         let verts: Vec<VertexId> = crate::traversal::FaceVertices::new(mesh, f).collect();
         if verts.len() != 3 {
             // 退化：填零三角，但保留面计数一致性由调用方保证
             out.extend_from_slice(&[0u8; 50]);
+            skipped += 1;
             continue;
         }
         let p0 = mesh
@@ -1008,7 +1538,889 @@ pub fn format_stl_binary(mesh: &MeshStorage) -> Vec<u8> {
         // 2 字节属性
         out.extend_from_slice(&[0u8, 0u8]);
     }
+    if skipped > 0 {
+        eprintln!("[halfedge::format_stl_binary] 警告：填零 {skipped} 个非三角面");
+    }
     out
+}
+
+// ============================================================
+// OFF I/O（ASCII）
+// ============================================================
+
+/// OFF 解析/序列化错误。
+#[derive(Debug)]
+pub enum OffError {
+    Io(std::io::Error),
+    Parse { line: usize, msg: String },
+}
+
+impl fmt::Display for OffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "IO 错误: {e}"),
+            Self::Parse { line, msg } => write!(f, "第 {line} 行 OFF 解析错误: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for OffError {}
+
+impl From<std::io::Error> for OffError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// 加载 OFF 文件（ASCII）。
+///
+/// 格式：
+/// ```text
+/// OFF
+/// <vertex_count> <face_count> <edge_count>
+/// x y z                # vertex 0
+/// ...
+/// k v0 v1 ... vk-1     # face 0
+/// ...
+/// ```
+/// 第一行 `OFF` 关键字可选（部分文件首行是 `OFFN` 或带数字）。
+/// `#` 开头行视为注释。`edge_count` 通常为 0，被忽略。
+pub fn load_off<P: AsRef<Path>>(path: P) -> Result<MeshStorage, OffError> {
+    let text = fs::read_to_string(path)?;
+    parse_off(&text)
+}
+
+/// 解析 OFF 文本。
+pub fn parse_off(text: &str) -> Result<MeshStorage, OffError> {
+    let mut lines = text.lines().filter(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#')
+    });
+
+    // 第一行可能含 OFF 关键字
+    let first = match lines.next() {
+        Some(s) => s,
+        None => {
+            return Err(OffError::Parse {
+                line: 1,
+                msg: "OFF 文件为空".into(),
+            });
+        }
+    };
+    let counts_line = if first.trim().starts_with("OFF") {
+        // 若首行除 OFF 外无数字，则计数在下一行
+        let rest = first.trim().strip_prefix("OFF").unwrap_or(first).trim();
+        if rest.is_empty() {
+            lines.next().unwrap_or("")
+        } else {
+            rest
+        }
+    } else {
+        first
+    };
+
+    let count_parts: Vec<&str> = counts_line.split_whitespace().collect();
+    if count_parts.len() < 2 {
+        return Err(OffError::Parse {
+            line: 1,
+            msg: "OFF 头部缺少顶点/面计数".into(),
+        });
+    }
+    let v_count: usize = count_parts[0].parse().map_err(|_| OffError::Parse {
+        line: 1,
+        msg: format!("无效顶点计数: {}", count_parts[0]),
+    })?;
+    let f_count: usize = count_parts[1].parse().map_err(|_| OffError::Parse {
+        line: 1,
+        msg: format!("无效面计数: {}", count_parts[1]),
+    })?;
+
+    let mut vertices: Vec<[f64; 3]> = Vec::with_capacity(v_count);
+    let mut faces: Vec<Vec<u32>> = Vec::with_capacity(f_count);
+    let mut line_no: usize;
+
+    for (i, raw) in lines.enumerate() {
+        line_no = i + 3;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if vertices.len() < v_count {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                return Err(OffError::Parse {
+                    line: line_no,
+                    msg: "vertex 行坐标数少于 3".into(),
+                });
+            }
+            let x: f64 = parts[0].parse().map_err(|_| OffError::Parse {
+                line: line_no,
+                msg: format!("无效 x 坐标: {}", parts[0]),
+            })?;
+            let y: f64 = parts[1].parse().map_err(|_| OffError::Parse {
+                line: line_no,
+                msg: format!("无效 y 坐标: {}", parts[1]),
+            })?;
+            let z: f64 = parts[2].parse().map_err(|_| OffError::Parse {
+                line: line_no,
+                msg: format!("无效 z 坐标: {}", parts[2]),
+            })?;
+            vertices.push([x, y, z]);
+        } else if faces.len() < f_count {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let k: usize = parts[0].parse().map_err(|_| OffError::Parse {
+                line: line_no,
+                msg: format!("无效面顶点数: {}", parts[0]),
+            })?;
+            // 退化面（k < 3）交给 build_mesh_from_polygons 统一警告并跳过
+            if parts.len() < k + 1 {
+                return Err(OffError::Parse {
+                    line: line_no,
+                    msg: "face 行索引数少于声明值".into(),
+                });
+            }
+            let mut idx = Vec::with_capacity(k);
+            for j in 0..k {
+                let v: u32 = parts[1 + j].parse().map_err(|_| OffError::Parse {
+                    line: line_no,
+                    msg: format!("无效面索引: {}", parts[1 + j]),
+                })?;
+                if v as usize >= v_count {
+                    return Err(OffError::Parse {
+                        line: line_no,
+                        msg: format!("面索引 {v} 越界（顶点计数 {v_count}）"),
+                    });
+                }
+                idx.push(v);
+            }
+            faces.push(idx);
+        }
+    }
+
+    Ok(build_mesh_from_polygons(&vertices, &faces))
+}
+
+/// 将网格序列化为 OFF 文本。
+pub fn format_off(mesh: &MeshStorage) -> String {
+    let v_ids: Vec<VertexId> = mesh.vertex_ids().collect();
+    let f_ids: Vec<FaceId> = mesh.face_ids().collect();
+    let mut index_map: std::collections::HashMap<VertexId, usize> =
+        std::collections::HashMap::new();
+    for (i, &v) in v_ids.iter().enumerate() {
+        index_map.insert(v, i);
+    }
+
+    let mut out = String::with_capacity(v_ids.len() * 32 + f_ids.len() * 16);
+    out.push_str("OFF\n");
+    out.push_str(&format!("{} {} 0\n", v_ids.len(), f_ids.len()));
+    for &v in &v_ids {
+        let p = mesh.get_vertex(v).unwrap().position;
+        out.push_str(&format!("{:.6} {:.6} {:.6}\n", p[0], p[1], p[2]));
+    }
+    let mut skipped: u32 = 0;
+    for f in &f_ids {
+        let verts: Vec<usize> = FaceVertices::new(mesh, *f)
+            .filter_map(|v| index_map.get(&v).copied())
+            .collect();
+        if verts.len() < 3 {
+            skipped += 1;
+            continue;
+        }
+        out.push_str(&verts.len().to_string());
+        for vi in &verts {
+            out.push(' ');
+            out.push_str(&vi.to_string());
+        }
+        out.push('\n');
+    }
+    if skipped > 0 {
+        eprintln!("[halfedge::format_off] 警告：跳过 {skipped} 个退化面（顶点数 < 3）");
+    }
+    out
+}
+
+/// 将网格保存为 OFF 文件。
+pub fn save_off<P: AsRef<Path>>(mesh: &MeshStorage, path: P) -> Result<(), OffError> {
+    let text = format_off(mesh);
+    fs::write(path, text)?;
+    Ok(())
+}
+
+// ============================================================
+// glTF GLB I/O（最小子集：单 mesh primitive，POSITION + indices）
+// ============================================================
+
+/// glTF 解析/序列化错误。
+#[derive(Debug)]
+pub enum GltfError {
+    Io(std::io::Error),
+    Parse(String),
+    Unsupported(String),
+}
+
+impl fmt::Display for GltfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "IO 错误: {e}"),
+            Self::Parse(s) => write!(f, "glTF 解析错误: {s}"),
+            Self::Unsupported(s) => write!(f, "不支持的 glTF 特性: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for GltfError {}
+
+impl From<std::io::Error> for GltfError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+const GLB_MAGIC: u32 = 0x4654_4C47; // "glTF"
+const GLB_VERSION: u32 = 2;
+const JSON_CHUNK_TYPE: u32 = 0x4E4F_534A; // "JSON"
+const BIN_CHUNK_TYPE: u32 = 0x004E_4942; // "BIN\0"
+
+/// 加载 GLB 文件（glTF 二进制容器）。
+///
+/// 仅支持最小子集：单 mesh primitive，含 POSITION accessor 与索引 accessor。
+/// 不支持材质、纹理、动画、skin、camera、node 层级等高级特性。
+pub fn load_glb<P: AsRef<Path>>(path: P) -> Result<MeshStorage, GltfError> {
+    let bytes = fs::read(path)?;
+    parse_glb(&bytes)
+}
+
+/// 解析 GLB 字节流。
+pub fn parse_glb(bytes: &[u8]) -> Result<MeshStorage, GltfError> {
+    if bytes.len() < 12 {
+        return Err(GltfError::Parse("文件过短，无法构成 GLB 头部".into()));
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if magic != GLB_MAGIC {
+        return Err(GltfError::Parse(format!(
+            "无效 GLB magic: 0x{magic:08X}"
+        )));
+    }
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != GLB_VERSION {
+        return Err(GltfError::Unsupported(format!(
+            "不支持 GLB 版本 {version}（仅支持 2）"
+        )));
+    }
+    let _total_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+
+    // 解析 chunks（每 chunk: 4 字节长度 + 4 字节类型 + 数据，需 4 字节对齐）
+    let mut offset = 12usize;
+    let mut json_chunk: Option<&[u8]> = None;
+    let mut bin_chunk: Option<&[u8]> = None;
+
+    while offset + 8 <= bytes.len() {
+        let chunk_len = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let chunk_type = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]);
+        offset += 8;
+        if offset + chunk_len > bytes.len() {
+            return Err(GltfError::Parse("chunk 长度超过文件大小".into()));
+        }
+        let data = &bytes[offset..offset + chunk_len];
+        offset += chunk_len;
+        // 4 字节对齐填充
+        while offset < bytes.len() && !offset.is_multiple_of(4) {
+            offset += 1;
+        }
+        match chunk_type {
+            JSON_CHUNK_TYPE => json_chunk = Some(data),
+            BIN_CHUNK_TYPE => bin_chunk = Some(data),
+            _ => {}
+        }
+    }
+
+    let json_bytes = json_chunk.ok_or_else(|| GltfError::Parse("缺少 JSON chunk".into()))?;
+    let json_str = std::str::from_utf8(json_bytes)
+        .map_err(|_| GltfError::Parse("JSON chunk 不是有效 UTF-8".into()))?;
+    let bin = bin_chunk.ok_or_else(|| GltfError::Parse("缺少 BIN chunk".into()))?;
+
+    let json = parse_minimal_json(json_str)?;
+    let gltf = GltfDoc::from_json(&json)?;
+
+    // 找第一个 mesh 的第一个 primitive
+    let prim = gltf
+        .meshes
+        .first()
+        .and_then(|m| m.primitives.first())
+        .ok_or_else(|| GltfError::Parse("未找到 mesh primitive".into()))?;
+
+    // 读 POSITION accessor
+    let pos_acc_idx = prim
+        .attributes
+        .get("POSITION")
+        .copied()
+        .ok_or_else(|| GltfError::Parse("primitive 缺少 POSITION 属性".into()))?;
+    let positions = read_accessor_f32x3(&gltf, pos_acc_idx, bin)?;
+
+    // 读 indices（可选）
+    let indices: Vec<u32> = if let Some(idx_acc) = prim.indices {
+        read_accessor_u32(&gltf, idx_acc, bin)?
+    } else {
+        // 无索引：非 indexed draw，顺序 0..N
+        (0..positions.len() as u32).collect()
+    };
+
+    // 转三角面：若 mode != 4（TRIANGLES）则不支持
+    if prim.mode != 4 {
+        return Err(GltfError::Unsupported(format!(
+            "不支持 primitive mode {}（仅支持 4 = TRIANGLES）",
+            prim.mode
+        )));
+    }
+
+    if !indices.len().is_multiple_of(3) {
+        return Err(GltfError::Parse(format!(
+            "索引数 {} 不是 3 的倍数",
+            indices.len()
+        )));
+    }
+
+    let mut faces: Vec<[u32; 3]> = Vec::with_capacity(indices.len() / 3);
+    for tri in indices.chunks_exact(3) {
+        faces.push([tri[0], tri[1], tri[2]]);
+    }
+
+    Ok(build_mesh_from_vertices_and_faces(&positions, &faces))
+}
+
+/// 序列化网格为 GLB 字节流（最小子集）。
+///
+/// 输出结构：
+/// - 12 字节 GLB header（magic, version=2, total_length）
+/// - JSON chunk：描述 buffers / bufferViews / accessors / meshes
+/// - BIN chunk：position (float32 × 3N) + indices (uint32 × M)
+///
+/// 仅生成单 mesh / 单 primitive（mode=4 TRIANGLES），无材质。
+/// 非三角面被跳过。
+pub fn format_glb(mesh: &MeshStorage) -> Vec<u8> {
+    let v_ids: Vec<VertexId> = mesh.vertex_ids().collect();
+    let mut index_map: std::collections::HashMap<VertexId, u32> = std::collections::HashMap::new();
+    for (i, &v) in v_ids.iter().enumerate() {
+        index_map.insert(v, i as u32);
+    }
+
+    // 构造 BIN 数据
+    let mut bin: Vec<u8> = Vec::with_capacity(v_ids.len() * 12 + mesh.face_count() * 12);
+    for &v in &v_ids {
+        let p = mesh.get_vertex(v).unwrap().position;
+        for c in &p {
+            bin.extend_from_slice(&(*c as f32).to_le_bytes());
+        }
+    }
+    let pos_byte_len = bin.len();
+    let pos_byte_offset = 0u32;
+
+    let mut index_count: u32 = 0;
+    let mut skipped: u32 = 0;
+    for f in mesh.face_ids() {
+        let verts: Vec<u32> = FaceVertices::new(mesh, f)
+            .filter_map(|v| index_map.get(&v).copied())
+            .collect();
+        if verts.len() != 3 {
+            skipped += 1;
+            continue;
+        }
+        for vi in &verts {
+            bin.extend_from_slice(&vi.to_le_bytes());
+        }
+        index_count += 3;
+    }
+    let idx_byte_offset = pos_byte_len as u32;
+    let idx_byte_len = bin.len() - pos_byte_len;
+
+    // 构造 JSON（手动拼接避免依赖 serde_json）
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0","generator":"halfedge"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"mode":4}}]}}],"buffers":[{{"byteLength":{}}}],"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":{},"target":34962}},{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34963}}],"accessors":[{{"bufferView":0,"componentType":5126,"count":{},"type":"VEC3","max":[0,0,0],"min":[0,0,0]}},{{"bufferView":1,"componentType":5125,"count":{},"type":"SCALAR"}}]}}"#,
+        bin.len(),
+        pos_byte_len,
+        idx_byte_offset,
+        idx_byte_len,
+        v_ids.len(),
+        index_count
+    );
+
+    // chunk 数据需 4 字节对齐（用空格填充 JSON）
+    let mut json_bytes = json.into_bytes();
+    while !json_bytes.len().is_multiple_of(4) {
+        json_bytes.push(b' ');
+    }
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+
+    let total_len = 12 + 8 + json_bytes.len() + 8 + bin.len();
+    let mut out: Vec<u8> = Vec::with_capacity(total_len);
+    out.extend_from_slice(&GLB_MAGIC.to_le_bytes());
+    out.extend_from_slice(&GLB_VERSION.to_le_bytes());
+    out.extend_from_slice(&(total_len as u32).to_le_bytes());
+
+    out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&JSON_CHUNK_TYPE.to_le_bytes());
+    out.extend_from_slice(&json_bytes);
+
+    out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    out.extend_from_slice(&BIN_CHUNK_TYPE.to_le_bytes());
+    out.extend_from_slice(&bin);
+
+    // 隐藏未使用变量警告
+    let _ = pos_byte_offset;
+    if skipped > 0 {
+        eprintln!("[halfedge::format_glb] 警告：跳过 {skipped} 个非三角面");
+    }
+    out
+}
+
+/// 将网格保存为 GLB 文件。
+pub fn save_glb<P: AsRef<Path>>(mesh: &MeshStorage, path: P) -> Result<(), GltfError> {
+    let bytes = format_glb(mesh);
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+// --- 极简 JSON 解析（仅支持 GLB 中所需的对象/数组/原始值） ---
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(Vec<(String, JsonValue)>),
+}
+
+impl JsonValue {
+    fn as_object(&self) -> Option<&[(String, JsonValue)]> {
+        match self {
+            JsonValue::Object(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    fn as_array(&self) -> Option<&[JsonValue]> {
+        match self {
+            JsonValue::Array(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    fn as_u32(&self) -> Option<u32> {
+        match self {
+            JsonValue::Number(n) if *n >= 0.0 => Some(*n as u32),
+            _ => None,
+        }
+    }
+    #[allow(dead_code)]
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    fn get(&self, key: &str) -> Option<&JsonValue> {
+        self.as_object()
+            .and_then(|o| o.iter().find(|(k, _)| k == key).map(|(_, v)| v))
+    }
+}
+
+/// 极简 JSON 解析器。支持 object / array / string / number / bool / null。
+fn parse_minimal_json(text: &str) -> Result<JsonValue, GltfError> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    skip_ws(bytes, &mut pos);
+    let v = parse_value(bytes, &mut pos)?;
+    Ok(v)
+}
+
+fn skip_ws(bytes: &[u8], pos: &mut usize) {
+    while *pos < bytes.len() {
+        match bytes[*pos] {
+            b' ' | b'\t' | b'\n' | b'\r' => *pos += 1,
+            _ => break,
+        }
+    }
+}
+
+fn parse_value(bytes: &[u8], pos: &mut usize) -> Result<JsonValue, GltfError> {
+    skip_ws(bytes, pos);
+    if *pos >= bytes.len() {
+        return Err(GltfError::Parse("JSON 意外结束".into()));
+    }
+    match bytes[*pos] {
+        b'{' => parse_object(bytes, pos),
+        b'[' => parse_array(bytes, pos),
+        b'"' => parse_string(bytes, pos).map(JsonValue::String),
+        b't' | b'f' => parse_bool(bytes, pos).map(JsonValue::Bool),
+        b'n' => parse_null(bytes, pos).map(|_| JsonValue::Null),
+        b'-' | b'0'..=b'9' => parse_number(bytes, pos).map(JsonValue::Number),
+        c => Err(GltfError::Parse(format!(
+            "位置 {} 处出现意外 JSON 字符 '{}'",
+            pos, c as char
+        ))),
+    }
+}
+
+fn parse_object(bytes: &[u8], pos: &mut usize) -> Result<JsonValue, GltfError> {
+    *pos += 1; // skip '{'
+    let mut entries: Vec<(String, JsonValue)> = Vec::new();
+    skip_ws(bytes, pos);
+    if *pos < bytes.len() && bytes[*pos] == b'}' {
+        *pos += 1;
+        return Ok(JsonValue::Object(entries));
+    }
+    loop {
+        skip_ws(bytes, pos);
+        if *pos >= bytes.len() || bytes[*pos] != b'"' {
+            return Err(GltfError::Parse("对象中应为字符串键".into()));
+        }
+        let key = parse_string(bytes, pos)?;
+        skip_ws(bytes, pos);
+        if *pos >= bytes.len() || bytes[*pos] != b':' {
+            return Err(GltfError::Parse("键后应为 ':'".into()));
+        }
+        *pos += 1;
+        let val = parse_value(bytes, pos)?;
+        entries.push((key, val));
+        skip_ws(bytes, pos);
+        if *pos >= bytes.len() {
+            return Err(GltfError::Parse("对象意外结束".into()));
+        }
+        match bytes[*pos] {
+            b',' => {
+                *pos += 1;
+                continue;
+            }
+            b'}' => {
+                *pos += 1;
+                return Ok(JsonValue::Object(entries));
+            }
+            c => {
+                return Err(GltfError::Parse(format!(
+                    "对象中应为 ',' 或 '}}'，实际为 '{}'",
+                    c as char
+                )));
+            }
+        }
+    }
+}
+
+fn parse_array(bytes: &[u8], pos: &mut usize) -> Result<JsonValue, GltfError> {
+    *pos += 1; // skip '['
+    let mut items: Vec<JsonValue> = Vec::new();
+    skip_ws(bytes, pos);
+    if *pos < bytes.len() && bytes[*pos] == b']' {
+        *pos += 1;
+        return Ok(JsonValue::Array(items));
+    }
+    loop {
+        let val = parse_value(bytes, pos)?;
+        items.push(val);
+        skip_ws(bytes, pos);
+        if *pos >= bytes.len() {
+            return Err(GltfError::Parse("数组意外结束".into()));
+        }
+        match bytes[*pos] {
+            b',' => {
+                *pos += 1;
+                continue;
+            }
+            b']' => {
+                *pos += 1;
+                return Ok(JsonValue::Array(items));
+            }
+            c => {
+                return Err(GltfError::Parse(format!(
+                    "数组中应为 ',' 或 ']'，实际为 '{}'",
+                    c as char
+                )));
+            }
+        }
+    }
+}
+
+fn parse_string(bytes: &[u8], pos: &mut usize) -> Result<String, GltfError> {
+    if *pos >= bytes.len() || bytes[*pos] != b'"' {
+        return Err(GltfError::Parse("应为 '\"'".into()));
+    }
+    *pos += 1;
+    let mut s = String::new();
+    while *pos < bytes.len() {
+        let c = bytes[*pos];
+        *pos += 1;
+        match c {
+            b'"' => return Ok(s),
+            b'\\' => {
+                if *pos >= bytes.len() {
+                    return Err(GltfError::Parse("不完整的转义序列".into()));
+                }
+                let esc = bytes[*pos];
+                *pos += 1;
+                match esc {
+                    b'"' => s.push('"'),
+                    b'\\' => s.push('\\'),
+                    b'/' => s.push('/'),
+                    b'n' => s.push('\n'),
+                    b't' => s.push('\t'),
+                    b'r' => s.push('\r'),
+                    b'b' => s.push('\u{08}'),
+                    b'f' => s.push('\u{0C}'),
+                    _ => s.push(esc as char),
+                }
+            }
+            _ => s.push(c as char),
+        }
+    }
+    Err(GltfError::Parse("字符串未终止".into()))
+}
+
+fn parse_bool(bytes: &[u8], pos: &mut usize) -> Result<bool, GltfError> {
+    if bytes[*pos..].starts_with(b"true") {
+        *pos += 4;
+        Ok(true)
+    } else if bytes[*pos..].starts_with(b"false") {
+        *pos += 5;
+        Ok(false)
+    } else {
+        Err(GltfError::Parse("无效 bool 值".into()))
+    }
+}
+
+fn parse_null(bytes: &[u8], pos: &mut usize) -> Result<(), GltfError> {
+    if bytes[*pos..].starts_with(b"null") {
+        *pos += 4;
+        Ok(())
+    } else {
+        Err(GltfError::Parse("无效 null 值".into()))
+    }
+}
+
+fn parse_number(bytes: &[u8], pos: &mut usize) -> Result<f64, GltfError> {
+    let start = *pos;
+    if *pos < bytes.len() && bytes[*pos] == b'-' {
+        *pos += 1;
+    }
+    while *pos < bytes.len() {
+        match bytes[*pos] {
+            b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => *pos += 1,
+            _ => break,
+        }
+    }
+    let s = std::str::from_utf8(&bytes[start..*pos])
+        .map_err(|_| GltfError::Parse("无效数字".into()))?;
+    s.parse::<f64>()
+        .map_err(|_| GltfError::Parse(format!("无效数字: {s}")))
+}
+
+// --- GLB 文档结构 ---
+
+#[derive(Debug)]
+struct GltfAccessor {
+    buffer_view: u32,
+    component_type: u32, // 5120 BYTE / 5121 UBYTE / 5122 SHORT / 5123 USHORT / 5125 UINT / 5126 FLOAT
+    count: u32,
+    byte_offset: u32,
+}
+
+#[derive(Debug)]
+struct GltfBufferView {
+    #[allow(dead_code)]
+    buffer: u32,
+    byte_offset: u32,
+    #[allow(dead_code)]
+    byte_length: u32,
+}
+
+#[derive(Debug)]
+struct GltfPrimitive {
+    attributes: std::collections::HashMap<String, u32>,
+    indices: Option<u32>,
+    mode: u32, // 4 = TRIANGLES
+}
+
+#[derive(Debug)]
+struct GltfMesh {
+    primitives: Vec<GltfPrimitive>,
+}
+
+#[derive(Debug)]
+struct GltfDoc {
+    buffer_views: Vec<GltfBufferView>,
+    accessors: Vec<GltfAccessor>,
+    meshes: Vec<GltfMesh>,
+}
+
+impl GltfDoc {
+    fn from_json(json: &JsonValue) -> Result<Self, GltfError> {
+        let bvs_json = json
+            .get("bufferViews")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| GltfError::Parse("缺少 bufferViews".into()))?;
+        let accs_json = json
+            .get("accessors")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| GltfError::Parse("缺少 accessors".into()))?;
+        let meshes_json = json
+            .get("meshes")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| GltfError::Parse("缺少 meshes".into()))?;
+
+        let mut buffer_views: Vec<GltfBufferView> = Vec::with_capacity(bvs_json.len());
+        for bv in bvs_json {
+            buffer_views.push(GltfBufferView {
+                buffer: bv.get("buffer").and_then(|v| v.as_u32()).unwrap_or(0),
+                byte_offset: bv.get("byteOffset").and_then(|v| v.as_u32()).unwrap_or(0),
+                byte_length: bv
+                    .get("byteLength")
+                    .and_then(|v| v.as_u32())
+                    .ok_or_else(|| GltfError::Parse("bufferView 缺少 byteLength".into()))?,
+            });
+        }
+
+        let mut accessors: Vec<GltfAccessor> = Vec::with_capacity(accs_json.len());
+        for acc in accs_json {
+            accessors.push(GltfAccessor {
+                buffer_view: acc
+                    .get("bufferView")
+                    .and_then(|v| v.as_u32())
+                    .ok_or_else(|| GltfError::Parse("accessor 缺少 bufferView".into()))?,
+                component_type: acc
+                    .get("componentType")
+                    .and_then(|v| v.as_u32())
+                    .ok_or_else(|| GltfError::Parse("accessor 缺少 componentType".into()))?,
+                count: acc
+                    .get("count")
+                    .and_then(|v| v.as_u32())
+                    .ok_or_else(|| GltfError::Parse("accessor 缺少 count".into()))?,
+                byte_offset: acc.get("byteOffset").and_then(|v| v.as_u32()).unwrap_or(0),
+            });
+        }
+
+        let mut meshes: Vec<GltfMesh> = Vec::with_capacity(meshes_json.len());
+        for m in meshes_json {
+            let prims_json = m
+                .get("primitives")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| GltfError::Parse("mesh 缺少 primitives".into()))?;
+            let mut primitives: Vec<GltfPrimitive> = Vec::with_capacity(prims_json.len());
+            for p in prims_json {
+                let mut attributes: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
+                if let Some(attrs) = p.get("attributes").and_then(|v| v.as_object()) {
+                    for (k, v) in attrs {
+                        if let Some(idx) = v.as_u32() {
+                            attributes.insert(k.clone(), idx);
+                        }
+                    }
+                }
+                let indices = p.get("indices").and_then(|v| v.as_u32());
+                let mode = p.get("mode").and_then(|v| v.as_u32()).unwrap_or(4);
+                primitives.push(GltfPrimitive {
+                    attributes,
+                    indices,
+                    mode,
+                });
+            }
+            meshes.push(GltfMesh { primitives });
+        }
+
+        Ok(GltfDoc {
+            buffer_views,
+            accessors,
+            meshes,
+        })
+    }
+}
+
+fn read_accessor_f32x3(
+    doc: &GltfDoc,
+    acc_idx: u32,
+    bin: &[u8],
+) -> Result<Vec<[f64; 3]>, GltfError> {
+    let acc = doc
+        .accessors
+        .get(acc_idx as usize)
+        .ok_or_else(|| GltfError::Parse(format!("accessor {acc_idx} 越界")))?;
+    if acc.component_type != 5126 {
+        return Err(GltfError::Unsupported(format!(
+            "不支持 POSITION componentType {}（仅支持 5126 FLOAT）",
+            acc.component_type
+        )));
+    }
+    let bv = doc
+        .buffer_views
+        .get(acc.buffer_view as usize)
+        .ok_or_else(|| GltfError::Parse(format!("bufferView {} 越界", acc.buffer_view)))?;
+    let start = (bv.byte_offset + acc.byte_offset) as usize;
+    let end = start + (acc.count as usize) * 12;
+    if end > bin.len() {
+        return Err(GltfError::Parse("accessor 超出 bufferView 范围".into()));
+    }
+    let mut out: Vec<[f64; 3]> = Vec::with_capacity(acc.count as usize);
+    let mut off = start;
+    for _ in 0..acc.count {
+        let x = f32::from_le_bytes([bin[off], bin[off + 1], bin[off + 2], bin[off + 3]]);
+        let y = f32::from_le_bytes([bin[off + 4], bin[off + 5], bin[off + 6], bin[off + 7]]);
+        let z = f32::from_le_bytes([bin[off + 8], bin[off + 9], bin[off + 10], bin[off + 11]]);
+        out.push([x as f64, y as f64, z as f64]);
+        off += 12;
+    }
+    Ok(out)
+}
+
+fn read_accessor_u32(doc: &GltfDoc, acc_idx: u32, bin: &[u8]) -> Result<Vec<u32>, GltfError> {
+    let acc = doc
+        .accessors
+        .get(acc_idx as usize)
+        .ok_or_else(|| GltfError::Parse(format!("accessor {acc_idx} 越界")))?;
+    let elem_size: usize = match acc.component_type {
+        5121 => 1, // UBYTE
+        5123 => 2, // USHORT
+        5125 => 4, // UINT
+        other => {
+            return Err(GltfError::Unsupported(format!(
+                "不支持 indices componentType {other}"
+            )));
+        }
+    };
+    let bv = doc
+        .buffer_views
+        .get(acc.buffer_view as usize)
+        .ok_or_else(|| GltfError::Parse(format!("bufferView {} 越界", acc.buffer_view)))?;
+    let start = (bv.byte_offset + acc.byte_offset) as usize;
+    let end = start + (acc.count as usize) * elem_size;
+    if end > bin.len() {
+        return Err(GltfError::Parse("accessor 超出 bufferView 范围".into()));
+    }
+    let mut out: Vec<u32> = Vec::with_capacity(acc.count as usize);
+    let mut off = start;
+    for _ in 0..acc.count {
+        let v: u32 = match acc.component_type {
+            5121 => bin[off] as u32,
+            5123 => u16::from_le_bytes([bin[off], bin[off + 1]]) as u32,
+            5125 => u32::from_le_bytes([bin[off], bin[off + 1], bin[off + 2], bin[off + 3]]),
+            _ => unreachable!(),
+        };
+        out.push(v);
+        off += elem_size;
+    }
+    Ok(out)
 }
 
 // ============================================================
@@ -1021,16 +2433,20 @@ pub enum MeshError {
     Obj(ObjError),
     Ply(PlyError),
     Stl(StlError),
+    Off(OffError),
+    Gltf(GltfError),
     UnsupportedFormat(String),
 }
 
 impl fmt::Display for MeshError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Obj(e) => write!(f, "OBJ error: {e}"),
-            Self::Ply(e) => write!(f, "PLY error: {e}"),
-            Self::Stl(e) => write!(f, "STL error: {e}"),
-            Self::UnsupportedFormat(s) => write!(f, "unsupported format: {s}"),
+            Self::Obj(e) => write!(f, "OBJ 错误: {e}"),
+            Self::Ply(e) => write!(f, "PLY 错误: {e}"),
+            Self::Stl(e) => write!(f, "STL 错误: {e}"),
+            Self::Off(e) => write!(f, "OFF 错误: {e}"),
+            Self::Gltf(e) => write!(f, "glTF 错误: {e}"),
+            Self::UnsupportedFormat(s) => write!(f, "不支持的格式: {s}"),
         }
     }
 }
@@ -1055,12 +2471,26 @@ impl From<StlError> for MeshError {
     }
 }
 
+impl From<OffError> for MeshError {
+    fn from(e: OffError) -> Self {
+        Self::Off(e)
+    }
+}
+
+impl From<GltfError> for MeshError {
+    fn from(e: GltfError) -> Self {
+        Self::Gltf(e)
+    }
+}
+
 /// 自动检测文件格式并加载网格。
 ///
 /// 根据文件扩展名选择解析器：
 /// - `.obj` → OBJ（支持三角面与 n-gon）
-/// - `.ply` → PLY ASCII
+/// - `.ply` → PLY（自动判别 ASCII / 二进制小端）
 /// - `.stl` → STL（自动判别 ASCII / 二进制）
+/// - `.off` → OFF（ASCII）
+/// - `.glb` / `.gltf` → glTF GLB（最小子集）
 pub fn load_mesh<P: AsRef<Path>>(path: P) -> Result<MeshStorage, MeshError> {
     let path = path.as_ref();
     let ext = path
@@ -1073,6 +2503,8 @@ pub fn load_mesh<P: AsRef<Path>>(path: P) -> Result<MeshStorage, MeshError> {
         "obj" => Ok(load_obj(path)?),
         "ply" => Ok(load_ply(path)?),
         "stl" => Ok(load_stl(path)?),
+        "off" => Ok(load_off(path)?),
+        "glb" | "gltf" => Ok(load_glb(path)?),
         other => Err(MeshError::UnsupportedFormat(other.into())),
     }
 }
@@ -1080,9 +2512,11 @@ pub fn load_mesh<P: AsRef<Path>>(path: P) -> Result<MeshStorage, MeshError> {
 /// 自动检测文件格式并保存网格。
 ///
 /// 根据文件扩展名选择序列化器：
-/// - `.obj` → OBJ
-/// - `.ply` → PLY ASCII
-/// - `.stl` → STL ASCII（若需二进制，请直接调用 `save_stl_binary`）
+/// - `.obj` → OBJ（ASCII）
+/// - `.ply` → PLY（ASCII；若需二进制请直接调用 `save_ply_binary`）
+/// - `.stl` → STL（ASCII；若需二进制请直接调用 `save_stl_binary`）
+/// - `.off` → OFF（ASCII）
+/// - `.glb` / `.gltf` → glTF GLB（二进制）
 pub fn save_mesh<P: AsRef<Path>>(mesh: &MeshStorage, path: P) -> Result<(), MeshError> {
     let path = path.as_ref();
     let ext = path
@@ -1102,6 +2536,14 @@ pub fn save_mesh<P: AsRef<Path>>(mesh: &MeshStorage, path: P) -> Result<(), Mesh
         }
         "stl" => {
             save_stl_ascii(mesh, path)?;
+            Ok(())
+        }
+        "off" => {
+            save_off(mesh, path)?;
+            Ok(())
+        }
+        "glb" | "gltf" => {
+            save_glb(mesh, path)?;
             Ok(())
         }
         other => Err(MeshError::UnsupportedFormat(other.into())),
@@ -1320,7 +2762,7 @@ f 1 2 5
 
     #[test]
     fn auto_detect_unsupported() {
-        let path = std::env::temp_dir().join("halfedge_autodetect.off");
+        let path = std::env::temp_dir().join("halfedge_autodetect.unknown");
         let err = load_mesh(&path).unwrap_err();
         assert!(matches!(err, MeshError::UnsupportedFormat(_)));
     }
@@ -1441,5 +2883,307 @@ f 1 2 5
         let loaded = load_mesh(&path).expect("load_mesh(.stl) 失败");
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded.face_count(), mesh.face_count());
+    }
+
+    // ---------- PLY 二进制测试 ----------
+
+    #[test]
+    fn ply_binary_roundtrip() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let bytes = format_ply_binary(&mesh);
+        let parsed = parse_ply_bytes(&bytes).expect("PLY 二进制往返解析失败");
+        assert_eq!(parsed.vertex_count(), mesh.vertex_count());
+        assert_eq!(parsed.face_count(), mesh.face_count());
+        assert!(check_topology(&parsed).is_ok());
+    }
+
+    #[test]
+    fn ply_binary_file_roundtrip() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let path = std::env::temp_dir().join("halfedge_ply_bin.ply");
+        save_ply_binary(&mesh, &path).expect("保存二进制 PLY 失败");
+        let loaded = load_ply(&path).expect("加载二进制 PLY 失败");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.vertex_count(), mesh.vertex_count());
+        assert_eq!(loaded.face_count(), mesh.face_count());
+    }
+
+    #[test]
+    fn ply_ascii_still_works_via_parse_ply_bytes() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let text = format_ply(&mesh);
+        let bytes = text.into_bytes();
+        let parsed = parse_ply_bytes(&bytes).expect("PLY ASCII via bytes 解析失败");
+        assert_eq!(parsed.vertex_count(), mesh.vertex_count());
+        assert_eq!(parsed.face_count(), mesh.face_count());
+    }
+
+    #[test]
+    fn ply_binary_detects_bad_header() {
+        // 缺少 end_header 应失败
+        let bytes = b"ply\nformat binary_little_endian 1.0\nelement vertex 0\n";
+        let err = parse_ply_bytes(bytes).unwrap_err();
+        assert!(matches!(err, PlyError::Parse { .. }));
+    }
+
+    // ---------- OFF 测试 ----------
+
+    #[test]
+    fn off_roundtrip_tetrahedron() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let text = format_off(&mesh);
+        let parsed = parse_off(&text).expect("OFF 往返解析失败");
+        assert_eq!(parsed.vertex_count(), mesh.vertex_count());
+        assert_eq!(parsed.face_count(), mesh.face_count());
+        assert!(check_topology(&parsed).is_ok());
+    }
+
+    #[test]
+    fn off_file_roundtrip() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let path = std::env::temp_dir().join("halfedge_off.off");
+        save_off(&mesh, &path).expect("保存 OFF 失败");
+        let loaded = load_off(&path).expect("加载 OFF 失败");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.vertex_count(), mesh.vertex_count());
+        assert_eq!(loaded.face_count(), mesh.face_count());
+    }
+
+    #[test]
+    fn off_parse_counts_inline_with_keyword() {
+        // 首行带 OFF 关键字 + 计数
+        let text = "OFF 4 4 0\n\
+            0 0 0\n1 0 0\n0 1 0\n0 0 1\n\
+            3 0 2 1\n3 0 1 3\n3 0 3 2\n3 1 2 3\n";
+        let mesh = parse_off(text).expect("OFF 行内计数解析失败");
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.face_count(), 4);
+    }
+
+    #[test]
+    fn off_parse_quadrilateral_face_succeeds() {
+        let text = "OFF\n4 1 0\n\
+            0 0 0\n1 0 0\n1 1 0\n0 1 0\n\
+            4 0 1 2 3\n";
+        let mesh = parse_off(text).expect("OFF 四边形面解析失败");
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.face_count(), 1);
+    }
+
+    #[test]
+    fn off_parse_out_of_range_index_fails() {
+        let text = "OFF\n3 1 0\n0 0 0\n1 0 0\n0 1 0\n3 0 1 5\n";
+        let err = parse_off(text).unwrap_err();
+        assert!(matches!(err, OffError::Parse { .. }));
+    }
+
+    #[test]
+    fn auto_detect_off() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let path = std::env::temp_dir().join("halfedge_autodetect.off");
+        save_mesh(&mesh, &path).expect("save_mesh(.off) 失败");
+        let loaded = load_mesh(&path).expect("load_mesh(.off) 失败");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.face_count(), mesh.face_count());
+    }
+
+    // ---------- glTF GLB 测试 ----------
+
+    #[test]
+    fn glb_roundtrip_tetrahedron() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let bytes = format_glb(&mesh);
+        let parsed = parse_glb(&bytes).expect("GLB 往返解析失败");
+        assert_eq!(parsed.vertex_count(), mesh.vertex_count());
+        assert_eq!(parsed.face_count(), mesh.face_count());
+        assert!(check_topology(&parsed).is_ok());
+    }
+
+    #[test]
+    fn glb_file_roundtrip() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let path = std::env::temp_dir().join("halfedge_glb.glb");
+        save_glb(&mesh, &path).expect("保存 GLB 失败");
+        let loaded = load_glb(&path).expect("加载 GLB 失败");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.vertex_count(), mesh.vertex_count());
+        assert_eq!(loaded.face_count(), mesh.face_count());
+    }
+
+    #[test]
+    fn glb_detects_bad_magic() {
+        let bytes = [0u8; 32];
+        let err = parse_glb(&bytes).unwrap_err();
+        assert!(matches!(err, GltfError::Parse(_)));
+    }
+
+    #[test]
+    fn glb_icosphere_roundtrip() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let bytes = format_glb(&mesh);
+        let parsed = parse_glb(&bytes).expect("GLB icosphere 往返失败");
+        assert_eq!(parsed.vertex_count(), mesh.vertex_count());
+        assert_eq!(parsed.face_count(), mesh.face_count());
+    }
+
+    #[test]
+    fn auto_detect_glb() {
+        let (verts, faces) = make_tetra_data();
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let path = std::env::temp_dir().join("halfedge_autodetect.glb");
+        save_mesh(&mesh, &path).expect("save_mesh(.glb) 失败");
+        let loaded = load_mesh(&path).expect("load_mesh(.glb) 失败");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.face_count(), mesh.face_count());
+    }
+
+    // ---------- 空集合 / 越界 / 退化面 边界测试 ----------
+
+    #[test]
+    fn build_mesh_empty_inputs_returns_empty_mesh() {
+        let mesh = build_mesh_from_vertices_and_faces(&[], &[]);
+        assert_eq!(mesh.vertex_count(), 0);
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    fn build_mesh_vertices_no_faces() {
+        let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &[]);
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    fn build_polygons_empty_inputs_returns_empty_mesh() {
+        let mesh = build_mesh_from_polygons(&[], &[]);
+        assert_eq!(mesh.vertex_count(), 0);
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "越界")]
+    fn build_mesh_face_index_out_of_range_panics() {
+        let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = [[0u32, 1, 5]];
+        let _ = build_mesh_from_vertices_and_faces(&vertices, &faces);
+    }
+
+    #[test]
+    #[should_panic(expected = "越界")]
+    fn build_polygons_face_index_out_of_range_panics() {
+        let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = [vec![0u32, 1, 5]];
+        let _ = build_mesh_from_polygons(&vertices, &faces);
+    }
+
+    #[test]
+    fn build_polygons_skips_degenerate_face_2_verts() {
+        let vertices = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let faces = [vec![0u32, 1]];
+        let mesh = build_mesh_from_polygons(&vertices, &faces);
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    fn build_polygons_mixed_degenerate_and_valid() {
+        let vertices = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let faces = [vec![], vec![0u32, 1, 2]];
+        let mesh = build_mesh_from_polygons(&vertices, &faces);
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.face_count(), 1);
+    }
+
+    // ---------- OBJ 损坏输入测试 ----------
+
+    #[test]
+    fn obj_parse_empty_text() {
+        let mesh = parse_obj("").expect("空 OBJ 应解析为空网格");
+        assert_eq!(mesh.vertex_count(), 0);
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    fn obj_parse_only_vertices_no_faces() {
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\n";
+        let mesh = parse_obj(text).expect("仅顶点 OBJ 应解析成功");
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    fn obj_parse_face_zero_index_fails() {
+        // OBJ 索引从 1 开始，0 无效
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n";
+        assert!(parse_obj(text).is_err());
+    }
+
+    #[test]
+    fn obj_parse_face_index_equal_to_vertex_count_fails() {
+        // 3 顶点，索引 4（1-based）→ 0-based 为 3，等于顶点数 → 越界
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n";
+        assert!(parse_obj(text).is_err());
+    }
+
+    // ---------- PLY 损坏输入测试 ----------
+
+    #[test]
+    fn ply_parse_empty_bytes_fails() {
+        assert!(parse_ply_bytes(b"").is_err());
+    }
+
+    #[test]
+    fn ply_parse_missing_end_header_fails() {
+        let bytes = b"ply\nformat ascii 1.0\n";
+        assert!(parse_ply_bytes(bytes).is_err());
+    }
+
+    // ---------- STL 损坏输入测试 ----------
+
+    #[test]
+    fn stl_ascii_empty_text() {
+        let mesh = parse_stl_ascii("").expect("空 STL 应解析为空网格");
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    #[test]
+    fn stl_ascii_only_solid_endsolid() {
+        let text = "solid x\nendsolid x\n";
+        let mesh = parse_stl_ascii(text).expect("空 solid STL 应解析为空网格");
+        assert_eq!(mesh.face_count(), 0);
+    }
+
+    // ---------- OFF 损坏输入测试 ----------
+
+    #[test]
+    fn off_parse_empty_text_fails() {
+        assert!(parse_off("").is_err());
+    }
+
+    #[test]
+    fn off_parse_only_vertices_no_faces() {
+        let text = "OFF\n3 0 0\n0 0 0\n1 0 0\n0 1 0\n";
+        let mesh = parse_off(text).expect("仅顶点 OFF 应解析成功");
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.face_count(), 0);
     }
 }

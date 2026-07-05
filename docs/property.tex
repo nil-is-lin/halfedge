@@ -73,33 +73,42 @@
 
 \begin{lstlisting}
 pub struct PropertyStore<T> {
-    data: HashMap<usize, T>,  // key = slotmap key 的 idx 部分
+    data: HashMap<usize, T>,  // key = slotmap key 的完整 64 位 ffi (idx + version)
 }
 \end{lstlisting}
 
-\textbf{键的选取}：使用 slotmap key 的 \texttt{idx}（槽位索引）部分作为 \texttt{usize} 键，
-而非完整 key（包含 version）。原因：
+\textbf{键的选取}：使用 slotmap key 的\textbf{完整 64 位 \texttt{as\_ffi()} 值}
+（idx + version）作为 \texttt{usize} 键，而非仅低 32 位 idx。原因：
 
 \begin{itemize}
-  \item 用户需求明确指定 \texttt{HashMap<usize, T>}；
-  \item 同一元素的 idx 在其生命周期内不变；
-  \item 便于 \texttt{ErasedProperty::remove\_by\_index} 在不知类型时批量删除。
+  \item 同一元素的 idx + version 组合在其生命周期内唯一不变；
+  \item slot 被复用时 version 递增，新元素得到与旧元素不同的键，
+        旧属性条目\textbf{自动成为孤儿}（永远不会被新元素匹配到），
+        避免了「slot 复用导致新元素静默继承旧属性」的隐患；
+  \item 仍便于 \texttt{ErasedProperty::remove\_by\_index} 在不知类型时批量删除。
 \end{itemize}
 
-\textbf{权衡}：idx 在 slot 复用时会被新元素继承，因此删除元素后\textbf{必须}
-同步清理属性（见 \S\ref{sec:remove-callback}），否则属性会错误关联到新元素。
+\textbf{孤儿条目}：删除元素后未调用 \texttt{remove\_*\_all\_props} 时，
+旧属性条目不会消失，但因 key 中的 version 已过时，新元素永远不会命中它，
+故\textbf{无正确性问题}，仅占用少量内存。如需立即释放，可调用
+\texttt{PropertyStore::clear()} 或 \texttt{remove\_*\_all\_props}（见 \S\ref{sec:remove-callback}）。
+
+\textbf{平台假设}：依赖 \texttt{usize} 为 64 位（64-bit 平台）。32-bit 平台上
+\texttt{as\_ffi() as usize} 会截断高 32 位 version，回退到旧行为（需手动清理）。
+本库目标平台为 64-bit，不做特殊处理。
 
 \subsection{idx 提取辅助函数}
 
 slotmap 1.1.1 的 \texttt{KeyData} 字段为私有，公开 API 仅 \texttt{as\_ffi()}。
 通过 \texttt{Key} trait 的 \texttt{data()} 方法取出 \texttt{KeyData}，
-再调 \texttt{as\_ffi()} 取 64 位编码，取低 32 位即 idx：
+再调 \texttt{as\_ffi()} 取\textbf{完整 64 位编码}（idx + version）作为键：
 
 \begin{lstlisting}
 #[inline]
 fn idx_of<K: Key>(id: K) -> usize {
-    let ffi = id.data().as_ffi();
-    (ffi & 0xFFFF_FFFF) as usize
+    // 完整 64 位 ffi 值（idx + version）作为键
+    // 在 64-bit 平台上 usize = u64，无损转换
+    id.data().as_ffi() as usize
 }
 \end{lstlisting}
 
@@ -107,6 +116,21 @@ fn idx_of<K: Key>(id: K) -> usize {
 \[
 \texttt{as\_ffi()} = (\underbrace{\texttt{version}}_{\text{高 32 位}} \ll 32)\;\big|\;\underbrace{\texttt{idx}}_{\text{低 32 位}}
 \]
+
+\textbf{对比旧设计}（仅取低 32 位 idx）：
+\begin{center}
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{} & \textbf{旧设计（仅 idx）} & \textbf{新设计（idx + version）} \\
+  \midrule
+  键值          & \texttt{ffi \& 0xFFFF\_FFFF} & \texttt{ffi}（完整 64 位） \\
+  slot 复用行为 & 新元素继承旧属性（危险）       & 新元素得到新键，旧条目成孤儿（安全） \\
+  删除后清理    & \textbf{必须}立即调用         & 可延迟（仅内存占用问题） \\
+  平台依赖      & 无                            & 需 64-bit \texttt{usize} \\
+  \bottomrule
+\end{tabular}
+\end{center}
 
 \subsection{ErasedProperty trait（私有）}
 
@@ -364,11 +388,15 @@ let weighted_avg = [sum_p[0] / sum_w, sum_p[1] / sum_w, sum_p[2] / sum_w];
         无法在不知 \texttt{T} 的情况下批量删除。\texttt{ErasedProperty} trait
         扩展了此能力，使 \texttt{remove\_*\_all\_props} 无需为每个已注册类型
         显式调用 \texttt{remove}。
-  \item \textbf{为何属性键用 idx 而非完整 key？} \\
-        用户需求明确指定 \texttt{HashMap<usize, T>}。idx 在元素生命周期内不变，
-        满足稀疏存储需求。代价是删除元素后必须同步清理（见 \S\ref{sec:remove-callback}）。
-        若用完整 \texttt{as\_ffi()} 作键，版本号会防止 slot 复用冲突，
-        但偏离用户指定接口且增加 \texttt{ErasedProperty} 复杂度。
+  \item \textbf{为何属性键用完整 \texttt{as\_ffi()} 而非仅 idx？} \\
+        早期版本仅取低 32 位 idx 作键，slot 复用时新元素会\textbf{静默继承}
+        旧元素的属性数据（\texttt{MeshStorage} 与 \texttt{MeshProperties} 解耦，
+        用户调用 \texttt{mesh.remove\_vertex()} 不会触发属性清理），
+        这是潜在的语义陷阱。改用完整 64 位 \texttt{as\_ffi()}
+        （idx + version）作键后，slot 复用时 version 递增，
+        新元素永远命中不到旧条目，旧条目成为孤儿（仅占少量内存，
+        无正确性问题）。代价是依赖 64-bit \texttt{usize}，
+        但本库目标平台已满足。
   \item \textbf{为何 \texttt{MeshProperties} 是外部结构体而非 \texttt{MeshStorage} 字段？} \\
         解耦让 \texttt{MeshStorage} 保持纯粹「存储 + 句柄有效性」职责，
         不绑定具体属性类型。用户可按需创建 0 个或多个 \texttt{MeshProperties}

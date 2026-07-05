@@ -76,15 +76,37 @@ use crate::storage::MeshStorage;
 ///   最末端的那条边界半边；`v.halfedge` 落在链中某处。
 /// - **孤立顶点**（`v.halfedge` 为 `None`）：返回空 `Vec`。
 pub fn collect_outgoing_halfedges(mesh: &MeshStorage, v: VertexId) -> Vec<HalfEdgeId> {
-    let mut result = Vec::new();
+    let mut buf = Vec::new();
+    collect_outgoing_halfedges_into(mesh, v, &mut buf);
+    buf
+}
+
+/// 与 [`collect_outgoing_halfedges`] 相同，但填充调用方提供的 `buf`。
+///
+/// **内存复用**：`buf.clear()` 后填充，不释放已分配容量。
+/// 适合在热循环中反复调用以避免重复分配：
+///
+/// ```ignore
+/// let mut buf = Vec::new();
+/// for v in mesh.vertex_ids() {
+///     collect_outgoing_halfedges_into(mesh, v, &mut buf);
+///     // 使用 buf...
+/// }
+/// ```
+pub fn collect_outgoing_halfedges_into(
+    mesh: &MeshStorage,
+    v: VertexId,
+    buf: &mut Vec<HalfEdgeId>,
+) {
+    buf.clear();
     let start = match mesh.get_vertex(v).and_then(|vt| vt.halfedge) {
         Some(s) => s,
-        None => return result,
+        None => return,
     };
     // 安全上界：任何正确的旋转环长度不会超过半边总数。
     let max_iter = mesh.halfedge_count() + 1;
 
-    result.push(start);
+    buf.push(start);
 
     // 向 CCW 方向走：he -> he.prev.twin
     let mut he = start;
@@ -97,7 +119,7 @@ pub fn collect_outgoing_halfedges(mesh: &MeshStorage, v: VertexId) -> Vec<HalfEd
             .and_then(|h| h.twin);
         match next {
             Some(n) if n != start => {
-                result.push(n);
+                buf.push(n);
                 he = n;
             }
             Some(_) => {
@@ -109,10 +131,10 @@ pub fn collect_outgoing_halfedges(mesh: &MeshStorage, v: VertexId) -> Vec<HalfEd
     }
 
     if closed {
-        return result;
+        return;
     }
 
-    // 开链：向 CW 方向补全，收集到的部分逆序后拼到 result 前面
+    // 开链：向 CW 方向补全，收集到的部分逆序后拼到 buf 前面
     let mut backward = Vec::new();
     let mut he = start;
     for _ in 0..max_iter {
@@ -130,35 +152,46 @@ pub fn collect_outgoing_halfedges(mesh: &MeshStorage, v: VertexId) -> Vec<HalfEd
         }
     }
     backward.reverse();
-    backward.extend(result);
-    backward
+    buf.splice(0..0, backward);
 }
 
 /// 收集面 `f` 边界环上的所有半边，按 `next` 顺序返回。
 ///
 /// 通用遍历原语，已处理拓扑断开等异常情况（撞到 `None` 立即终止）。
 pub fn collect_face_halfedges(mesh: &MeshStorage, f: FaceId) -> Vec<HalfEdgeId> {
-    let mut result = Vec::new();
+    let mut buf = Vec::new();
+    collect_face_halfedges_into(mesh, f, &mut buf);
+    buf
+}
+
+/// 与 [`collect_face_halfedges`] 相同，但填充调用方提供的 `buf`。
+///
+/// **内存复用**：`buf.clear()` 后填充，不释放已分配容量。
+pub fn collect_face_halfedges_into(
+    mesh: &MeshStorage,
+    f: FaceId,
+    buf: &mut Vec<HalfEdgeId>,
+) {
+    buf.clear();
     let start = match mesh.get_face(f).and_then(|ft| ft.halfedge) {
         Some(s) => s,
-        None => return result,
+        None => return,
     };
     let max_iter = mesh.halfedge_count() + 1;
 
-    result.push(start);
+    buf.push(start);
     let mut he = start;
     for _ in 0..max_iter {
         let next = mesh.get_halfedge(he).and_then(|h| h.next);
         match next {
             Some(n) if n != start => {
-                result.push(n);
+                buf.push(n);
                 he = n;
             }
             Some(_) => break, // 回到起点
             None => break,    // 拓扑断开
         }
     }
-    result
 }
 
 // ============================================================
@@ -2128,5 +2161,62 @@ mod tests {
             // 关联边数 == 度数（对于闭合网格）
             assert_eq!(edges.len(), valence, "顶点 {:?} 度数应等于关联边数", v);
         }
+    }
+
+    // ---------- _into 内存复用 API ----------
+
+    #[test]
+    fn collect_outgoing_halfedges_into_matches_original() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let mut buf = Vec::new();
+        for v in mesh.vertex_ids() {
+            let expected = collect_outgoing_halfedges(&mesh, v);
+            collect_outgoing_halfedges_into(&mesh, v, &mut buf);
+            assert_eq!(buf, expected, "顶点 {:?} 的 outgoing 半边不匹配", v);
+        }
+    }
+
+    #[test]
+    fn collect_face_halfedges_into_matches_original() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let mut buf = Vec::new();
+        for f in mesh.face_ids() {
+            let expected = collect_face_halfedges(&mesh, f);
+            collect_face_halfedges_into(&mesh, f, &mut buf);
+            assert_eq!(buf, expected, "面 {:?} 的半边不匹配", f);
+        }
+    }
+
+    #[test]
+    fn collect_outgoing_halfedges_into_reuses_capacity() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let mut buf = Vec::new();
+        // 第一次调用分配容量
+        collect_outgoing_halfedges_into(&mesh, mesh.vertex_ids().next().unwrap(), &mut buf);
+        let cap_after_first = buf.capacity();
+        assert!(cap_after_first > 0);
+        // 后续调用不应释放容量
+        for v in mesh.vertex_ids() {
+            collect_outgoing_halfedges_into(&mesh, v, &mut buf);
+            assert!(buf.capacity() >= cap_after_first, "容量不应缩小");
+        }
+    }
+
+    #[test]
+    fn collect_face_halfedges_into_clears_buffer() {
+        let (mesh, _v, _he, f) = build_triangle();
+        let mut buf = vec![HalfEdgeId::default(); 100]; // 预填充垃圾数据
+        collect_face_halfedges_into(&mesh, f, &mut buf);
+        // 应只包含 3 条半边（三角形），不含垃圾数据
+        assert_eq!(buf.len(), 3);
+    }
+
+    #[test]
+    fn collect_outgoing_halfedges_into_isolated_vertex() {
+        let mut mesh = MeshStorage::new();
+        let v = mesh.add_vertex(Vertex::new([0.0, 0.0, 0.0]));
+        let mut buf = vec![HalfEdgeId::default(); 10];
+        collect_outgoing_halfedges_into(&mesh, v, &mut buf);
+        assert!(buf.is_empty(), "孤立顶点应返回空 buffer");
     }
 }

@@ -291,6 +291,109 @@ impl Bvh {
         best
     }
 
+    /// 返回所有 AABB 与 `query_aabb` 相交的叶子节点中的面 ID。
+    ///
+    /// 用于布尔运算等需要"对一条边/一个三角形查找另一网格候选面"的场景，
+    /// 把暴力 $O(F)$ 扫描降到平均 $O(\log F + k)$，$k$ 为候选面数。
+    ///
+    /// 注意：AABB 相交只是**候选**，调用方仍需用精确几何测试（如
+    /// `segment_triangle_intersection`）做最终判定。
+    pub fn faces_in_aabb(&self, query_aabb: &AABB, mesh: &MeshStorage) -> Vec<FaceId> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root {
+            self.faces_in_aabb_recursive(root, query_aabb, mesh, &mut out);
+        }
+        out
+    }
+
+    fn faces_in_aabb_recursive(
+        &self,
+        node_idx: usize,
+        query: &AABB,
+        mesh: &MeshStorage,
+        out: &mut Vec<FaceId>,
+    ) {
+        let node = &self.nodes[node_idx];
+        if !aabb_overlap(&node.aabb, query) {
+            return;
+        }
+        if node.is_leaf() {
+            for &f in &node.faces {
+                // 进一步精筛：面 AABB 与 query 相交才返回
+                if let Some(face_aabb) = face_aabb(mesh, f) {
+                    if aabb_overlap(&face_aabb, query) {
+                        out.push(f);
+                    }
+                }
+            }
+        } else {
+            if let Some(l) = node.left {
+                self.faces_in_aabb_recursive(l, query, mesh, out);
+            }
+            if let Some(r) = node.right {
+                self.faces_in_aabb_recursive(r, query, mesh, out);
+            }
+        }
+    }
+
+    /// 射线与网格所有三角面交点数（用于射线奇偶法判定内外）。
+    ///
+    /// 与 [`Bvh::ray_intersection`] 不同，本方法不返回最近交点而是**统计所有命中**，
+    /// 因为射线奇偶法需要交点总数的奇偶性。
+    pub fn ray_count_hits(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        mesh: &MeshStorage,
+    ) -> u32 {
+        let mut count = 0u32;
+        if let Some(root) = self.root {
+            self.ray_count_hits_recursive(root, origin, direction, mesh, &mut count);
+        }
+        count
+    }
+
+    fn ray_count_hits_recursive(
+        &self,
+        node_idx: usize,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        mesh: &MeshStorage,
+        count: &mut u32,
+    ) {
+        let node = &self.nodes[node_idx];
+        // AABB 剪枝：射线不与节点 AABB 相交则整棵子树跳过
+        if ray_aabb(origin, direction, &node.aabb).is_none() {
+            return;
+        }
+        if node.is_leaf() {
+            for &f in &node.faces {
+                let verts: Vec<VertexId> = FaceVertices::new(mesh, f).collect();
+                if verts.len() != 3 {
+                    continue;
+                }
+                let (v0, v1, v2) = match (
+                    mesh.get_vertex(verts[0]),
+                    mesh.get_vertex(verts[1]),
+                    mesh.get_vertex(verts[2]),
+                ) {
+                    (Some(a), Some(b), Some(c)) => (a.position, b.position, c.position),
+                    _ => continue,
+                };
+                if ray_triangle_intersection(origin, direction, v0, v1, v2).is_some() {
+                    *count += 1;
+                }
+            }
+        } else {
+            if let Some(l) = node.left {
+                self.ray_count_hits_recursive(l, origin, direction, mesh, count);
+            }
+            if let Some(r) = node.right {
+                self.ray_count_hits_recursive(r, origin, direction, mesh, count);
+            }
+        }
+    }
+
     fn nearest_recursive(
         &self,
         node_idx: usize,
@@ -400,6 +503,35 @@ impl Default for Bvh {
 // ============================================================
 // 内部辅助
 // ============================================================
+
+/// 两个 AABB 是否相交（含边界接触）。
+///
+/// 当且仅当三轴上区间 `[a.min[i], a.max[i]]` 与 `[b.min[i], b.max[i]]`
+/// 均有重叠时返回 `true`：`a.min[i] <= b.max[i] && b.min[i] <= a.max[i]`。
+fn aabb_overlap(a: &AABB, b: &AABB) -> bool {
+    for i in 0..3 {
+        if a.min[i] > b.max[i] || b.min[i] > a.max[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// 计算单个三角面 `f` 的 AABB。非三角面或含已删除顶点返回 `None`。
+fn face_aabb(mesh: &MeshStorage, f: FaceId) -> Option<AABB> {
+    let mut aabb = AABB::new();
+    let mut count = 0usize;
+    for he in crate::traversal::FaceHalfEdges::new(mesh, f) {
+        let h = mesh.get_halfedge(he)?;
+        let v = mesh.get_vertex(h.vertex)?;
+        aabb.extend(&v.position);
+        count += 1;
+    }
+    if count != 3 {
+        return None;
+    }
+    Some(aabb)
+}
 
 /// 射线与 AABB 的 slab 法求交。返回 `(t_enter, t_exit)` 或 `None`。
 ///
@@ -723,5 +855,145 @@ mod tests {
         assert_eq!(point_aabb_distance_sq([-1.0, -1.0, -1.0], &aabb), 3.0);
         // 点在面外（距离 1）
         assert_eq!(point_aabb_distance_sq([2.0, 0.5, 0.5], &aabb), 1.0);
+    }
+
+    #[test]
+    fn aabb_overlap_basic() {
+        let a = AABB {
+            min: [0.0; 3],
+            max: [1.0; 3],
+        };
+        // 完全包含
+        assert!(aabb_overlap(&a, &a));
+        // 部分重叠
+        assert!(aabb_overlap(
+            &a,
+            &AABB {
+                min: [0.5; 3],
+                max: [1.5; 3],
+            }
+        ));
+        // 边界接触（视为重叠）
+        assert!(aabb_overlap(
+            &a,
+            &AABB {
+                min: [1.0; 3],
+                max: [2.0; 3],
+            }
+        ));
+        // 完全分离
+        assert!(!aabb_overlap(
+            &a,
+            &AABB {
+                min: [2.0; 3],
+                max: [3.0; 3],
+            }
+        ));
+        // 单轴分离
+        assert!(!aabb_overlap(
+            &a,
+            &AABB {
+                min: [0.5, 2.0, 0.5],
+                max: [1.5, 3.0, 1.5],
+            }
+        ));
+    }
+
+    #[test]
+    fn faces_in_aabb_returns_only_overlapping() {
+        let mesh = build_two_triangles();
+        let bvh = Bvh::build(&mesh);
+        // 查询 AABB 覆盖第一个三角形（位于 [0,0,0]-[1,1,0]）
+        let query = AABB {
+            min: [-0.5, -0.5, -0.5],
+            max: [1.5, 1.5, 0.5],
+        };
+        let faces = bvh.faces_in_aabb(&query, &mesh);
+        // 至少返回第一个三角形
+        assert!(!faces.is_empty());
+        // 查询 AABB 远离所有三角形
+        let far_query = AABB {
+            min: [100.0; 3],
+            max: [200.0; 3],
+        };
+        let far_faces = bvh.faces_in_aabb(&far_query, &mesh);
+        assert!(far_faces.is_empty(), "远查询不应命中任何面");
+    }
+
+    #[test]
+    fn faces_in_aabb_icosphere_consistent_with_brute_force() {
+        let mesh = build_icosphere(2);
+        let bvh = Bvh::build(&mesh);
+        // 任意 AABB
+        let query = AABB {
+            min: [-0.5, -0.5, -0.5],
+            max: [0.5, 0.5, 0.5],
+        };
+        let bvh_faces = bvh.faces_in_aabb(&query, &mesh);
+        // 暴力扫描
+        let mut brute_faces = Vec::new();
+        for f in mesh.face_ids() {
+            if let Some(fa) = face_aabb(&mesh, f) {
+                if aabb_overlap(&fa, &query) {
+                    brute_faces.push(f);
+                }
+            }
+        }
+        // BVH 应返回 brute 的子集（AABB 候选），且包含所有 brute 面
+        // （BVH 只做节点 AABB 剪枝 + 叶子面 AABB 精筛，与暴力一致）
+        let bvh_set: std::collections::HashSet<FaceId> = bvh_faces.iter().copied().collect();
+        let brute_set: std::collections::HashSet<FaceId> = brute_faces.iter().copied().collect();
+        assert_eq!(bvh_set, brute_set, "BVH 与暴力扫描候选集应一致");
+    }
+
+    #[test]
+    fn ray_count_hits_icosphere_consistent_with_brute_force() {
+        let mesh = build_icosphere(2);
+        let bvh = Bvh::build(&mesh);
+        // 测试多条射线
+        for (origin, dir) in [
+            ([0.0, 0.0, 5.0], [0.0, 0.0, -1.0]),
+            ([2.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            ([0.0, -3.0, 0.0], [0.0, 1.0, 0.0]),
+        ] {
+            let bvh_count = bvh.ray_count_hits(origin, dir, &mesh);
+            // 暴力扫描
+            let mut brute_count = 0u32;
+            for f in mesh.face_ids() {
+                let verts: Vec<VertexId> = crate::traversal::FaceVertices::new(&mesh, f).collect();
+                if verts.len() != 3 {
+                    continue;
+                }
+                let v0 = mesh.get_vertex(verts[0]).unwrap().position;
+                let v1 = mesh.get_vertex(verts[1]).unwrap().position;
+                let v2 = mesh.get_vertex(verts[2]).unwrap().position;
+                if ray_triangle_intersection(origin, dir, v0, v1, v2).is_some() {
+                    brute_count += 1;
+                }
+            }
+            assert_eq!(
+                bvh_count, brute_count,
+                "BVH 命中数应与暴力一致 (origin={:?}, dir={:?})",
+                origin, dir
+            );
+        }
+    }
+
+    #[test]
+    fn ray_count_hits_empty_mesh_returns_zero() {
+        let mesh = MeshStorage::new();
+        let bvh = Bvh::build(&mesh);
+        assert_eq!(bvh.ray_count_hits([0.0; 3], [1.0, 0.0, 0.0], &mesh), 0);
+    }
+
+    #[test]
+    fn faces_in_aabb_empty_mesh_returns_empty() {
+        let mesh = MeshStorage::new();
+        let bvh = Bvh::build(&mesh);
+        let query = AABB {
+            min: [-1.0; 3],
+            max: [1.0; 3],
+        };
+        assert!(bvh.faces_in_aabb(&query, &mesh).is_empty());
     }
 }

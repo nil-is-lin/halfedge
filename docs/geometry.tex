@@ -137,6 +137,12 @@
         \texttt{twin.vertex} 是 origin，面边界环按 \texttt{next} 顺序遍历，CCW 朝向。
 \end{itemize}
 
+\paragraph{拓扑不一致防护}
+\texttt{ray\_mesh\_intersects} 与 \texttt{mesh\_volume} 遍历面时取三顶点位置，
+对 \texttt{mesh.get\_vertex(v)} 不使用 \texttt{unwrap}，而是用模式匹配：
+若任一顶点查询返回 \texttt{None}（面引用的半边指向已删除顶点），
+\emph{跳过该面}而非 panic。这保证公开 API 在拓扑不一致时仍安全返回（结果可能不准但不崩溃）。
+
 \section{几何查询公式}
 
 \subsection{边长}
@@ -675,10 +681,34 @@ impl EdgeLengthStats {
   \texttt{bilateral\_smooth\_runs\_on\_icosphere}   & 双边滤波在 icosphere 上可运行 \\
   \texttt{taubin\_smooth\_zero\_iterations\_is\_noop} & 0 次迭代不变网格 \\
   \texttt{bilateral\_smooth\_zero\_iterations\_is\_noop} & 0 次迭代不变网格 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{空/退化网格}} \\
+  \texttt{ray\_mesh\_intersects\_empty\_mesh\_returns\_false} & 空网格任意射线返回 \texttt{false} \\
+  \texttt{mesh\_volume\_empty\_mesh\_returns\_zero} & 空网格体积 $= 0$ \\
+  \texttt{mesh\_volume\_par\_empty\_mesh\_returns\_zero} & 空网格并行体积 $= 0$ \\
+  \texttt{surface\_area\_empty\_mesh\_returns\_zero} & 空网格表面积 $= 0$ \\
+  \texttt{surface\_area\_par\_empty\_mesh\_returns\_zero} & 空网格并行表面积 $= 0$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{并行一致性（icosphere(1)）}} \\
+  \texttt{surface\_area\_par\_matches\_serial} & 串/并行表面积误差 $< 10^{-10}$ \\
+  \texttt{mesh\_volume\_par\_matches\_serial} & 串/并行体积误差 $< 10^{-10}$ \\
+  \texttt{vertex\_normals\_par\_matches\_serial} & 逐顶点法向串/并行一致 \\
+  \texttt{all\_gaussian\_curvatures\_par\_matches\_serial} & 逐顶点高斯曲率串/并行一致 \\
+  \texttt{all\_mean\_curvatures\_par\_matches\_serial} & 逐顶点平均曲率串/并行一致 \\
+  \texttt{feature\_edges\_par\_matches\_serial} & 特征边集合串/并行一致（排序后比较） \\
+  \texttt{ray\_mesh\_intersection\_par\_matches\_serial} & 最近交点 $t$ 串/并行一致 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{ray\_mesh\_intersects 正确性}} \\
+  \texttt{ray\_mesh\_intersects\_origin\_outside\_returns\_false} & 原点在球外、射线穿过球面（偶数交点）$\to$ \texttt{false} \\
+  \texttt{ray\_mesh\_intersects\_misses\_returns\_false} & 射线未命中网格（0 交点）$\to$ \texttt{false} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{mesh\_volume 符号}} \\
+  \texttt{mesh\_volume\_cube\_positive} & \texttt{build\_cube(1.0)} 体积 $\approx +1.0$ \\
+  \texttt{mesh\_volume\_par\_cube\_positive} & 并行版本同上 \\
   \bottomrule
 \end{tabular}
 \end{center}
 
-\texttt{src/geometry.rs} 共 \textbf{41 个}单元测试，全库共 \textbf{371 个}。
+\texttt{src/geometry.rs} 共 \textbf{57 个}单元测试，全库共 \textbf{552 个}。
 
 \end{document}

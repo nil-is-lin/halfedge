@@ -89,7 +89,10 @@ pub fn conjugate_gradient(
     tol: f64,
 ) -> Option<Vec<f64>> {
     let n = a.rows();
-    assert_eq!(n, b.len(), "A 与 b 维度不匹配");
+    // 维度不匹配时返回 None 而非 panic
+    if n != b.len() {
+        return None;
+    }
     if n == 0 {
         return Some(Vec::new());
     }
@@ -113,7 +116,12 @@ pub fn conjugate_gradient(
         // Ap = A * p
         let ap = sparse_matvec(a, &p);
 
-        let alpha = rsold / dot(&p, &ap);
+        let p_ap = dot(&p, &ap);
+        // 除零守卫：半正定系统未正则化时 p·Ap 可能为零
+        if p_ap.abs() < 1e-30 {
+            return None;
+        }
+        let alpha = rsold / p_ap;
 
         // x_{k+1} = x_k + alpha * p_k
         for i in 0..n {
@@ -132,6 +140,10 @@ pub fn conjugate_gradient(
             return Some(x);
         }
 
+        // 除零守卫：rsold 为零时无法计算 beta
+        if rsold.abs() < 1e-30 {
+            return None;
+        }
         // beta = rsnew / rsold
         let beta = rsnew / rsold;
 
@@ -173,7 +185,10 @@ fn sparse_matvec(a: &CsMat<f64>, x: &[f64]) -> Vec<f64> {
     for (row_idx, row) in a.outer_iterator().enumerate() {
         let mut sum = 0.0;
         for (col_idx, &val) in row.iter() {
-            sum += val * x[col_idx];
+            // 越界守卫：列索引超出 x 长度时跳过，避免 panic
+            if col_idx < x.len() {
+                sum += val * x[col_idx];
+            }
         }
         y[row_idx] = sum;
     }
@@ -181,13 +196,89 @@ fn sparse_matvec(a: &CsMat<f64>, x: &[f64]) -> Vec<f64> {
 }
 
 /// 向量内积。
-fn dot(a: &[f64], b: &[f64]) -> f64 {
+pub(crate) fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 /// 向量 2-范数。
-fn norm2(v: &[f64]) -> f64 {
+pub(crate) fn norm2(v: &[f64]) -> f64 {
     dot(v, v).sqrt()
+}
+
+// ============================================================
+// 三维向量工具（[f64; 3]）
+// ============================================================
+
+/// 三维向量基础运算。
+///
+/// 统一提供全库共用的 `[f64; 3]` 向量原语，避免 `geometry.rs` /
+/// `geodesics.rs` / `deformation.rs` / `boolean.rs` / `validate.rs` /
+/// `test_util.rs` 各自重复定义。
+pub(crate) mod vec3 {
+    pub(crate) type Vec3 = [f64; 3];
+
+    #[inline]
+    pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    #[inline]
+    pub(crate) fn add(a: Vec3, b: Vec3) -> Vec3 {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    }
+
+    #[inline]
+    pub(crate) fn scale(a: Vec3, s: f64) -> Vec3 {
+        [a[0] * s, a[1] * s, a[2] * s]
+    }
+
+    #[inline]
+    pub(crate) fn dot(a: Vec3, b: Vec3) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    #[inline]
+    pub(crate) fn cross(a: Vec3, b: Vec3) -> Vec3 {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    #[inline]
+    pub(crate) fn length(a: Vec3) -> f64 {
+        dot(a, a).sqrt()
+    }
+
+    #[inline]
+    pub(crate) fn normalize(a: Vec3) -> Vec3 {
+        let l = length(a);
+        if l < 1e-12 { a } else { scale(a, 1.0 / l) }
+    }
+
+    #[inline]
+    pub(crate) fn angle_between(u: Vec3, v: Vec3) -> f64 {
+        let lu = length(u);
+        let lv = length(v);
+        if lu < 1e-12 || lv < 1e-12 {
+            return 0.0;
+        }
+        let c = dot(u, v) / (lu * lv);
+        c.clamp(-1.0, 1.0).acos()
+    }
+
+    /// 三角形面积（顶点位置）：$0.5 \cdot |(b-a) \times (c-a)|$。
+    #[inline]
+    pub(crate) fn triangle_area(a: Vec3, b: Vec3, c: Vec3) -> f64 {
+        0.5 * length(cross(sub(b, a), sub(c, a)))
+    }
+
+    /// 三角形单位法向（顶点位置）：$\mathrm{normalize}((b-a) \times (c-a))$。
+    #[inline]
+    pub(crate) fn triangle_normal(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+        normalize(cross(sub(b, a), sub(c, a)))
+    }
 }
 
 // ============================================================
@@ -267,5 +358,105 @@ mod tests {
         assert!((a.get(1, 2).unwrap() + 2.0).abs() < 1e-14);
         assert!((a.get(2, 1).unwrap() + 2.0).abs() < 1e-14);
         assert!((a.get(2, 2).unwrap() - 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn cg_dimension_mismatch_returns_none() {
+        let mut tri = TriMat::new((2, 2));
+        tri.add_triplet(0, 0, 1.0);
+        tri.add_triplet(1, 1, 1.0);
+        let a = tri.to_csr();
+        let b = vec![1.0, 2.0, 3.0]; // 长度 3 ≠ 矩阵维度 2
+        assert!(conjugate_gradient(&a, &b, 10, 1e-10).is_none());
+    }
+
+    #[test]
+    fn cg_empty_matrix_returns_empty() {
+        let a = TriMat::new((0, 0)).to_csr();
+        let b: Vec<f64> = vec![];
+        assert_eq!(conjugate_gradient(&a, &b, 10, 1e-10), Some(Vec::new()));
+    }
+
+    #[test]
+    fn cg_zero_right_hand_side_returns_zero_solution() {
+        let mut tri = TriMat::new((3, 3));
+        tri.add_triplet(0, 0, 1.0);
+        tri.add_triplet(1, 1, 1.0);
+        tri.add_triplet(2, 2, 1.0);
+        let a = tri.to_csr();
+        let b = vec![0.0, 0.0, 0.0];
+        assert_eq!(conjugate_gradient(&a, &b, 10, 1e-10), Some(vec![0.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn cg_max_iter_zero_returns_none() {
+        // 可解的 3x3 SPD 系统
+        let mut tri = TriMat::new((3, 3));
+        tri.add_triplet(0, 0, 4.0);
+        tri.add_triplet(1, 1, 3.0);
+        tri.add_triplet(2, 2, 2.0);
+        tri.add_triplet(0, 1, 1.0);
+        tri.add_triplet(1, 0, 1.0);
+        let a = tri.to_csr();
+        let b = vec![1.0, 2.0, 3.0];
+        assert!(conjugate_gradient(&a, &b, 0, 1e-10).is_none());
+    }
+
+    #[test]
+    fn cg_semidefinite_returns_none() {
+        // A = [[1,-1],[-1,1]]，特征值 0 和 2（半正定），p·Ap=0 触发除零守卫
+        let mut tri = TriMat::new((2, 2));
+        tri.add_triplet(0, 0, 1.0);
+        tri.add_triplet(1, 1, 1.0);
+        tri.add_triplet(0, 1, -1.0);
+        tri.add_triplet(1, 0, -1.0);
+        let a = tri.to_csr();
+        let b = vec![1.0, 1.0];
+        assert!(conjugate_gradient(&a, &b, 100, 1e-10).is_none());
+    }
+
+    #[test]
+    fn cg_known_solution_2x2() {
+        // A = [[4,1],[1,3]]，b = [1,2]，精确解 x = [1/11, 7/11]
+        let mut tri = TriMat::new((2, 2));
+        tri.add_triplet(0, 0, 4.0);
+        tri.add_triplet(1, 1, 3.0);
+        tri.add_triplet(0, 1, 1.0);
+        tri.add_triplet(1, 0, 1.0);
+        let a = tri.to_csr();
+        let b = vec![1.0, 2.0];
+        let x = conjugate_gradient(&a, &b, 100, 1e-12).expect("SPD 系统应收敛");
+        let exact = [1.0 / 11.0, 7.0 / 11.0];
+        for i in 0..2 {
+            assert!(
+                (x[i] - exact[i]).abs() < 1e-8,
+                "分量 {i}: 得到 {}，期望 {}",
+                x[i],
+                exact[i]
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_system_add_out_of_bounds_silently_drops() {
+        let mut sys = SparseSystem::new(2);
+        sys.add(5, 0, 1.0); // i=5 越界，应丢弃
+        sys.add_diag(5, 1.0); // i=5 越界，应丢弃
+        let a = sys.finish();
+        assert_eq!(a.rows(), 2);
+        // 2x2 矩阵所有位置应为空（无任何条目被写入）
+        assert!(a.get(0, 0).is_none());
+        assert!(a.get(0, 1).is_none());
+        assert!(a.get(1, 0).is_none());
+        assert!(a.get(1, 1).is_none());
+    }
+
+    #[test]
+    fn sparse_system_add_diag_accumulates() {
+        let mut sys = SparseSystem::new(2);
+        sys.add_diag(0, 1.0);
+        sys.add_diag(0, 2.0);
+        let a = sys.finish();
+        assert!((a.get(0, 0).unwrap() - 3.0).abs() < 1e-14);
     }
 }

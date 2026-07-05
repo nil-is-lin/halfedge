@@ -1,0 +1,502 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 鲁棒几何谓词模块设计文档} \\ \large \texttt{src/predicates.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{predicates.rs} 是 \texttt{halfedge} 库的\textbf{鲁棒几何谓词}模块，
+基于 \href{https://docs.rs/robust}{\texttt{robust}} crate
+（Jonathan Richard Shewchuk 1997 论文的 Rust 直译实现）提供\textbf{精确的}
+几何方向谓词：
+
+\begin{itemize}
+  \item \texttt{orient2d}：2D 三点方向判定（CCW / CW / 共线）
+  \item \texttt{orient3d}：3D 四点方向判定（在平面下方 / 上方 / 共面）
+  \item \texttt{incircle}：2D 四点共圆判定（在圆内 / 圆外 / 共圆）
+  \item \texttt{insphere}：3D 五点共球判定（在球内 / 球外 / 共球）
+\end{itemize}
+
+以及一批 \texttt{bool} / 标量包装函数（\texttt{is\_ccw2d}、
+\texttt{point\_in\_triangle\_2d}、\texttt{tet\_signed\_volume}、
+\texttt{is\_triangle\_degenerate\_3d} 等）。
+
+\textbf{使用场景}：布尔运算的射线-三角形求交、三角剖分的凸性 / 内点判定、
+拉伸操作的侧面退化检测、网格自检的退化面识别、网格体积计算等。
+任何需要\textbf{符号判定}的几何运算都应通过本模块完成。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{4}{*}{核心谓词}
+    & \texttt{orient2d(a, b, c)}                 & 2D 三点方向（CCW $>$ 0 / CW $<$ 0 / 共线 $=$ 0） \\
+    & \texttt{orient3d(a, b, c, d)}              & 3D 四点方向（d 在 abc 平面下方 $>$ 0 / 上方 $<$ 0 / 共面 $=$ 0） \\
+    & \texttt{incircle(a, b, c, d)}              & 2D 共圆（d 在 abc 外接圆内 $>$ 0；要求 abc 呈 CCW） \\
+    & \texttt{insphere(a, b, c, d, e)}           & 3D 共球（e 在 abcd 外接球内 $>$ 0；要求 abcd 正方向） \\
+  \midrule
+  \multirow{5}{*}{2D 便利}
+    & \texttt{signed\_area2d(a, b, c)}           & $\tfrac{1}{2}\,\text{orient2d}(a,b,c)$（CCW 为正） \\
+    & \texttt{triangle\_area2d(a, b, c)}         & 2D 三角形无符号面积 \\
+    & \texttt{is\_ccw2d(a, b, c)}                & \texttt{orient2d $>$ 0} \\
+    & \texttt{is\_collinear2d(a, b, c)}          & \texttt{orient2d $=$ 0} \\
+    & \texttt{is\_convex\_vertex2d(a, b, c)}     & \texttt{orient2d $>$ 0}（ear clipping 凸性判定） \\
+  \midrule
+  \multirow{2}{*}{2D 点-三角形}
+    & \texttt{point\_in\_triangle\_2d(p, a, b, c)} & 4 次 \texttt{orient2d} 同号判定 \\
+    & 退化三角形（共线）                          & 返回 \texttt{false} \\
+  \midrule
+  \multirow{3}{*}{3D 便利}
+    & \texttt{tet\_signed\_volume(a, b, c, d)}   & $-\tfrac{1}{6}\,\text{orient3d}(a,b,c,d)$（CCW 朝外为正） \\
+    & \texttt{is\_coplanar(a, b, c, d)}          & \texttt{orient3d $=$ 0} \\
+    & \texttt{is\_triangle\_degenerate\_3d(a, b, c)} & 主轴投影 + \texttt{orient2d} 精确共线判定 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{为什么需要鲁棒谓词}
+
+普通 \texttt{f64} 浮点运算在\textbf{退化情况}（共线、共面、共圆、共球）
+附近会因舍入误差给出错误符号，导致依赖符号判定的算法在边界情况下失败：
+
+\begin{itemize}
+  \item 布尔运算：点刚好在三角形边上时被误判为内 / 外；
+  \item 三角剖分：共线点序列被误判为 CCW / CW，导致 ear clipping 死循环；
+  \item 内外判定：射线刚好穿过三角形顶点时方向符号错误；
+  \item 退化检测：浮点面积阈值 $10^{-12}$ 对极小但不退化的三角形误报。
+\end{itemize}
+
+\textbf{Shewchuk 自适应精度算法}的核心思想是：
+
+\begin{enumerate}
+  \item 先用普通 \texttt{f64} 计算快速得到一个近似符号；
+  \item 同时计算一个\textbf{误差上界} $\varepsilon$；
+  \item 若 $|result| > \varepsilon$，符号确定，直接返回；
+  \item 否则启动\textbf{扩展精度}（adaptive precision）重新计算，
+        使用 \textbf{expanded double}（将一个 \texttt{f64} 拆为
+        非重叠序列的累加形式）消除舍入误差；
+  \item 最终保证返回值的\textbf{符号是精确的}（值仍可能不精确，
+        但符号决定几何关系，已经足够）。
+\end{enumerate}
+
+\textbf{性能}：非退化情况下自适应算法与朴素 \texttt{f64} 实现相当
+（仅多一次误差估计）；仅在接近退化时才付出扩展精度的代价。
+
+\section{符号约定}
+
+\subsection{orient2d}
+
+\[
+  \text{orient2d}(a, b, c) =
+  \det\begin{pmatrix}
+    b_x - a_x & b_y - a_y \\
+    c_x - a_x & c_y - a_y
+  \end{pmatrix}
+  = (b_x - a_x)(c_y - a_y) - (b_y - a_y)(c_x - a_x).
+\]
+
+\begin{itemize}
+  \item $> 0$：$c$ 在有向线 $a \to b$ 的\textbf{左侧}（三点呈 CCW）；
+  \item $< 0$：$c$ 在右侧（CW）；
+  \item $= 0$：三点共线。
+\end{itemize}
+返回值绝对值 $=$ 三角形 $abc$ 有向面积的 2 倍。
+
+\subsection{orient3d（Shewchuk 约定）}
+
+\[
+  \text{orient3d}(a, b, c, d) =
+  \det\begin{pmatrix}
+    b_x - a_x & b_y - a_y & b_z - a_z \\
+    c_x - a_x & c_y - a_y & c_z - a_z \\
+    d_x - a_x & d_y - a_y & d_z - a_z
+  \end{pmatrix}.
+\]
+
+\textbf{Shewchuk 约定}：从 $abc$ 呈 CCW 顺序的一侧（"上方"）看，
+\begin{itemize}
+  \item $> 0$：$d$ 在平面 $abc$ 的\textbf{下方}；
+  \item $< 0$：$d$ 在\textbf{上方}；
+  \item $= 0$：四点共面。
+\end{itemize}
+返回值绝对值 $=$ 四面体 $abcd$ 有向体积的 6 倍。
+
+\subsection{tet\_signed\_volume（几何约定）}
+
+几何上"\textbf{CCW 朝外为正体积}"的约定与 Shewchuk 相反：
+
+\[
+  \text{tet\_signed\_volume}(a, b, c, d) =
+  -\frac{1}{6}\,\text{orient3d}(a, b, c, d).
+\]
+
+\textbf{取负原因}：当 $abc$ 按右手定则给出朝外法向时，
+$d$ 在四面体内部（即 $abc$ 平面"上方"，朝向法向相反一侧），
+此时 Shewchuk 的 \texttt{orient3d} 返回负值，
+而几何约定希望该四面体体积为正，故取负。
+
+\subsection{incircle / insphere}
+
+\texttt{incircle} 要求 $a, b, c$ 呈 CCW 顺序；\texttt{insphere} 要求
+$a, b, c, d$ 呈正方向（即 \texttt{orient3d(a, b, c, d) $>$ 0}）。
+若输入违反该前置条件，结果符号反转但仍一致。
+
+\section{核心谓词实现}
+
+\texttt{predicates.rs} 仅做 API 包装，直接委托给 \texttt{robust} crate：
+
+\begin{lstlisting}[language=Rust]
+use robust::{Coord, Coord3D};
+
+#[inline]
+pub fn orient2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    robust::orient2d(
+        Coord { x: a[0], y: a[1] },
+        Coord { x: b[0], y: b[1] },
+        Coord { x: c[0], y: c[1] },
+    )
+}
+
+#[inline]
+pub fn orient3d(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
+    robust::orient3d(
+        Coord3D { x: a[0], y: a[1], z: a[2] },
+        Coord3D { x: b[0], y: b[1], z: b[2] },
+        Coord3D { x: c[0], y: c[1], z: c[2] },
+        Coord3D { x: d[0], y: d[1], z: d[2] },
+    )
+}
+\end{lstlisting}
+
+\texttt{robust} crate 是 Shewchuk 1997 论文
+\textit{Adaptive Precision Floating-Point Arithmetic and Fast Robust
+Geometric Predicates} 的 Rust 直译实现，由 georust 维护，
+crates.io 累计下载 490 万+，许可 MIT OR Apache-2.0，
+与 \texttt{halfedge} 双许可兼容。
+
+\section{点在三角形内判定}
+
+\texttt{point\_in\_triangle\_2d(p, a, b, c)} 用 4 次 \texttt{orient2d}
+同号判定：若 $abc$ 为 CCW，则 $p$ 在内部（含边界）当且仅当 $p$ 相对
+三条有向边 $ab$、$bc$、$ca$ 均在左侧或边上（\texttt{orient $\ge 0$}）。
+
+\begin{lstlisting}[language=Rust]
+pub fn point_in_triangle_2d(
+    p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2],
+) -> bool {
+    let o1 = orient2d(a, b, p);
+    let o2 = orient2d(b, c, p);
+    let o3 = orient2d(c, a, p);
+    let tri_sign = orient2d(a, b, c);
+    if tri_sign == 0.0 { return false; }  // 退化三角形
+    if tri_sign > 0.0 {  // CCW
+        o1 >= 0.0 && o2 >= 0.0 && o3 >= 0.0
+    } else {             // CW
+        o1 <= 0.0 && o2 <= 0.0 && o3 <= 0.0
+    }
+}
+\end{lstlisting}
+
+\textbf{退化处理}：三角形 $abc$ 共线（\texttt{tri\_sign $=$ 0}）时
+返回 \texttt{false}，避免后续 \texttt{>= 0 / <= 0} 永真导致误判。
+
+\section{3D 三角形退化判定}
+
+\texttt{is\_triangle\_degenerate\_3d(a, b, c)} 精确判定 3D 三点是否共线
+（含重合）。直接对 3D 三点用 \texttt{orient3d} 无法判共线（只能判共面），
+故采用\textbf{主轴投影 + 2D 谓词}的两步法：
+
+\subsection{算法}
+
+\begin{enumerate}
+  \item 计算法向 $\vec{n} = (\vec{b} - \vec{a}) \times (\vec{c} - \vec{a})$
+        的三个分量绝对值 $|n_x|, |n_y|, |n_z|$；
+  \item 选取\textbf{最大分量轴为丢弃轴}，将三角形投影到其余两轴构成的
+        2D 平面（保证投影面积最大，避免再次退化）；
+  \item 在 2D 平面上调用 \texttt{orient2d} 精确判定共线：
+        \texttt{orient2d $=$ 0} $\iff$ 三点共线。
+\end{enumerate}
+
+\subsection{投影轴选择公式}
+
+\[
+  \text{drop\_axis} =
+  \begin{cases}
+    x, & |n_x| \ge |n_y| \,\land\, |n_x| \ge |n_z| \\
+    y, & |n_y| \ge |n_z| \quad\text{（否则）} \\
+    z, & \text{否则}
+  \end{cases}
+\]
+
+对应投影：
+\begin{itemize}
+  \item 丢弃 $x$：$(x, y, z) \mapsto (y, z)$
+  \item 丢弃 $y$：$(x, y, z) \mapsto (x, z)$
+  \item 丢弃 $z$：$(x, y, z) \mapsto (x, y)$
+\end{itemize}
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.8, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.8cm, minimum height=0.7cm, font=\small, fill=gray!12},
+  term/.style={draw, rounded corners=2pt, fill=green!12, minimum width=4cm, minimum height=0.7cm, font=\small, align=center}
+]
+  \node[startend] (s) {开始：3D 三点 $a, b, c$};
+  \node[proc, below=of s, fill=blue!8] (p1) {计算 $\vec{ab} = b - a$，$\vec{ac} = c - a$，叉积分量 $n_x, n_y, n_z$};
+  \node[proc, below=of p1, fill=blue!4] (p2) {取绝对值 $|n_x|, |n_y|, |n_z|$};
+  \node[dec, below=of p2] (d1) {$|n_x| \ge |n_y|$ 且 $|n_x| \ge |n_z|$？};
+  \node[proc, right=1.0cm of d1, fill=yellow!10] (p3) {丢弃 $x$ 轴，投影到 $yz$ 平面};
+  \node[dec, below=1.0cm of d1] (d2) {$|n_y| \ge |n_z|$？};
+  \node[proc, below=of d2, fill=yellow!10] (p4) {丢弃 $y$ 轴，投影到 $xz$ 平面};
+  \node[proc, right=1.0cm of d2, fill=yellow!10] (p5) {丢弃 $z$ 轴，投影到 $xy$ 平面};
+  \node[proc, below=2.0cm of d2, fill=blue!4] (p6) {在 2D 平面调用 \texttt{orient2d}（Shewchuk 自适应精度）};
+  \node[dec, below=of p6] (d3) {\texttt{orient2d $=$ 0}？};
+  \node[term, right=1.6cm of d3] (t1) {返回 \texttt{true}（退化）};
+  \node[term, left=1.6cm of d3] (t2) {返回 \texttt{false}（非退化）};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (p3);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (d2);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {是} (p4);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {否} (p5);
+  \draw[op] (p3.south) |- (p6.east);
+  \draw[op] (p4) -- (p6);
+  \draw[op] (p5.south) |- (p6.east);
+  \draw[op] (p6) -- (d3);
+  \draw[op] (d3) -- node[above, font=\scriptsize] {是} (t1);
+  \draw[op] (d3) -- node[above, font=\scriptsize] {否} (t2);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{正确性论证}
+
+\textbf{为何"最大分量轴"投影能避免再次退化？}
+设原三角形的法向 $\vec{n}$ 在某轴（如 $z$）上的分量最大，
+则将三角形投影到 $xy$ 平面后，新法向 $\vec{n}' = (n_x, n_y)$
+的长度 $\sqrt{n_x^2 + n_y^2}$ 是所有投影中\textbf{最大}的。
+若 $\vec{n} \ne \vec{0}$（原三角形非退化），则至少一个分量非零，
+该最大投影必非零；反之若 $\vec{n} = \vec{0}$（原三角形退化），
+所有投影法向均为零，任意轴都判出 \texttt{orient2d $=$ 0}。
+
+\textbf{为何不直接用 $|\vec{n}| < \varepsilon$？}
+浮点阈值 $\varepsilon$ 难以选取：太小则接近退化的三角形漏报，
+太大则正常窄三角形误报。Shewchuk 谓词给出\textbf{精确}符号，
+无需阈值，能在边界情况下做出几何上正确的判定。
+
+\section{与旧浮点实现的对比}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{场景} & \textbf{旧实现（浮点阈值）} & \textbf{新实现（鲁棒谓词）} \\
+  \midrule
+  2D 三点方向      & \texttt{(b-a)$\times$(c-a) $>$ 0}              & \texttt{orient2d(a, b, c) $>$ 0} \\
+  2D 共线判定      & $|cross| < 10^{-14}$                            & \texttt{orient2d $==$ 0} \\
+  2D 三角形面积    & $\tfrac{1}{2}|cross|$                           & \texttt{signed\_area2d}（基于 \texttt{orient2d}） \\
+  2D 点在三角形内  & 朴素叉积同号                                    & \texttt{point\_in\_triangle\_2d}（4 次 \texttt{orient2d}） \\
+  3D 退化三角形    & $|cross| < 10^{-12}$                            & \texttt{is\_triangle\_degenerate\_3d} \\
+  3D 四面体体积    & 朴素行列式                                      & \texttt{tet\_signed\_volume}（基于 \texttt{orient3d}） \\
+  射线-三角形求交  & Möller-Trumbore（浮点行列式）                   & \texttt{orient3d} + 投影2D + \texttt{point\_in\_triangle\_2d} \\
+  拉伸侧面退化     & $|edge \times offset| < 10^{-12}$               & \texttt{is\_triangle\_degenerate\_3d} \\
+  网格自检退化面   & $area < 10^{-12}$                               & \texttt{is\_triangle\_degenerate\_3d} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{关键改进}：旧实现在退化边界（如点恰好共线、面积接近零）附近
+依赖浮点阈值，存在误报 / 漏报风险；新实现符号判定\textbf{精确}，
+仅在真正退化时报告，避免阈值选取的工程难题。
+
+\section{调用方迁移清单}
+
+本模块在 \texttt{halfedge} 库内的替换位置：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{源文件} & \textbf{原函数} & \textbf{替换为} \\
+  \midrule
+  \texttt{triangulation.rs} & \texttt{v2\_cross / signed\_area}        & \texttt{orient2d / signed\_area2d} \\
+  \texttt{triangulation.rs} & \texttt{point\_in\_triangle}             & \texttt{point\_in\_triangle\_2d} \\
+  \texttt{triangulation.rs} & 凸顶点 \texttt{v2\_cross $\le 0$}        & \texttt{!is\_convex\_vertex2d} \\
+  \texttt{geometry.rs}      & 体积手写行列式                            & \texttt{tet\_signed\_volume} \\
+  \texttt{geometry.rs}      & Möller-Trumbore                          & \texttt{orient3d} + 投影2D \\
+  \texttt{boolean.rs}       & 私有 \texttt{ray\_triangle\_intersection} & 调用 \texttt{geometry::ray\_triangle\_intersection} \\
+  \texttt{validate.rs}      & \texttt{area < DEGENERATE\_AREA\_EPS}    & \texttt{is\_triangle\_degenerate\_3d} \\
+  \texttt{topology\_ops.rs} & 拉伸侧面 \texttt{area $<$ 1e-12}（2 处） & \texttt{is\_triangle\_degenerate\_3d} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫汇总}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{API} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{orient2d / orient3d / incircle / insphere}
+    & 退化输入（共线 / 共面 / 共圆 / 共球）
+    & 返回 \texttt{0.0}（精确零，非近似） \\
+  \texttt{point\_in\_triangle\_2d}
+    & 三角形退化（共线）       & 返回 \texttt{false} \\
+  \texttt{point\_in\_triangle\_2d}
+    & $p$ 在边上 / 顶点上       & 返回 \texttt{true}（含边界） \\
+  \texttt{is\_triangle\_degenerate\_3d}
+    & 三点重合                  & 返回 \texttt{true} \\
+  \texttt{is\_triangle\_degenerate\_3d}
+    & 法向某分量为零            & 自动选最大分量轴投影，避免再次退化 \\
+  \texttt{tet\_signed\_volume}
+    & 四点共面                  & 返回 \texttt{0.0} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{使用示例}
+
+\begin{lstlisting}[language=Rust]
+use halfedge::predicates::*;
+
+// 1. 2D 方向判定
+let a = [0.0, 0.0];
+let b = [1.0, 0.0];
+let c = [0.0, 1.0];
+assert!(orient2d(a, b, c) > 0.0);  // CCW
+assert!(is_ccw2d(a, b, c));
+assert!((signed_area2d(a, b, c) - 0.5).abs() < 1e-15);
+
+// 2. 浮点易错的共线判定（朴素 f64 会失败）
+let p = [1e20, 1.0];
+let q = [1e20 + 1.0, 1.0];
+let r = [1e20 + 2.0, 1.0];
+assert_eq!(orient2d(p, q, r), 0.0);  // Shewchuk 精确识别为共线
+
+// 3. 2D 点在三角形内
+assert!(point_in_triangle_2d([0.25, 0.25], a, b, c));
+assert!(!point_in_triangle_2d([0.6, 0.6], a, b, c));
+
+// 4. 3D 四面体体积
+let a3 = [0.0, 0.0, 0.0];
+let b3 = [1.0, 0.0, 0.0];
+let c3 = [0.0, 1.0, 0.0];
+let d3 = [0.0, 0.0, 1.0];
+assert!((tet_signed_volume(a3, b3, c3, d3) - 1.0 / 6.0).abs() < 1e-15);
+
+// 5. 3D 三角形退化判定
+assert!(!is_triangle_degenerate_3d(a3, b3, c3));          // 正常三角形
+assert!(is_triangle_degenerate_3d(a3, [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]));  // 共线
+assert!(is_triangle_degenerate_3d(a3, a3, a3));           // 重合
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{orient2d\_ccw}                       & CCW 三点 \texttt{orient2d $>$ 0}，\texttt{is\_ccw2d} 为真 \\
+  \texttt{orient2d\_cw}                        & CW 三点 \texttt{orient2d $<$ 0} \\
+  \texttt{orient2d\_collinear\_exact}          & 精确共线三点 \texttt{orient2d $=$ 0} \\
+  \texttt{orient2d\_collinear\_near}           & 浮点易错共线（$10^{20}$ 量级），仍精确返回 0 \\
+  \texttt{signed\_area\_2d\_unit\_triangle}    & 单位三角形面积 $= 0.5$ \\
+  \texttt{point\_in\_triangle\_interior}       & 内部点返回 \texttt{true} \\
+  \texttt{point\_in\_triangle\_vertex}         & 三顶点返回 \texttt{true} \\
+  \texttt{point\_in\_triangle\_edge}           & 边上点返回 \texttt{true} \\
+  \texttt{point\_outside\_triangle}            & 外部点返回 \texttt{false} \\
+  \texttt{point\_in\_triangle\_cw\_orientation}& CW 三角形仍能正确判定内点 \\
+  \texttt{point\_in\_triangle\_degenerate}     & 共线三角形返回 \texttt{false} \\
+  \texttt{orient3d\_basic}                     & Shewchuk 约定：下方 $>$ 0 / 上方 $<$ 0 / 共面 $=$ 0 \\
+  \texttt{tet\_signed\_volume\_unit}           & 标准正交四面体体积 $= 1/6$ \\
+  \texttt{orient3d\_coplanar}                  & 四点共面 \texttt{is\_coplanar} 为真 \\
+  \texttt{incircle\_inside / outside / on\_circle} & 共圆谓词三类情况 \\
+  \texttt{insphere\_inside / outside}          & 共球谓词（要求 abcd 正方向） \\
+  \texttt{convex\_vertex\_ccw}                 & CCW 凸顶点 / CW 凹顶点 \\
+  \texttt{triangle\_degenerate\_3d\_normal}    & 正常 3D 三角形非退化 \\
+  \texttt{triangle\_degenerate\_3d\_collinear} & 3D 共线三点判为退化 \\
+  \texttt{triangle\_degenerate\_3d\_coincident}& 三点重合判为退化 \\
+  \texttt{triangle\_degenerate\_3d\_axis\_aligned} & 主轴对齐三角形的退化 / 非退化 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/predicates.rs} 共 \textbf{20 个}单元测试，全库共 \textbf{433 个}。
+
+\section{参考资料}
+
+\begin{itemize}
+  \item Shewchuk, J. R. (1997). \textit{Adaptive Precision Floating-Point
+        Arithmetic and Fast Robust Geometric Predicates.}
+        Discrete \& Computational Geometry, 18(3), 305--363.
+  \item \texttt{robust} crate 文档：\url{https://docs.rs/robust}
+  \item Möller-Trumbore 射线求交原始论文（已被本模块替换）：
+        Möller, T., \& Trumbore, B. (1997). Fast, Minimum Storage
+        Ray-Triangle Intersection. \textit{Journal of Graphics Tools}, 2(1).
+\end{itemize}
+
+\end{document}

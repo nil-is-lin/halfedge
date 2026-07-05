@@ -3,11 +3,36 @@
 //! 提供 [`validate_topology`]：对 [`MeshStorage`] 执行**完整**的流形三角曲面
 //! 不变量校验，输出所有违例的列表（而非首个错误）。
 //!
+//! ## 三个验证函数如何选择
+//!
+//! 库中存在三个语义相关的验证函数。下表给出**明确的取舍标准**：
+//!
+//! | 函数 | 错误类型 | 返回方式 | 校验项 | 适用场景 |
+//! |------|---------|---------|--------|----------|
+//! | [`crate::topology_ops::validate_mesh`] | `TopologyError` | 首错返回 | 仅 twin/next-prev/三角面环 | **拓扑操作内部**断言（split/flip/collapse 前后），需要快速失败且复用 `TopologyError` 类型 |
+//! | [`validate_topology`] | `ValidationError` | 收集全部 | 全部 8 项（见下） | **诊断/调试**：需要看到所有违例，结构化错误便于程序化处理 |
+//! | [`check_topology`] | `Vec<ValidationError>` | `Result` 包装 | 同 `validate_topology` | **入口检查**：作为函数前置/后置条件，`?` 传播 |
+//! | [`validate_first_error`] | `ValidationError` | 首错返回 | 同 `validate_topology`，遇到即停 | **快速失败**但需要结构化错误类型（比 `validate_mesh` 多校验项，比 `validate_topology` 早返回） |
+//!
+//! ### 决策树
+//!
+//! ```text
+//! 是否在 topology_ops 内部（split/flip/collapse 等）？
+//!   是 ──▶ validate_mesh            （复用 TopologyError，最快）
+//!   否 ──▶ 是否需要看到所有错误？
+//!           是 ──▶ validate_topology  （Vec<ValidationError>）
+//!           否 ──▶ 是否需要 ? 传播？
+//!                   是 ──▶ check_topology  （Result<(), Vec<_>>）
+//!                   否 ──▶ validate_first_error  （Option<ValidationError>）
+//! ```
+//!
 //! ## 与 [`crate::topology_ops::validate_mesh`] 的区别
 //! - `validate_mesh`：**轻量级**，仅校验 twin 互指 / next-prev 一致 / 面边界环长度，
 //!   用于拓扑操作前后快速断言；遇到首个错误即返回。
 //! - `validate_topology`：**完整**，额外校验悬空 ID、退化面、流形约束、
 //!   顶点/面入口字段一致性，收集所有错误后返回。
+//! - `validate_first_error`：与 `validate_topology` 校验项相同，但遇到首个错误即返回，
+//!   适合只需要"是否合法 + 第一个错因"的场景。
 //!
 //! ## 校验项
 //! 1. **句柄有效性**：所有 `vertex/face/halfedge` 引用必须指向存活元素；
@@ -16,18 +41,17 @@
 //! 4. **面边界环**：每个面的 `next` 链闭合，长度恰为 3；
 //! 5. **入口字段一致**：`Vertex.halfedge` 的 origin 必须是该顶点；
 //!    `Face.halfedge` 的 `face` 字段必须指向该面；
-//! 6. **退化面**：三角面三顶点不共线，面积大于阈值；
+//! 6. **退化面**：三角面三顶点不共线（基于 Shewchuk 鲁棒谓词精确判定）；
 //! 7. **流形约束**：每条无向边至多被 2 个面共享；每个顶点 outgoing 环
 //!    或闭合（内部顶点）或开链且两端为边界半边（边界顶点）。
 
 use std::fmt;
 
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
+use crate::linalg::vec3;
+use crate::predicates::is_triangle_degenerate_3d;
 use crate::storage::MeshStorage;
 use crate::traversal::{FaceHalfEdges, VertexRing};
-
-/// 退化面面积阈值（小于此值视为退化）。
-const DEGENERATE_AREA_EPS: f64 = 1e-12;
 
 /// 拓扑校验错误。
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +206,23 @@ pub fn check_topology(mesh: &MeshStorage) -> Result<(), Vec<ValidationError>> {
     } else {
         Err(errors)
     }
+}
+
+/// 校验网格拓扑，**遇到首个错误即返回**。
+///
+/// 与 [`validate_topology`] 校验项相同（8 项全检），但遇到首个违例即停止。
+/// 适合只需要"是否合法 + 第一个错因"的场景。
+///
+/// # 性能说明
+/// 当前实现复用 [`validate_topology`] 后取首元素，**不会**在底层早返回。
+/// 如需真正的早返回性能（仅校验 twin/next-prev/三角面环 3 项），
+/// 请使用 [`crate::topology_ops::validate_mesh`]，它专用于拓扑操作内部断言。
+///
+/// # 返回
+/// - `Some(err)`：首个违例；
+/// - `None`：网格通过校验。
+pub fn validate_first_error(mesh: &MeshStorage) -> Option<ValidationError> {
+    validate_topology(mesh).into_iter().next()
 }
 
 // ============================================================
@@ -390,7 +431,7 @@ fn validate_entry_fields(mesh: &MeshStorage, errors: &mut Vec<ValidationError>) 
     }
 }
 
-/// 6. 退化面：面积接近零。
+/// 6. 退化面：三顶点共线（基于 Shewchuk 鲁棒谓词精确判定）。
 fn validate_degenerate_faces(mesh: &MeshStorage, errors: &mut Vec<ValidationError>) {
     for f_id in mesh.face_ids().collect::<Vec<_>>() {
         let verts: Vec<_> = FaceHalfEdges::new(mesh, f_id)
@@ -401,8 +442,9 @@ fn validate_degenerate_faces(mesh: &MeshStorage, errors: &mut Vec<ValidationErro
         if verts.len() != 3 {
             continue; // 已由 face_boundaries 报告
         }
-        let area = triangle_area(verts[0], verts[1], verts[2]);
-        if area < DEGENERATE_AREA_EPS {
+        if is_triangle_degenerate_3d(verts[0], verts[1], verts[2]) {
+            // 报告浮点面积用于错误信息显示
+            let area = vec3::triangle_area(verts[0], verts[1], verts[2]);
             errors.push(ValidationError::DegenerateFace { face: f_id, area });
         }
     }
@@ -488,18 +530,6 @@ fn validate_manifold_vertices(mesh: &MeshStorage, errors: &mut Vec<ValidationErr
 // 辅助
 // ============================================================
 
-#[inline]
-fn triangle_area(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let cross = [
-        ab[1] * ac[2] - ab[2] * ac[1],
-        ab[2] * ac[0] - ab[0] * ac[2],
-        ab[0] * ac[1] - ab[1] * ac[0],
-    ];
-    0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
-}
-
 // ============================================================
 // 单元测试
 // ============================================================
@@ -548,6 +578,36 @@ mod tests {
         let (mesh, _v, _f) = build_clean_triangle();
         let errors = validate_topology(&mesh);
         assert!(errors.is_empty(), "应有 0 个错误，实际: {:?}", errors);
+    }
+
+    #[test]
+    fn validate_first_error_passes_on_clean_mesh() {
+        let (mesh, _v, _f) = build_clean_triangle();
+        assert!(validate_first_error(&mesh).is_none());
+    }
+
+    #[test]
+    fn validate_first_error_returns_some_on_invalid_mesh() {
+        let (mut mesh, v, _f) = build_clean_triangle();
+        // 制造一个悬空顶点引用
+        let h0 = mesh
+            .halfedge_ids()
+            .find(|h| {
+                mesh.get_halfedge(*h)
+                    .map(|he| he.vertex == v[1] && he.face.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap();
+        let bad_v = VertexId::default();
+        mesh.get_halfedge_mut(h0).unwrap().vertex = bad_v;
+        let first = validate_first_error(&mesh);
+        assert!(first.is_some(), "应返回首个错误");
+        // 应是 HalfEdgeDanglingVertex（句柄有效性是第 1 项校验）
+        assert!(
+            matches!(first, Some(ValidationError::HalfEdgeDanglingVertex { .. })),
+            "首个错误应是悬空顶点引用, 实际: {:?}",
+            first
+        );
     }
 
     #[test]

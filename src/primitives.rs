@@ -83,8 +83,8 @@ pub fn build_uv_sphere(radius: f64, slices: usize, stacks: usize) -> MeshStorage
             let b = v_ids[i][j + 1];
             let c = v_ids[i + 1][j];
             let d = v_ids[i + 1][j + 1];
-            let _ = add_triangle(&mut mesh, a, b, c);
-            let _ = add_triangle(&mut mesh, c, b, d);
+            add_triangle(&mut mesh, a, b, c).expect("图元构建不应失败");
+            add_triangle(&mut mesh, c, b, d).expect("图元构建不应失败");
         }
     }
 
@@ -124,12 +124,12 @@ pub fn build_cylinder(radius: f64, height: f64, slices: usize) -> MeshStorage {
     for i in 0..slices {
         let j = (i + 1) % slices;
         // 侧面（两个三角形）
-        let _ = add_triangle(&mut mesh, top_ring[i], bot_ring[i], bot_ring[j]);
-        let _ = add_triangle(&mut mesh, top_ring[i], bot_ring[j], top_ring[j]);
+        add_triangle(&mut mesh, top_ring[i], bot_ring[i], bot_ring[j]).expect("图元构建不应失败");
+        add_triangle(&mut mesh, top_ring[i], bot_ring[j], top_ring[j]).expect("图元构建不应失败");
         // 顶面
-        let _ = add_triangle(&mut mesh, top_c, top_ring[j], top_ring[i]);
+        add_triangle(&mut mesh, top_c, top_ring[j], top_ring[i]).expect("图元构建不应失败");
         // 底面
-        let _ = add_triangle(&mut mesh, bot_c, bot_ring[i], bot_ring[j]);
+        add_triangle(&mut mesh, bot_c, bot_ring[i], bot_ring[j]).expect("图元构建不应失败");
     }
 
     mesh
@@ -183,8 +183,8 @@ pub fn build_torus(
             let b = rings[ni][j];
             let c = rings[ni][nj];
             let d = rings[i][nj];
-            let _ = add_triangle(&mut mesh, a, b, c);
-            let _ = add_triangle(&mut mesh, a, c, d);
+            add_triangle(&mut mesh, a, b, c).expect("图元构建不应失败");
+            add_triangle(&mut mesh, a, c, d).expect("图元构建不应失败");
         }
     }
 
@@ -221,9 +221,9 @@ pub fn build_cone(radius: f64, height: f64, slices: usize) -> MeshStorage {
     for i in 0..slices {
         let j = (i + 1) % slices;
         // 侧面
-        let _ = add_triangle(&mut mesh, apex, ring[j], ring[i]);
+        add_triangle(&mut mesh, apex, ring[j], ring[i]).expect("图元构建不应失败");
         // 底面
-        let _ = add_triangle(&mut mesh, base_c, ring[i], ring[j]);
+        add_triangle(&mut mesh, base_c, ring[i], ring[j]).expect("图元构建不应失败");
     }
 
     mesh
@@ -262,8 +262,8 @@ pub fn build_grid(width: f64, depth: f64, segments_x: usize, segments_z: usize) 
             let b = v_ids[iz][ix + 1];
             let c = v_ids[iz + 1][ix];
             let d = v_ids[iz + 1][ix + 1];
-            let _ = add_triangle(&mut mesh, a, b, c);
-            let _ = add_triangle(&mut mesh, c, b, d);
+            add_triangle(&mut mesh, a, b, c).expect("图元构建不应失败");
+            add_triangle(&mut mesh, c, b, d).expect("图元构建不应失败");
         }
     }
 

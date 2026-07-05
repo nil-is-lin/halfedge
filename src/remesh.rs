@@ -42,7 +42,10 @@ fn tangential_smooth(mesh: &mut MeshStorage, v: VertexId) {
     avg[1] /= n;
     avg[2] /= n;
 
-    let pos = mesh.get_vertex(v).unwrap().position;
+    let pos = match mesh.get_vertex(v) {
+        Some(vt) => vt.position,
+        None => return,
+    };
 
     // 取第一个邻接面的法向作为切线方向参考
     let normal = vertex_normal(mesh, v).unwrap_or([0.0, 1.0, 0.0]);
@@ -60,7 +63,9 @@ fn tangential_smooth(mesh: &mut MeshStorage, v: VertexId) {
         pos[1] + lambda * tangent[1],
         pos[2] + lambda * tangent[2],
     ];
-    mesh.get_vertex_mut(v).unwrap().position = new_pos;
+    if let Some(vt) = mesh.get_vertex_mut(v) {
+        vt.position = new_pos;
+    }
 }
 
 // ============================================================
@@ -100,6 +105,7 @@ pub fn isotropic_remesh(
     let target_len = target_length.unwrap_or_else(|| compute_target_length(mesh));
     if target_len <= 0.0 {
         return RemeshStats {
+            iterations,
             target_length: target_len,
             ..Default::default()
         };
@@ -175,7 +181,10 @@ fn split_long_edges(mesh: &mut MeshStorage, max_len: f64) -> usize {
         .halfedge_ids()
         .filter(|&he| {
             // 只处理 canonical half（key 较小者），避免重复
-            let h = mesh.get_halfedge(he).unwrap();
+            let h = match mesh.get_halfedge(he) {
+                Some(h) => h,
+                None => return false,
+            };
             if let Some(twin) = h.twin
                 && he > twin
             {
@@ -202,7 +211,10 @@ fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
     let to_collapse: Vec<HalfEdgeId> = mesh
         .halfedge_ids()
         .filter(|&he| {
-            let h = mesh.get_halfedge(he).unwrap();
+            let h = match mesh.get_halfedge(he) {
+                Some(h) => h,
+                None => return false,
+            };
             if let Some(twin) = h.twin
                 && he > twin
             {
@@ -221,19 +233,34 @@ fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
             && len > 1e-10
         {
             // 在中点折叠
-            let h = mesh.get_halfedge(he).unwrap();
+            let h = match mesh.get_halfedge(he) {
+                Some(h) => h,
+                None => continue,
+            };
             let v_dst = h.vertex;
             let mid = if let Some(twin) = h.twin {
-                let v_src = mesh.get_halfedge(twin).unwrap().vertex;
-                let p0 = mesh.get_vertex(v_src).unwrap().position;
-                let p1 = mesh.get_vertex(v_dst).unwrap().position;
+                let v_src = match mesh.get_halfedge(twin) {
+                    Some(t) => t.vertex,
+                    None => continue,
+                };
+                let p0 = match mesh.get_vertex(v_src) {
+                    Some(vt) => vt.position,
+                    None => continue,
+                };
+                let p1 = match mesh.get_vertex(v_dst) {
+                    Some(vt) => vt.position,
+                    None => continue,
+                };
                 [
                     (p0[0] + p1[0]) / 2.0,
                     (p0[1] + p1[1]) / 2.0,
                     (p0[2] + p1[2]) / 2.0,
                 ]
             } else {
-                mesh.get_vertex(v_dst).unwrap().position
+                match mesh.get_vertex(v_dst) {
+                    Some(vt) => vt.position,
+                    None => continue,
+                }
             };
             if collapse_edge_at(mesh, he, mid).is_ok() {
                 count += 1;
@@ -253,9 +280,10 @@ fn flip_for_valence(mesh: &mut MeshStorage) -> usize {
             continue;
         }
 
-        // 只处理内部边（有 twin）
+        // 只处理内部边（有 twin 且本侧有面）；边界半边 face=None 跳过，
+        // 其 interior twin 会在另一轮迭代中被处理
         let h = match mesh.get_halfedge(he) {
-            Some(h) if h.twin.is_some() => h,
+            Some(h) if h.twin.is_some() && h.face.is_some() => h,
             _ => continue,
         };
 
@@ -265,34 +293,37 @@ fn flip_for_valence(mesh: &mut MeshStorage) -> usize {
             continue;
         }
 
+        // twin 侧必须也有面，否则是边界边无法翻转
+        let twin_face = match mesh.get_halfedge(twin).and_then(|t| t.face) {
+            Some(f) => f,
+            None => continue,
+        };
+
         // 获取四个顶点
-        let v0 = mesh.get_halfedge(twin).unwrap().vertex; // a
+        let v0 = match mesh.get_halfedge(twin) {
+            Some(t) => t.vertex, // a
+            None => continue,
+        };
         let v1 = h.vertex; // c
+        let face = h.face.unwrap();
         // 需要三角形另外两个顶点
-        let face_hes: Vec<_> = FaceHalfEdges::new(mesh, h.face.unwrap()).collect();
+        let face_hes: Vec<_> = FaceHalfEdges::new(mesh, face).collect();
         if face_hes.len() != 3 {
             continue;
         }
         let v2 = face_hes
             .iter()
-            .find(|&&eh| {
-                let v = mesh.get_halfedge(eh).unwrap().vertex;
-                v != v0 && v != v1
-            })
-            .map(|&eh| mesh.get_halfedge(eh).unwrap().vertex);
+            .filter_map(|&eh| mesh.get_halfedge(eh).map(|h| h.vertex))
+            .find(|&v| v != v0 && v != v1);
 
-        let twin_face = mesh.get_halfedge(twin).unwrap().face;
-        let twin_hes: Vec<_> = FaceHalfEdges::new(mesh, twin_face.unwrap()).collect();
+        let twin_hes: Vec<_> = FaceHalfEdges::new(mesh, twin_face).collect();
         if twin_hes.len() != 3 {
             continue;
         }
         let v3 = twin_hes
             .iter()
-            .find(|&&eh| {
-                let v = mesh.get_halfedge(eh).unwrap().vertex;
-                v != v0 && v != v1
-            })
-            .map(|&eh| mesh.get_halfedge(eh).unwrap().vertex);
+            .filter_map(|&eh| mesh.get_halfedge(eh).map(|h| h.vertex))
+            .find(|&v| v != v0 && v != v1);
 
         let (Some(v2), Some(v3)) = (v2, v3) else {
             continue;
@@ -422,5 +453,87 @@ mod tests {
         let stats = remesh_to_length(&mut mesh, 0.5);
         assert!(stats.target_length > 0.0);
         validate_mesh(&mesh).unwrap();
+    }
+
+    #[test]
+    fn isotropic_remesh_zero_target_length_returns_early() {
+        let mut mesh = crate::test_util::build_icosphere(1);
+        let stats = isotropic_remesh(&mut mesh, Some(0.0), 5, false);
+        // 早退时 iterations 报告请求值，splits/collapses/flips 均为 0
+        assert_eq!(stats.iterations, 5);
+        assert_eq!(stats.splits, 0);
+        assert_eq!(stats.collapses, 0);
+        assert_eq!(stats.flips, 0);
+    }
+
+    #[test]
+    fn isotropic_remesh_negative_target_length_returns_early() {
+        let mut mesh = crate::test_util::build_icosphere(1);
+        let stats = isotropic_remesh(&mut mesh, Some(-1.0), 5, false);
+        assert_eq!(stats.iterations, 5);
+        assert_eq!(stats.splits, 0);
+        assert_eq!(stats.collapses, 0);
+        assert_eq!(stats.flips, 0);
+    }
+
+    #[test]
+    fn compute_target_length_empty_mesh_returns_zero() {
+        let mesh = MeshStorage::new();
+        assert_eq!(compute_target_length(&mesh), 0.0);
+    }
+
+    #[test]
+    fn remesh_on_open_grid_does_not_panic() {
+        let mut mesh = crate::primitives::build_grid(2.0, 2.0, 3, 3);
+        let _stats = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
+        validate_mesh(&mesh).unwrap();
+    }
+
+    #[test]
+    fn target_valence_boundary_is_4() {
+        let mesh = crate::primitives::build_grid(2.0, 2.0, 3, 3);
+        let mut boundary = 0;
+        let mut interior = 0;
+        for v in mesh.vertex_ids() {
+            if is_boundary_vertex(&mesh, v) {
+                assert_eq!(target_valence(v, &mesh), 4);
+                boundary += 1;
+            } else {
+                assert_eq!(target_valence(v, &mesh), 6);
+                interior += 1;
+            }
+        }
+        assert!(boundary > 0, "开放网格应存在边界顶点");
+        assert!(interior > 0, "3x3 网格应存在内部顶点");
+    }
+
+    #[test]
+    fn tangential_smooth_on_isolated_vertex_is_noop() {
+        let mut mesh = MeshStorage::new();
+        let v = mesh.add_vertex(crate::storage::Vertex::new([0.0, 0.0, 0.0]));
+        tangential_smooth(&mut mesh, v);
+        // 孤立顶点无邻居，位置不变
+        let pos = mesh.get_vertex(v).unwrap().position;
+        assert_eq!(pos, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn isotropic_remesh_zero_iterations_is_noop() {
+        let mut mesh = crate::test_util::build_icosphere(1);
+        let stats = isotropic_remesh(&mut mesh, None, 0, false);
+        assert_eq!(stats.iterations, 0);
+        assert_eq!(stats.splits, 0);
+        assert_eq!(stats.collapses, 0);
+        assert_eq!(stats.flips, 0);
+    }
+
+    #[test]
+    fn remesh_preserves_euler_characteristic() {
+        let mut mesh = crate::test_util::build_icosphere(1);
+        let chi_before = mesh.euler_characteristic();
+        assert_eq!(chi_before, 2);
+        let _ = quick_remesh(&mut mesh);
+        let chi_after = mesh.euler_characteristic();
+        assert_eq!(chi_after, chi_before);
     }
 }

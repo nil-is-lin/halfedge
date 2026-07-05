@@ -23,25 +23,9 @@ use std::collections::HashMap;
 use crate::geometry::cotan_edge_weight;
 use crate::ids::VertexId;
 use crate::linalg::{SparseSystem, conjugate_gradient, regularize_diagonal};
+use crate::linalg::vec3::{Vec3, sub, add, scale};
 use crate::storage::MeshStorage;
 use crate::traversal::VertexRing;
-
-type Vec3 = [f64; 3];
-
-#[inline]
-fn sub(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-#[inline]
-fn add(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-#[inline]
-fn scale(a: Vec3, s: f64) -> Vec3 {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
 
 /// 3×3 矩阵按行主序存储。
 type Mat3 = [[f64; 3]; 3];

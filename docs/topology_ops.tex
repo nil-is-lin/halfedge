@@ -116,6 +116,22 @@
 \end{tabular}
 \end{center}
 
+\subsection{错误信息语言约定}
+
+\texttt{TopologyError::Inconsistent(msg)} 中的 \texttt{msg} 字符串\textbf{统一使用中文}，
+与代码库其余部分（\texttt{io.rs} 各 \texttt{*Error}、\texttt{validate.rs}、
+\texttt{panic!} / \texttt{eprintln!} / \texttt{expect()}）保持一致。例如：
+\begin{itemize}
+  \item 字段缺失类：\texttt{"h.next 为 None"}、\texttt{"twin.prev 为 None"}、
+        \texttt{"p1.twin 为 None"}；
+  \item 实体缺失类：\texttt{"顶点 A 不存在"}、\texttt{"面 \{:?\} 不存在"}；
+  \item 几何/语义类：\texttt{"挤出区域为空"}、\texttt{"仅支持三角面"}、
+        \texttt{"面 \{:?\} 边界环长度=\{\}, 非三角面"}。
+\end{itemize}
+\textbf{半边字段路径保留原文}：\texttt{h.next} / \texttt{h.prev} / \texttt{twin.next} /
+\texttt{twin.prev} / \texttt{p1.twin} / \texttt{n1.twin} / \texttt{n2.twin} /
+\texttt{p2.twin} 等以字段名直接引用结构体成员，便于从错误信息定位到对应源码字段。
+
 \section{validate\_mesh：流形不变量校验}
 
 \texttt{validate\_mesh(mesh)} 遍历所有半边与面，检查以下不变量：
@@ -839,10 +855,11 @@ $\text{vert\_map}[v] = v'$。
   \item \textbf{创建 3 条半边}：$h_0: v_0 \to v_1$、$h_1: v_1 \to v_2$、$h_2: v_2 \to v_0$，
         设置 \texttt{next/prev} 闭环 $h_0 \to h_1 \to h_2 \to h_0$。
   \item \textbf{创建面} $F$，\texttt{halfedge} $\leftarrow h_0$，三条半边 \texttt{face} $\leftarrow F$。
-  \item \textbf{twin 配对}（对每条边 $h_i: \text{src} \to \text{dst}$）：
-        遍历所有现存半边，查找 $E$ 满足 $E.\mathrm{vertex} = \text{src}$
-        且 $E.\mathrm{twin}.\mathrm{vertex} = \text{dst}$ 且 $E.\mathrm{twin}.\mathrm{face} = \mathrm{None}$
-        （即 $E$ 的 twin 是方向为 $\text{src} \to \text{dst}$ 的边界半边）。
+  \item \textbf{twin 配对}：首先一次性遍历所有现存半边，构建哈希索引
+        $\text{boundary\_twin\_map}: (\text{origin}, \text{tip}) \to \text{HalfEdgeId}$，
+        仅收录 twin 为边界半边（\texttt{face = None}）的内部半边。
+        然后对每条新边 $h_i: \text{src} \to \text{dst}$，以 key $= (\text{dst}, \text{src})$
+        在哈希中 $O(1)$ 查找满足条件的 $E$（$E$ 从 $\text{dst} \to \text{src}$，其 twin 从 $\text{src} \to \text{dst}$ 且为边界半边）。
         \begin{itemize}
           \item \textbf{命中}：删除旧边界 twin，将 $h_i$ 与 $E$ 互设为 twin（复用已有内部半边）。
           \item \textbf{未命中}：新建边界半边 $\text{twin}: \text{dst} \to \text{src}$，与 $h_i$ 互指。
@@ -864,12 +881,14 @@ $\text{vert\_map}[v] = v'$。
   startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12}
 ]
   \node[startend] (s) {开始：新边 $h_i: \text{src}\to\text{dst}$};
-  \node[proc, below=of s, fill=blue!8] (p1) {扫描所有现存半边 $E$，查找 $E.\mathrm{vertex}=\text{src}$ 且 $E.\mathrm{twin}.\mathrm{vertex}=\text{dst}$ 且 $E.\mathrm{twin}.\mathrm{face}=\mathrm{None}$};
+  \node[proc, below=of s, fill=blue!8] (p0) {一次性遍历全部半边，构建 \texttt{boundary\_twin\_map}：$(\text{origin}, \text{tip}) \to E$，仅含 twin 为边界者};
+  \node[proc, below=of p0, fill=blue!4] (p1) {哈希查找 key $= (\text{dst}, \text{src})$，$O(1)$};
   \node[dec, below=of p1] (d1) {找到 $E$？};
   \node[proc, below=of d1, fill=green!10] (yes) {删除 $E$ 的旧边界 twin；$h_i \leftrightarrow E$ 互设 twin};
   \node[proc, right=2.2cm of d1, fill=blue!8] (no) {新建 twin: $\text{dst}\to\text{src}$（边界）；$h_i \leftrightarrow \text{twin}$};
   \node[startend, below=of yes, fill=green!12] (e) {返回};
-  \draw[op] (s) -- (p1);
+  \draw[op] (s) -- (p0);
+  \draw[op] (p0) -- (p1);
   \draw[op] (p1) -- (d1);
   \draw[op] (d1) -- node[right, font=\footnotesize] {是} (yes);
   \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (no);
@@ -1010,7 +1029,7 @@ $\text{vert\_map}[v] = v'$。
   \texttt{extrude\_face}   & $O(1)$（固定 18 半边 + 7 面创建）+ $O(|E|+|F|)$（校验） \\
   \texttt{extrude\_faces}  & $O(n) \cdot (\texttt{extrude\_face} + \texttt{validate})$ \\
   \texttt{extrude\_region} & $O(|\mathcal{R}| \cdot \bar{d_v}) + O(|\partial\mathcal{R}|)$（顶点分类 + 侧面创建）+ $O(|E|+|F|)$（校验） \\
-  \texttt{add\_triangle}   & $O(|E_{\mathrm{he}}|)$（每条边需扫描现存半边查找可配对 twin）+ $O(|E|+|F|)$（校验） \\
+  \texttt{add\_triangle}   & $O(|E_{\mathrm{he}}|)$（一次性构建哈希索引）$+ O(1)$（3 次查找）$+ O(|E|+|F|)$（校验） \\
   \texttt{split\_face}     & $O(1)$（固定 9 半边创建与重连）+ $O(|E|+|F|)$（校验） \\
   \texttt{validate\_mesh}  & $O(|E_{\mathrm{he}}| + |F|)$（遍历所有半边与面） \\
   \bottomrule
@@ -1144,11 +1163,12 @@ $\text{vert\_map}[v] = v'$。
         既连接非区域面（保留原位），又连接侧面（新创建）。$v$ 的 outgoing 入口
         必须指向一个确实从 $v$ 出发的半边。垂直半边 $\text{up}: v \to v'$ 是最稳定的选择，
         因为它不依赖于具体的边界边排列顺序。
-  \item \textbf{为何 add\_triangle 暴力扫描半边而非维护邻接表？} 增量构建 API
-        假设调用频率不高（构建完成后转入常规遍历），暴力扫描 $O(|E_{\mathrm{he}}|)$
-        在小规模构建中足够快；维护额外索引会增加 \texttt{MeshStorage} 内存开销
-        并破坏与 \texttt{slotmap} 的简洁集成。大规模重建应使用
-        \texttt{build\_mesh\_from\_vertices\_and\_faces}（一次成型）。
+  \item \textbf{为何 add\_triangle 使用临时哈希而非持久化邻接表？}
+        \texttt{add\_triangle} 每次调用时一次性遍历全部半边构建
+        \texttt{boundary\_twin\_map}（$O(|E_{\mathrm{he}}|)$），然后 3 次查找 $O(1)$。
+        相比旧版每条边独立扫描（$O(3|E_{\mathrm{he}}|)$）减少约 3 倍常数。
+        持久化邻接表会增加 \texttt{MeshStorage} 内存开销并破坏与 \texttt{slotmap}
+        的简洁集成；大规模重建仍应使用 \texttt{build\_mesh\_from\_polygons}（一次成型）。
   \item \textbf{为何 split\_face 删除原半边再重建，而非就地分裂？} poke 操作将
         3 条外边界半边全部「易主」给新的 3 个面，并新增 6 条辐条半边。若就地修改，
         需要为每条原半边分配新 twin、调整 next/prev，分支较多。先删除再重建使逻辑

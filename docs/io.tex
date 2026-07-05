@@ -9,6 +9,7 @@
 \usepackage{tikz}
 \usepackage{booktabs}
 \usepackage{multirow}
+\usepackage{longtable}
 \usepackage{hyperref}
 \usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
 
@@ -46,7 +47,7 @@
   keepspaces=true,
 }
 
-\title{\textbf{halfedge\,: OBJ / PLY / STL 读写与网格构建模块设计文档} \\ \large \texttt{src/io.rs}}
+\title{\textbf{halfedge\,: OBJ / PLY / STL / OFF / glTF 读写与网格构建模块设计文档} \\ \large \texttt{src/io.rs}}
 \author{halfedge 库}
 \date{2026-07-05}
 
@@ -56,7 +57,7 @@
 
 \section{模块定位}
 
-\texttt{io.rs} 提供五组能力：
+\texttt{io.rs} 提供\textbf{五类网格文件格式}的读写能力：
 
 \begin{center}
 \renewcommand{\arraystretch}{1.18}
@@ -76,13 +77,17 @@
     & \texttt{save\_obj(mesh, path)} & 保存到文件 \\
     & \texttt{format\_obj(mesh)}     & 序列化为文本 \\
   \midrule
-  \multirow{2}{*}{PLY 读}
-    & \texttt{load\_ply(path)}    & 从文件加载 PLY ASCII \\
-    & \texttt{parse\_ply(text)}   & 从文本解析 PLY ASCII \\
+  \multirow{4}{*}{PLY 读}
+    & \texttt{load\_ply(path)}                & 从文件加载（自动判别 ASCII / 二进制） \\
+    & \texttt{parse\_ply(text)}               & 从文本解析 PLY ASCII（保留旧入口） \\
+    & \texttt{parse\_ply\_bytes(bytes)}       & 从字节流解析（自动判别 ASCII / 二进制） \\
+    & （内部）\texttt{parse\_ply\_binary\_le} & 二进制小端 PLY 解析 \\
   \midrule
-  \multirow{2}{*}{PLY 写}
-    & \texttt{save\_ply(mesh, path)} & 保存到 PLY 文件 \\
-    & \texttt{format\_ply(mesh)}     & 序列化为 PLY 文本 \\
+  \multirow{4}{*}{PLY 写}
+    & \texttt{save\_ply(mesh, path)}            & 保存为 PLY 文件（ASCII） \\
+    & \texttt{format\_ply(mesh)}                & 序列化为 PLY ASCII 文本 \\
+    & \texttt{save\_ply\_binary(mesh, path)}    & 保存为 PLY 文件（二进制小端） \\
+    & \texttt{format\_ply\_binary(mesh)}        & 序列化为 PLY 二进制字节流 \\
   \midrule
   \multirow{5}{*}{STL 读}
     & \texttt{load\_stl(path)}                  & 从文件加载（自动判别 ASCII / 二进制） \\
@@ -96,10 +101,43 @@
     & \texttt{save\_stl\_binary(mesh, path)}    & 保存为 STL 二进制文件 \\
     & \texttt{format\_stl\_binary(mesh)}        & 序列化为 STL 二进制字节 \\
   \midrule
+  \multirow{2}{*}{OFF 读}
+    & \texttt{load\_off(path)}    & 从文件加载 OFF（ASCII） \\
+    & \texttt{parse\_off(text)}   & 从文本解析 OFF \\
+  \midrule
+  \multirow{2}{*}{OFF 写}
+    & \texttt{save\_off(mesh, path)} & 保存到 OFF 文件 \\
+    & \texttt{format\_off(mesh)}     & 序列化为 OFF 文本 \\
+  \midrule
+  \multirow{2}{*}{glTF 读}
+    & \texttt{load\_glb(path)}    & 从文件加载 GLB（glTF 二进制容器） \\
+    & \texttt{parse\_glb(bytes)}  & 从字节流解析 GLB \\
+  \midrule
+  \multirow{2}{*}{glTF 写}
+    & \texttt{save\_glb(mesh, path)} & 保存到 GLB 文件 \\
+    & \texttt{format\_glb(mesh)}     & 序列化为 GLB 字节流 \\
+  \midrule
   \multirow{3}{*}{统一入口}
-    & \texttt{MeshError}                            & 统一错误枚举（\texttt{Obj} / \texttt{Ply} / \texttt{Stl} / \texttt{UnsupportedFormat}） \\
-    & \texttt{load\_mesh(path)}                     & 按扩展名自动选择 OBJ / PLY / STL 解析器 \\
-    & \texttt{save\_mesh(mesh, path)}               & 按扩展名自动选择 OBJ / PLY / STL 序列化器 \\
+    & \texttt{MeshError}                            & 统一错误枚举（\texttt{Obj} / \texttt{Ply} / \texttt{Stl} / \texttt{Off} / \texttt{Gltf} / \texttt{UnsupportedFormat}） \\
+    & \texttt{load\_mesh(path)}                     & 按扩展名自动选择 OBJ / PLY / STL / OFF / GLB 解析器 \\
+    & \texttt{save\_mesh(mesh, path)}               & 按扩展名自动选择 OBJ / PLY / STL / OFF / GLB 序列化器 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{支持的格式总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{格式} & \textbf{扩展名} & \textbf{变体} & \textbf{特点} \\
+  \midrule
+  OBJ  & \texttt{.obj}            & ASCII                 & 支持 n-gon、\texttt{v/vt/vn}、负索引 \\
+  PLY  & \texttt{.ply}            & ASCII + 二进制小端    & 自动判别；二进制支持任意属性类型 \\
+  STL  & \texttt{.stl}            & ASCII + 二进制        & 自动判别；顶点按位模式去重 \\
+  OFF  & \texttt{.off}            & ASCII                 & 简单文本；支持任意多边形面 \\
+  glTF & \texttt{.glb} / \texttt{.gltf} & GLB 二进制      & 最小子集：单 primitive + POSITION + indices \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -146,6 +184,38 @@ f -3 -2 -1
 \end{tabular}
 \end{center}
 
+\subsection{错误信息语言约定}
+
+全模块错误信息\textbf{统一使用中文}，与代码库其余部分（\texttt{panic!}、\texttt{eprintln!}、
+\texttt{expect()}、\texttt{validate.rs}）保持一致。具体包括：
+\begin{itemize}
+  \item 各 \texttt{Display} 实现的标题文字，如 \texttt{"IO 错误: \{e\}"}、
+        \texttt{"第 \{line\} 行 PLY 解析错误: \{msg\}"}、\texttt{"OBJ 错误: \{e\}"}；
+  \item \texttt{Parse\{msg\}} 中的描述串，如 \texttt{"无法解析顶点坐标"}、
+        \texttt{"无效顶点坐标: \{s\}"}、\texttt{"无效 x 坐标: \{...\}"}、
+        \texttt{"面索引 \{v\} 越界（顶点计数 \{v\_count\}）"}；
+  \item \texttt{Unsupported} 中的描述串，如 \texttt{"不支持大端 PLY"}、
+        \texttt{"未知 PLY 格式: \{other\}"}、\texttt{"不支持 GLB 版本 \{version\}（仅支持 2）"}。
+\end{itemize}
+\textbf{技术术语保留原文}：\texttt{OBJ} / \texttt{PLY} / \texttt{STL} / \texttt{OFF} / \texttt{glTF}
+格式名、\texttt{chunk} / \texttt{bufferView} / \texttt{accessor} / \texttt{componentType} /
+\texttt{POSITION} 等 GLTF 规范字段、\texttt{h.next} / \texttt{twin.prev} 等半边字段路径
+不在翻译范围内，以保证错误信息与规范文档的可对照性。
+
+\subsection{数据丢弃警告}
+
+\begin{itemize}
+  \item \texttt{build\_mesh\_from\_polygons} 跳过顶点数 $< 3$ 的退化面时，
+        会通过 \texttt{eprintln!} 输出警告统计；
+  \item PLY/OFF 解析器不再自行过滤退化面（移除 \texttt{if indices.len() >= 3}
+        / \texttt{if k < 3} 的静默跳过），而是将所有面交给
+        \texttt{build\_mesh\_from\_polygons} 统一处理与警告；
+  \item 所有导出函数（\texttt{format\_obj} / \texttt{format\_ply} /
+        \texttt{format\_ply\_binary} / \texttt{format\_stl\_ascii} /
+        \texttt{format\_stl\_binary} / \texttt{format\_off} / \texttt{format\_glb}）
+        跳过退化面/非三角面时，会通过 \texttt{eprintln!} 输出警告统计。
+\end{itemize}
+
 \section{build\_mesh\_from\_vertices\_and\_faces 算法}
 
 \subsection{整体流程}
@@ -191,6 +261,13 @@ f -3 -2 -1
 设置 $\mathrm{next}(h_0)=h_1,\ \mathrm{next}(h_1)=h_2,\ \mathrm{next}(h_2)=h_0$，
 $\mathrm{prev}$ 反向，$\mathrm{face} = f$。
 记录 \texttt{edge\_map}：$(i_0, i_1) \to h_0$，$(i_1, i_2) \to h_1$，$(i_2, i_0) \to h_2$。
+
+\paragraph{面索引越界检查}
+\texttt{build\_mesh\_from\_vertices\_and\_faces} 与 \texttt{build\_mesh\_from\_polygons}
+作为公开构建函数，在访问 \texttt{v\_ids[i]} 之前显式检查 $i < |\texttt{v\_ids}|$。
+若越界，\texttt{panic} 并输出索引值与顶点总数（而非让标准库抛出匿名的
+``index out of bounds''）。这把 silent panic 转为可诊断的失败，
+为后续接入 \texttt{Result} 变体（缺陷 \#17）预留接口。
 
 \subsection{步骤 3：twin 建立}
 
@@ -421,6 +498,262 @@ STL 文件每个三角面独立存储三顶点，无共享顶点索引。
 若 STL 文件含微小浮点误差导致同顶点不同表示，应先用
 \texttt{weld\_vertices}（按距离阈值合并）做后处理。
 
+\section{PLY 二进制小端读写}
+
+PLY 二进制格式在文件大小与解析速度上显著优于 ASCII 变体，是工业应用的首选。
+本模块支持完整的二进制小端格式（\texttt{format binary\_little\_endian 1.0}）。
+
+\subsection{Header 解析}
+
+PLY 文件由\textbf{文本 header} 与\textbf{二进制数据}两段组成，以 \texttt{end\_header\textbackslash n}
+为分界。Header 描述了：
+\begin{itemize}
+  \item \texttt{format}：\texttt{ascii} / \texttt{binary\_little\_endian} / \texttt{binary\_big\_endian}；
+  \item \texttt{element vertex <N>}：顶点元素数量；
+  \item \texttt{property <type> <name>}：顶点属性（按声明顺序排列），支持
+        \texttt{char} / \texttt{uchar} / \texttt{short} / \texttt{ushort} /
+        \texttt{int} / \texttt{uint} / \texttt{float} / \texttt{double} 8 种类型；
+  \item \texttt{element face <M>}：面元素数量；
+  \item \texttt{property list <count\_type> <index\_type> <name>}：面索引 list。
+\end{itemize}
+
+\textbf{搜索算法}：用 \texttt{windows(11).position(|w| w == b"end\_header\textbackslash n")}
+找到字节偏移，将 header 部分按文本逐行解析后，剩余字节按二进制布局读取。
+
+\subsection{二进制数据布局}
+
+顶点数据按 \texttt{vertex\_stride} 字节连续排列：
+\[
+  \text{vertex\_stride} = \sum_{i=1}^{k} \text{size}(\text{type}_i)
+\]
+其中 $k$ 为属性数量，$\text{size}(\cdot)$ 取 $\{1, 2, 4, 8\}$ 字节。
+顶点 $j$ 的属性 $i$ 起始偏移：
+\[
+  \text{offset}(j, i) = j \cdot \text{vertex\_stride} + \sum_{l=1}^{i-1} \text{size}(\text{type}_l)
+\]
+
+面数据每条由 1 字节（\texttt{uchar}）顶点数 + $k \cdot \text{size}(\text{index\_type})$ 字节索引组成。
+
+\subsection{ASCII / 二进制自动判别}
+
+\texttt{parse\_ply\_bytes} 通过解析 header 中的 \texttt{format} 行决定后续路径：
+\begin{itemize}
+  \item \texttt{ascii} $\to$ 全文件转 UTF-8 后走 \texttt{parse\_ply\_ascii\_with\_header}；
+  \item \texttt{binary\_little\_endian} $\to$ 从 \texttt{end\_header} 偏移走 \texttt{parse\_ply\_binary\_le}；
+  \item \texttt{binary\_big\_endian} $\to$ 返回 \texttt{Unsupported} 错误。
+\end{itemize}
+
+\subsection{PlyType 类型分发}
+
+\texttt{PlyType} 枚举对 8 种 PLY 标量类型提供：
+\begin{itemize}
+  \item \texttt{size()}：字节宽度；
+  \item \texttt{read\_le\_as\_f64(bytes)}：小端读为 \texttt{f64}（顶点坐标）；
+  \item \texttt{read\_le\_as\_u32(bytes)}：小端读为 \texttt{u32}（面索引）；
+  \item \texttt{write\_le\_from\_f64(v)} / \texttt{write\_le\_from\_u32(v)}：小端写字节。
+\end{itemize}
+
+\subsection{format\_ply\_binary 输出约定}
+
+输出固定布局（与 OpenMesh / MeshLab 兼容）：
+\begin{itemize}
+  \item \texttt{format binary\_little\_endian 1.0}；
+  \item 顶点属性 \texttt{float x y z}（每顶点 12 字节）；
+  \item 面索引 \texttt{property list uchar int vertex\_indices}（每面 $1 + 4k$ 字节）。
+\end{itemize}
+
+\subsection{PlyError}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发场景} \\
+  \midrule
+  \texttt{Io(std::io::Error)}     & 文件读写错误 \\
+  \texttt{Parse\{line, msg\}}     & header 或数据解析失败（行号 + 描述） \\
+  \texttt{Unsupported(String)}    & 不支持的 PLY 特性（如大端） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{OFF 读写}
+
+OFF（Object File Format）是 Geomview 与许多学术工具使用的简化网格格式。
+
+\subsection{格式约定}
+
+\begin{lstlisting}
+OFF
+<vertex_count> <face_count> <edge_count>
+x y z                # vertex 0
+...
+k v0 v1 ... vk-1     # face 0 (k = vertex count of face)
+...
+\end{lstlisting}
+
+\begin{itemize}
+  \item 第一行 \texttt{OFF} 关键字可选；部分文件首行为 \texttt{OFF 4 4 0}（关键字与计数同行）；
+  \item \texttt{\#} 开头行视为注释；
+  \item \texttt{edge\_count} 通常为 0，被忽略；
+  \item 面顶点数 $k \ge 3$ 任意，自动按 fan 方式三角化（通过
+        \texttt{build\_mesh\_from\_polygons}）；
+  \item 索引越界（$v_i \ge \text{vertex\_count}$）返回 \texttt{Parse} 错误。
+\end{itemize}
+
+\subsection{首行解析流程}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.6cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.4cm, minimum height=0.6cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {读取首行};
+  \node[dec, below=of s] (d1) {首行以 \texttt{OFF} 起始？};
+  \node[proc, below=of d1, fill=blue!8] (yes) {剥离 \texttt{OFF} 前缀，剩余作为计数行};
+  \node[dec, below=of yes] (d2) {剩余非空？};
+  \node[proc, right=1.6cm of d2, fill=green!12] (use) {用剩余作为计数行};
+  \node[proc, below=of d2, fill=yellow!15] (next) {读取下一行作为计数行};
+  \node[proc, below=of next, fill=blue!8] (no) {首行整体作为计数行};
+  \node[startend, below=2cm of no, fill=gray!12] (e) {解析 V / F / E};
+  \draw[op] (s) -- (d1);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {是} (yes);
+  \draw[op] (yes) -- (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (use);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {否} (next);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {否} ++(3.6,0) |- (no.east);
+  \draw[op] (use) |- (e);
+  \draw[op] (next) -- (e);
+  \draw[op] (no) -- (e);
+\end{tikzpicture}
+\end{center}
+
+\subsection{OffError}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发场景} \\
+  \midrule
+  \texttt{Io(std::io::Error)}     & 文件读写错误 \\
+  \texttt{Parse\{line, msg\}}     & 解析失败（行号 + 描述） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{glTF GLB 读写}
+
+glTF（GL Transmission Format）是 Khronos 制定的现代 3D 资源交换标准。
+本模块实现 GLB（glTF 二进制容器）的\textbf{最小子集}：
+
+\begin{itemize}
+  \item 仅支持单 mesh 单 primitive，mode = 4（TRIANGLES）；
+  \item POSITION 属性必须为 \texttt{FLOAT}（componentType 5126）；
+  \item 索引 accessor 可选 \texttt{UBYTE}（5121） / \texttt{USHORT}（5123） / \texttt{UINT}（5125），
+        若无 indices 则按顺序 0..N；
+  \item \textbf{不支持}材质、纹理、动画、skin、camera、node 层级等。
+\end{itemize}
+
+\subsection{GLB 文件结构}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.3cm,
+  block/.style={draw, minimum width=12cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick}
+]
+  \node[block, fill=gray!15] (h) {12 字节 GLB Header：magic=0x46546C67, version=2, total\_length};
+  \node[block, below=of h, fill=blue!10] (jc) {JSON Chunk：4 字节长度 + 4 字节类型 0x4E4F534A + JSON 数据（4 字节对齐）};
+  \node[block, below=of jc, fill=green!10] (bc) {BIN Chunk：4 字节长度 + 4 字节类型 0x004E4942 + 二进制数据（4 字节对齐）};
+  \draw[op] (h) -- (jc);
+  \draw[op] (jc) -- (bc);
+\end{tikzpicture}
+\end{center}
+
+\subsection{JSON 与极简 JSON 解析器}
+
+为避免引入 \texttt{serde\_json} 依赖，本模块实现一个\textbf{极简 JSON 解析器}
+（\texttt{parse\_minimal\_json}），仅支持 GLB 中所需的对象/数组/原始值。
+解析树 \texttt{JsonValue} 提供 \texttt{get(key)} / \texttt{as\_array()} / \texttt{as\_u32()}
+等访问方法。
+
+\subsection{GLB 解析流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=12cm, minimum height=0.65cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.4cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {字节流};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. 校验 magic / version，读 total\_length};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 循环读 chunks：length + type + data，4 字节对齐};
+  \node[proc, below=of p2, fill=blue!8] (p3) {3. JSON chunk $\to$ \texttt{parse\_minimal\_json} $\to$ \texttt{GltfDoc}};
+  \node[proc, below=of p3, fill=blue!8] (p4) {4. 取 meshes[0].primitives[0]，查 POSITION 与 indices accessor};
+  \node[proc, below=of p4, fill=blue!8] (p5) {5. 按 accessor 读取 BIN chunk 中的位置与索引};
+  \node[proc, below=of p5, fill=blue!8] (p6) {6. mode=4 时按每 3 索引构成三角面};
+  \node[proc, below=of p6, fill=yellow!15] (p7) {7. \texttt{build\_mesh\_from\_vertices\_and\_faces}};
+  \node[startend, below=of p7] (e) {半边网格};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (p7);
+  \draw[op] (p7) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{Accessor 读取}
+
+\textbf{POSITION}（\texttt{read\_accessor\_f32x3}）：
+\begin{itemize}
+  \item 校验 \texttt{componentType == 5126}（FLOAT）；
+  \item 计算起始偏移 $s = \text{bufferView.byteOffset} + \text{accessor.byteOffset}$；
+  \item 每顶点 12 字节（3 × f32 LE），转 \texttt{f64} 推入 \texttt{Vec<[f64; 3]>}。
+\end{itemize}
+
+\textbf{indices}（\texttt{read\_accessor\_u32}）：
+\begin{itemize}
+  \item \texttt{componentType} $\in \{5121, 5123, 5125\}$（UBYTE / USHORT / UINT）；
+  \item 按元素大小 1/2/4 字节读为 \texttt{u32}。
+\end{itemize}
+
+\subsection{format\_glb 输出约定}
+
+输出固定结构（与 Babylon.js / Three.js 兼容）：
+\begin{itemize}
+  \item GLB header：\texttt{magic=0x46546C67, version=2}；
+  \item JSON chunk：描述 asset / scene / nodes / meshes / buffers / bufferViews / accessors，
+        JSON 文本用空格填充至 4 字节对齐；
+  \item BIN chunk：先 $12V$ 字节 position（float32 × 3V），后 $4M$ 字节 indices（uint32 × M），
+        末尾用 0 填充至 4 字节对齐；
+  \item 仅三角面输出，非三角面跳过。
+\end{itemize}
+
+\subsection{GltfError}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发场景} \\
+  \midrule
+  \texttt{Io(std::io::Error)}     & 文件读写错误 \\
+  \texttt{Parse(String)}          & GLB 结构或 JSON 解析失败 \\
+  \texttt{Unsupported(String)}    & 不支持的 glTF 特性（如 mode $\ne 4$） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
 \section{统一入口：load\_mesh / save\_mesh / MeshError}
 
 为简化上层调用，\texttt{io.rs} 提供\textbf{按扩展名自动分派}的统一接口：
@@ -431,9 +764,11 @@ STL 文件每个三角面独立存储三顶点，无共享顶点索引。
   \toprule
   \textbf{扩展名} & \texttt{load\_mesh} 调用 & \texttt{save\_mesh} 调用 \\
   \midrule
-  \texttt{.obj} & \texttt{load\_obj} & \texttt{save\_obj} \\
-  \texttt{.ply} & \texttt{load\_ply} & \texttt{save\_ply} \\
-  \texttt{.stl} & \texttt{load\_stl} & \texttt{save\_stl\_binary} \\
+  \texttt{.obj}              & \texttt{load\_obj}  & \texttt{save\_obj} \\
+  \texttt{.ply}              & \texttt{load\_ply}（自动判别 ASCII / 二进制） & \texttt{save\_ply}（ASCII） \\
+  \texttt{.stl}              & \texttt{load\_stl}（自动判别 ASCII / 二进制） & \texttt{save\_stl\_ascii} \\
+  \texttt{.off}              & \texttt{load\_off}  & \texttt{save\_off} \\
+  \texttt{.glb} / \texttt{.gltf} & \texttt{load\_glb} & \texttt{save\_glb} \\
   其他 & \multicolumn{2}{c}{\texttt{Err(MeshError::UnsupportedFormat(ext))}} \\
   \bottomrule
 \end{tabular}
@@ -441,8 +776,9 @@ STL 文件每个三角面独立存储三顶点，无共享顶点索引。
 
 \subsection{MeshError 枚举}
 
-\texttt{MeshError} 是 OBJ / PLY / STL 错误的\textbf{统一包装}，通过 \texttt{From<ObjError>}
-、\texttt{From<PlyError>} 与 \texttt{From<StlError>} 实现自动转换，
+\texttt{MeshError} 是 OBJ / PLY / STL / OFF / glTF 错误的\textbf{统一包装}，
+通过 \texttt{From<ObjError>} / \texttt{From<PlyError>} / \texttt{From<StlError>}
+/ \texttt{From<OffError>} / \texttt{From<GltfError>} 实现自动转换，
 便于在 \texttt{?} 运算符中混用：
 
 \begin{center}
@@ -452,8 +788,10 @@ STL 文件每个三角面独立存储三顶点，无共享顶点索引。
   \textbf{变体} & \textbf{来源} \\
   \midrule
   \texttt{Obj(ObjError)}                & \texttt{load\_obj} / \texttt{save\_obj} 错误 \\
-  \texttt{Ply(PlyError)}                & \texttt{load\_ply} / \texttt{save\_ply} 错误 \\
+  \texttt{Ply(PlyError)}                & \texttt{load\_ply} / \texttt{save\_ply*} 错误 \\
   \texttt{Stl(StlError)}                & \texttt{load\_stl} / \texttt{save\_stl\_*} 错误 \\
+  \texttt{Off(OffError)}                & \texttt{load\_off} / \texttt{save\_off} 错误 \\
+  \texttt{Gltf(GltfError)}              & \texttt{load\_glb} / \texttt{save\_glb} 错误 \\
   \texttt{UnsupportedFormat(String)}    & 未知扩展名 \\
   \bottomrule
 \end{tabular}
@@ -464,27 +802,36 @@ STL 文件每个三角面独立存储三顶点，无共享顶点索引。
 \begin{lstlisting}
 // 自动按扩展名加载
 let mesh = halfedge::load_mesh("model.obj")?;
-let mesh = halfedge::load_mesh("model.ply")?;
+let mesh = halfedge::load_mesh("model.ply")?;   // 自动判别 ASCII / 二进制
+let mesh = halfedge::load_mesh("model.off")?;
+let mesh = halfedge::load_mesh("model.glb")?;
 
 // 自动按扩展名保存
-halfedge::save_mesh(&mesh, "out.ply")?;
-halfedge::save_mesh(&mesh, "out.obj")?;
+halfedge::save_mesh(&mesh, "out.ply")?;          // ASCII
+halfedge::save_mesh(&mesh, "out.glb")?;          // 二进制
+halfedge::save_ply_binary(&mesh, "out_bin.ply")?; // 显式二进制 PLY
 \end{lstlisting}
 
 \section{测试覆盖}
 
-\begin{center}
-\renewcommand{\arraystretch}{1.18}
-\begin{tabular}{@{}ll@{}}
+\begin{longtable}{@{}ll@{}}
   \toprule
   \textbf{测试名} & \textbf{验证点} \\
   \midrule
-  \multicolumn{2}{l}{\textit{构建器}} \\
+  \endhead
+  \multicolumn{2}{l}{\textit{构建器（10 个）}} \\
   \texttt{build\_mesh\_basic\_quad}                  & 4 顶点 2 面 10 半边 \\
   \texttt{build\_mesh\_passes\_full\_validation}     & 构建结果通过完整校验 \\
   \texttt{build\_mesh\_closed\_tetrahedron}          & 闭合四面体 12 半边 \\
+  \texttt{build\_mesh\_empty\_inputs\_returns\_empty\_mesh} & 空顶点 + 空面 → 空网格，不 panic \\
+  \texttt{build\_mesh\_vertices\_no\_faces}          & 仅顶点无面 → 顶点保留无面 \\
+  \texttt{build\_polygons\_empty\_inputs\_returns\_empty\_mesh} & \texttt{build\_mesh\_from\_polygons} 空输入 \\
+  \texttt{build\_mesh\_face\_index\_out\_of\_range\_panics} & 面索引越界 \texttt{panic!("越界")} \\
+  \texttt{build\_polygons\_face\_index\_out\_of\_range\_panics} & 多边形入口同样越界 panic \\
+  \texttt{build\_polygons\_skips\_degenerate\_face\_2\_verts} & 2 顶点退化面被静默跳过 \\
+  \texttt{build\_polygons\_mixed\_degenerate\_and\_valid} & 退化与有效面混合时只保留有效面 \\
   \midrule
-  \multicolumn{2}{l}{\textit{OBJ 往返与解析}} \\
+  \multicolumn{2}{l}{\textit{OBJ 往返与解析（12 个）}} \\
   \texttt{obj\_roundtrip\_quad}                      & 四边形 OBJ 往返一致 \\
   \texttt{obj\_roundtrip\_tetrahedron}               & 四面体 OBJ 往返一致 \\
   \texttt{obj\_parse\_skips\_comments\_and\_other\_lines} & 忽略 \texttt{\#} / \texttt{vt} / \texttt{vn} / \texttt{g} 等 \\
@@ -493,8 +840,20 @@ halfedge::save_mesh(&mesh, "out.obj")?;
   \texttt{obj\_parse\_quadrilateral\_face\_succeeds} & 四边形面解析成功（支持 n-gon） \\
   \texttt{obj\_parse\_out\_of\_range\_index\_fails}  & 越界索引报 \texttt{IndexOutOfRange} \\
   \texttt{obj\_save\_load\_file\_roundtrip}          & 文件 IO 往返一致 \\
+  \texttt{obj\_parse\_empty\_text}                   & 空文本 → 空网格，不报错 \\
+  \texttt{obj\_parse\_only\_vertices\_no\_faces}     & 仅 \texttt{v} 行 → 顶点保留无面 \\
+  \texttt{obj\_parse\_face\_zero\_index\_fails}      & 0 索引（OBJ 1-based）报错 \\
+  \texttt{obj\_parse\_face\_index\_equal\_to\_vertex\_count\_fails} & 索引 = 顶点数报越界 \\
   \midrule
-  \multicolumn{2}{l}{\textit{STL 往返与解析}} \\
+  \multicolumn{2}{l}{\textit{PLY 二进制（6 个）}} \\
+  \texttt{ply\_binary\_roundtrip}                    & 二进制 PLY 字节往返一致 \\
+  \texttt{ply\_binary\_file\_roundtrip}              & 二进制 PLY 文件 IO 往返 \\
+  \texttt{ply\_ascii\_still\_works\_via\_parse\_ply\_bytes} & 旧 ASCII 文本经字节入口仍可解析 \\
+  \texttt{ply\_binary\_detects\_bad\_header}         & 缺失 \texttt{end\_header} 报 \texttt{Parse} \\
+  \texttt{ply\_parse\_empty\_bytes\_fails}           & 空字节流报错 \\
+  \texttt{ply\_parse\_missing\_end\_header\_fails}   & 缺失 \texttt{end\_header} 报 \texttt{Parse} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{STL 往返与解析（9 个）}} \\
   \texttt{stl\_ascii\_roundtrip}                     & STL ASCII 往返一致 \\
   \texttt{stl\_binary\_roundtrip}                    & STL 二进制往返一致 \\
   \texttt{stl\_ascii\_parses\_minimum\_solid}        & 最小 \texttt{solid} 块解析成功 \\
@@ -502,16 +861,52 @@ halfedge::save_mesh(&mesh, "out.obj")?;
   \texttt{stl\_binary\_detects\_size\_mismatch}      & 二进制长度不匹配报 \texttt{BadBinarySize} \\
   \texttt{stl\_file\_roundtrip\_ascii}               & STL ASCII 文件 IO 往返 \\
   \texttt{stl\_file\_roundtrip\_binary}              & STL 二进制文件 IO 往返 \\
+  \texttt{stl\_ascii\_empty\_text}                   & 空文本 → 空网格，不报错 \\
+  \texttt{stl\_ascii\_only\_solid\_endsolid}         & 仅 \texttt{solid/endsolid} 块 → 空网格 \\
   \midrule
-  \multicolumn{2}{l}{\textit{统一入口}} \\
+  \multicolumn{2}{l}{\textit{OFF 往返与解析（7 个）}} \\
+  \texttt{off\_roundtrip\_tetrahedron}               & 四面体 OFF 往返一致 \\
+  \texttt{off\_file\_roundtrip}                      & OFF 文件 IO 往返 \\
+  \texttt{off\_parse\_counts\_inline\_with\_keyword} & 首行 \texttt{OFF 4 4 0} 行内计数支持 \\
+  \texttt{off\_parse\_quadrilateral\_face\_succeeds} & 四边形面解析成功 \\
+  \texttt{off\_parse\_out\_of\_range\_index\_fails}  & 索引越界报 \texttt{Parse} \\
+  \texttt{off\_parse\_empty\_text\_fails}            & 空文本报错（OFF 需首行关键字） \\
+  \texttt{off\_parse\_only\_vertices\_no\_faces}     & 仅顶点无面 → 顶点保留无面 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{glTF GLB 往返与解析（4 个）}} \\
+  \texttt{glb\_roundtrip\_tetrahedron}               & 四面体 GLB 字节往返一致 \\
+  \texttt{glb\_file\_roundtrip}                      & GLB 文件 IO 往返 \\
+  \texttt{glb\_detects\_bad\_magic}                  & 错误 magic 报 \texttt{Parse} \\
+  \texttt{glb\_icosphere\_roundtrip}                 & icosphere 经 GLB 往返一致 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{统一入口（6 个）}} \\
   \texttt{auto\_detect\_obj}                         & \texttt{load\_mesh(".obj")} 走 OBJ 路径 \\
   \texttt{auto\_detect\_ply}                         & \texttt{load\_mesh(".ply")} 走 PLY 路径 \\
   \texttt{auto\_detect\_stl}                         & \texttt{load\_mesh(".stl")} 走 STL 路径 \\
+  \texttt{auto\_detect\_off}                         & \texttt{load\_mesh(".off")} 走 OFF 路径 \\
+  \texttt{auto\_detect\_glb}                         & \texttt{load\_mesh(".glb")} 走 GLB 路径 \\
   \texttt{auto\_detect\_unsupported}                 & 未知扩展名返回 \texttt{UnsupportedFormat} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{损坏输入与退化面（11 个，散布于上述分组）}} \\
+  \multicolumn{2}{l}{上述 \texttt{*\_empty\_*} / \texttt{*\_out\_of\_range\_*} / \texttt{*\_degenerate\_*} / \texttt{*\_only\_*} 系列} \\
+  \multicolumn{2}{l}{覆盖空输入、越界索引、退化面、仅顶点等边界场景，} \\
+  \multicolumn{2}{l}{确保所有解析入口在异常输入下既不 \texttt{unwrap} panic、也不静默吞错。} \\
   \bottomrule
-\end{tabular}
-\end{center}
+\end{longtable}
 
-全模块共 \textbf{22 个}单元测试，全库共 \textbf{371 个}。
+\subsection{历史 panic 回归}
+
+\texttt{tests/panic\_safety.rs} 集成测试中针对 \texttt{io} 模块的回归用例：
+
+\begin{sloppypar}
+\begin{itemize}
+  \item \texttt{regression\_build\_mesh\_index\_out\_of\_range\_panics\_with\_clear\_message}：保证越界 \texttt{panic!} 消息含中文 \texttt{越界}；
+  \item \texttt{regression\_parse\_obj\_empty\_input\_no\_panic}：空 OBJ 文本不 panic；
+  \item \texttt{regression\_parse\_obj\_only\_vertices\_no\_faces\_no\_panic}：仅顶点 OBJ 不 panic；
+  \item \texttt{regression\_parse\_obj\_malformed\_face\_skipped\_no\_panic}：损坏面行不 panic。
+\end{itemize}
+\end{sloppypar}
+
+全模块共 \textbf{54 个}单元测试，全库共 \textbf{578 个}单元测试 + \textbf{24 个}集成测试（\texttt{tests/mesh\_workflow.rs} 与 \texttt{tests/panic\_safety.rs}）。
 
 \end{document}

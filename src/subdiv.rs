@@ -69,6 +69,12 @@ use crate::traversal::{FaceHalfEdges, VertexRing, is_boundary_edge, is_boundary_
 /// - 所有查询通过 `mesh.get_*` + `Option` 链式调用，无效 ID 返回 `None` 时跳过；
 /// - 边界顶点的邻居数 ≠ 2 时保持原位置（退化情况）；
 /// - 内部顶点 valence=0 时保持原位置（孤立顶点）。
+///
+/// # 非三角面
+/// Loop 细分仅支持三角形。若输入网格包含非三角面（如四边形），
+/// 这些面会被跳过并通过 `eprintln!` 输出警告到 stderr。
+/// 若需处理任意多边形网格，请使用
+/// [`catmull_clark::catmull_clark_subdivide`]。
 pub fn loop_subdivide(mesh: &MeshStorage) -> MeshStorage {
     // 1. 收集原始顶点 ID 并建立 VertexId → u32 索引映射
     let orig_v_ids: Vec<VertexId> = mesh.vertex_ids().collect();
@@ -79,16 +85,26 @@ pub fn loop_subdivide(mesh: &MeshStorage) -> MeshStorage {
     }
 
     // 2. 收集所有面，转为顶点索引三元组（CCW 顺序，由 FaceHalfEdges 保证）
+    //    非三角面被跳过并发出警告（Loop 细分仅支持三角形）
     let mut orig_faces: Vec<[u32; 3]> = Vec::new();
+    let mut skipped_non_triangle: u32 = 0;
     for f_id in mesh.face_ids() {
         let verts: Vec<u32> = FaceHalfEdges::new(mesh, f_id)
             .filter_map(|he| mesh.get_halfedge(he))
             .map(|h| h.vertex)
             .filter_map(|v| v_index.get(&v).copied())
             .collect();
-        if verts.len() == 3 {
-            orig_faces.push([verts[0], verts[1], verts[2]]);
+        match verts.len() {
+            3 => orig_faces.push([verts[0], verts[1], verts[2]]),
+            _ => skipped_non_triangle += 1,
         }
+    }
+    if skipped_non_triangle > 0 {
+        eprintln!(
+            "[halfedge::loop_subdivide] 警告：输入网格含 {} 个非三角面，已跳过（Loop 细分仅支持三角形）。\
+             若需处理任意多边形，请使用 catmull_clark_subdivide。",
+            skipped_non_triangle
+        );
     }
 
     // 3. 计算每条边的中点
@@ -301,8 +317,106 @@ fn edge_key(a: u32, b: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{Face, HalfEdge, Vertex};
     use crate::test_util::build_icosphere;
     use crate::validate::check_topology;
+
+    /// 构造仅含 1 个四边形面的网格（无 twin，仅面环）。
+    /// 用于测试 Loop/√3 细分对非三角面的跳过 + 警告行为。
+    fn build_single_quad_mesh() -> MeshStorage {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(Vertex::new([0.0, 0.0, 0.0]));
+        let v1 = mesh.add_vertex(Vertex::new([1.0, 0.0, 0.0]));
+        let v2 = mesh.add_vertex(Vertex::new([1.0, 1.0, 0.0]));
+        let v3 = mesh.add_vertex(Vertex::new([0.0, 1.0, 0.0]));
+
+        let h0 = mesh.add_halfedge(HalfEdge::new(v1)); // v0→v1
+        let h1 = mesh.add_halfedge(HalfEdge::new(v2)); // v1→v2
+        let h2 = mesh.add_halfedge(HalfEdge::new(v3)); // v2→v3
+        let h3 = mesh.add_halfedge(HalfEdge::new(v0)); // v3→v0
+
+        for (he, next, prev) in [(h0, h1, h3), (h1, h2, h0), (h2, h3, h1), (h3, h0, h2)] {
+            let h = mesh.get_halfedge_mut(he).unwrap();
+            h.next = Some(next);
+            h.prev = Some(prev);
+        }
+
+        let face = mesh.add_face(Face::new());
+        mesh.get_face_mut(face).unwrap().halfedge = Some(h0);
+        for he in [h0, h1, h2, h3] {
+            mesh.get_halfedge_mut(he).unwrap().face = Some(face);
+        }
+
+        // 顶点入口：任一 outgoing 半边
+        mesh.get_vertex_mut(v0).unwrap().halfedge = Some(h0);
+        mesh.get_vertex_mut(v1).unwrap().halfedge = Some(h1);
+        mesh.get_vertex_mut(v2).unwrap().halfedge = Some(h2);
+        mesh.get_vertex_mut(v3).unwrap().halfedge = Some(h3);
+
+        mesh
+    }
+
+    // ---------- 非三角面跳过 + 警告 ----------
+
+    #[test]
+    fn loop_subdivide_skips_non_triangle_with_warning() {
+        // 输入：1 个四边形面（无三角面）
+        // 期望：跳过四边形，输出为 0 面（顶点保留）；
+        //      警告通过 eprintln! 输出到 stderr，测试只验证行为不变化。
+        let mesh = build_single_quad_mesh();
+        assert_eq!(mesh.face_count(), 1, "输入应含 1 个四边形面");
+
+        let refined = loop_subdivide(&mesh);
+        assert_eq!(
+            refined.face_count(),
+            0,
+            "非三角面应被跳过，输出 0 面"
+        );
+        assert_eq!(
+            refined.vertex_count(),
+            4,
+            "原始 4 个顶点应保留（无新边中点）"
+        );
+    }
+
+    #[test]
+    fn loop_subdivide_mixed_mesh_keeps_only_triangles() {
+        // 输入：1 个三角形（含完整 twin）+ 1 个独立四边形（无 twin）
+        // 期望：仅三角形被细分 → 4 个三角面；四边形被跳过
+        let tri_verts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let tri_faces = [[0, 1, 2]];
+        let mut mesh = build_mesh_from_vertices_and_faces(&tri_verts, &tri_faces);
+
+        // 追加独立四边形面（无 twin）
+        let qv0 = mesh.add_vertex(Vertex::new([10.0, 0.0, 0.0]));
+        let qv1 = mesh.add_vertex(Vertex::new([11.0, 0.0, 0.0]));
+        let qv2 = mesh.add_vertex(Vertex::new([11.0, 1.0, 0.0]));
+        let qv3 = mesh.add_vertex(Vertex::new([10.0, 1.0, 0.0]));
+        let qh0 = mesh.add_halfedge(HalfEdge::new(qv1));
+        let qh1 = mesh.add_halfedge(HalfEdge::new(qv2));
+        let qh2 = mesh.add_halfedge(HalfEdge::new(qv3));
+        let qh3 = mesh.add_halfedge(HalfEdge::new(qv0));
+        for (he, next, prev) in [(qh0, qh1, qh3), (qh1, qh2, qh0), (qh2, qh3, qh1), (qh3, qh0, qh2)] {
+            let h = mesh.get_halfedge_mut(he).unwrap();
+            h.next = Some(next);
+            h.prev = Some(prev);
+        }
+        let qf = mesh.add_face(Face::new());
+        mesh.get_face_mut(qf).unwrap().halfedge = Some(qh0);
+        for he in [qh0, qh1, qh2, qh3] {
+            mesh.get_halfedge_mut(he).unwrap().face = Some(qf);
+        }
+        mesh.get_vertex_mut(qv0).unwrap().halfedge = Some(qh0);
+        mesh.get_vertex_mut(qv1).unwrap().halfedge = Some(qh1);
+        mesh.get_vertex_mut(qv2).unwrap().halfedge = Some(qh2);
+        mesh.get_vertex_mut(qv3).unwrap().halfedge = Some(qh3);
+
+        assert_eq!(mesh.face_count(), 2);
+
+        let refined = loop_subdivide(&mesh);
+        // 仅三角形被细分（1 三角 → 4 三角），四边形被跳过
+        assert_eq!(refined.face_count(), 4, "仅三角面被细分为 4 面");
+    }
 
     // ---------- 规模验证 ----------
 

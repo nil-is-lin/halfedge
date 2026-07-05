@@ -20,65 +20,10 @@
 //! [`crate::traversal`]: crate::traversal
 
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
+use crate::linalg::vec3;
+use crate::linalg::vec3::{Vec3, sub, add, scale, dot, cross, length, normalize, angle_between};
 use crate::storage::MeshStorage;
 use crate::traversal::{FaceHalfEdges, VertexAdjacentFaces, VertexAdjacentVerts, VertexRing};
-
-// ============================================================
-// 内部向量工具（不对外暴露）
-// ============================================================
-
-type Vec3 = [f64; 3];
-
-#[inline]
-fn sub(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-#[inline]
-fn add(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-#[inline]
-fn scale(a: Vec3, s: f64) -> Vec3 {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-
-#[inline]
-fn dot(a: Vec3, b: Vec3) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn cross(a: Vec3, b: Vec3) -> Vec3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-#[inline]
-fn length(a: Vec3) -> f64 {
-    dot(a, a).sqrt()
-}
-
-#[inline]
-fn normalize(a: Vec3) -> Vec3 {
-    let l = length(a);
-    if l < 1e-12 { a } else { scale(a, 1.0 / l) }
-}
-
-#[inline]
-fn angle_between(u: Vec3, v: Vec3) -> f64 {
-    let lu = length(u);
-    let lv = length(v);
-    if lu < 1e-12 || lv < 1e-12 {
-        return 0.0;
-    }
-    let c = dot(u, v) / (lu * lv);
-    c.clamp(-1.0, 1.0).acos()
-}
 
 // ============================================================
 // 几何查询
@@ -713,10 +658,21 @@ pub struct RayHit {
     pub barycentric: (f64, f64),
 }
 
-/// 射线与三角形求交（Möller-Trumbore 算法）。
+/// 射线与三角形求交（基于 Shewchuk 鲁棒 `orient3d` 谓词）。
 ///
 /// 返回参数 t（`origin + t * direction` 即为交点）与重心坐标 `(u, v)`。
 /// 不相交返回 `None`。
+///
+/// ## 算法
+/// 1. 用 `orient3d(v0, v1, v2, origin)` 与 `orient3d(v0, v1, v2, origin+dir)`
+///    判定射线是否穿过三角形平面（鲁棒符号判定）；
+/// 2. 线性插值求交点参数 t；
+/// 3. 投影到三角形法向主轴的正交平面，用鲁棒 `point_in_triangle_2d`
+///    判定交点是否在三角形内；
+/// 4. 用 2D 重心坐标公式计算 (u, v)。
+///
+/// 相比朴素 Möller-Trumbore，本实现在共面、共线、交点接近三角形边等
+/// 退化情况下能给出精确判定，避免因浮点舍入导致的误判。
 pub fn ray_triangle_intersection(
     origin: [f64; 3],
     direction: [f64; 3],
@@ -724,32 +680,80 @@ pub fn ray_triangle_intersection(
     v1: [f64; 3],
     v2: [f64; 3],
 ) -> Option<(f64, f64, f64)> {
+    use crate::predicates::{orient3d, point_in_triangle_2d};
+
+    // 1. 鲁棒判定射线与三角形平面相交
+    // 由 orient3d 在第 4 个参数上的线性性：
+    //   f(t) = orient3d(v0, v1, v2, origin + t*dir) = a + t*(b - a)
+    // 其中 a = orient3d(v0, v1, v2, origin)，b = orient3d(v0, v1, v2, origin+dir)
+    // 注意：direction 是方向向量（不一定是单位向量），origin+dir 是 t=1 处的点。
+    let a = orient3d(v0, v1, v2, origin);
+    let end = [
+        origin[0] + direction[0],
+        origin[1] + direction[1],
+        origin[2] + direction[2],
+    ];
+    let b = orient3d(v0, v1, v2, end);
+
+    // 求交点参数 t：a + t*(b - a) = 0 → t = -a / (b - a)
+    let denom = b - a;
+    if denom == 0.0 {
+        return None; // 射线与平面平行（含在平面内的退化情况）
+    }
+    let t = -a / denom;
+    if t <= 1e-12 {
+        return None; // 交点在射线后方或原点附近
+    }
+
+    // 3. 计算交点 P = origin + t * direction
+    let p = [
+        origin[0] + t * direction[0],
+        origin[1] + t * direction[1],
+        origin[2] + t * direction[2],
+    ];
+
+    // 4. 投影到 2D（丢弃法向最大分量轴），用鲁棒 point_in_triangle_2d 判定
     let e1 = sub(v1, v0);
     let e2 = sub(v2, v0);
-    let pvec = cross(direction, e2);
-    let det = dot(e1, pvec);
+    let normal = cross(e1, e2);
+    let abs_n = [normal[0].abs(), normal[1].abs(), normal[2].abs()];
+    let drop_axis = if abs_n[0] >= abs_n[1] && abs_n[0] >= abs_n[2] {
+        0
+    } else if abs_n[1] >= abs_n[2] {
+        1
+    } else {
+        2
+    };
 
-    if det.abs() < 1e-14 {
+    let project = |q: [f64; 3]| -> [f64; 2] {
+        match drop_axis {
+            0 => [q[1], q[2]],
+            1 => [q[0], q[2]],
+            _ => [q[0], q[1]],
+        }
+    };
+
+    let p2d = project(p);
+    let a2d = project(v0);
+    let b2d = project(v1);
+    let c2d = project(v2);
+
+    if !point_in_triangle_2d(p2d, a2d, b2d, c2d) {
         return None;
     }
 
-    let inv_det = 1.0 / det;
-    let tvec = sub(origin, v0);
-    let u = dot(tvec, pvec) * inv_det;
-    if !(0.0..=1.0).contains(&u) {
-        return None;
+    // 5. 用 2D 重心坐标公式计算 (u, v)
+    // P = v0 + u*(v1-v0) + v*(v2-v0)，在 2D 投影中求解
+    let ab = [b2d[0] - a2d[0], b2d[1] - a2d[1]];
+    let ac = [c2d[0] - a2d[0], c2d[1] - a2d[1]];
+    let ap = [p2d[0] - a2d[0], p2d[1] - a2d[1]];
+    let denom = ab[0] * ac[1] - ab[1] * ac[0];
+    if denom == 0.0 {
+        return None; // 退化三角形（共线）
     }
-
-    let qvec = cross(tvec, e1);
-    let v = dot(direction, qvec) * inv_det;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-
-    let t = dot(e2, qvec) * inv_det;
-    if t < 1e-12 {
-        return None;
-    }
+    let inv_denom = 1.0 / denom;
+    let u = (ap[0] * ac[1] - ap[1] * ac[0]) * inv_denom;
+    let v = (ab[0] * ap[1] - ab[1] * ap[0]) * inv_denom;
 
     Some((t, u, v))
 }
@@ -806,9 +810,15 @@ pub fn ray_mesh_intersects(origin: [f64; 3], direction: [f64; 3], mesh: &MeshSto
         if verts.len() != 3 {
             continue;
         }
-        let v0 = mesh.get_vertex(verts[0]).unwrap().position;
-        let v1 = mesh.get_vertex(verts[1]).unwrap().position;
-        let v2 = mesh.get_vertex(verts[2]).unwrap().position;
+        // 拓扑不一致时跳过，避免 panic
+        let (v0, v1, v2) = match (
+            mesh.get_vertex(verts[0]),
+            mesh.get_vertex(verts[1]),
+            mesh.get_vertex(verts[2]),
+        ) {
+            (Some(a), Some(b), Some(c)) => (a.position, b.position, c.position),
+            _ => continue,
+        };
         if ray_triangle_intersection(origin, direction, v0, v1, v2).is_some() {
             count += 1;
         }
@@ -828,27 +838,33 @@ pub fn surface_area(mesh: &MeshStorage) -> f64 {
 /// 计算闭合网格的有向体积（散度定理）。
 ///
 /// $$
-/// V = \frac{1}{6} \sum_{f} (v_0 \cdot (v_1 \times v_2))
+/// V = \frac{1}{6} \sum_{f} \operatorname{orient3d}(\mathbf{0}, v_0, v_1, v_2)
 /// $$
 ///
+/// 使用 Shewchuk 鲁棒 `orient3d` 谓词，保证在退化（共面）情况下符号精确。
 /// 正值为 CCW 面朝外（右手系）。非闭合网格结果无意义。
 pub fn mesh_volume(mesh: &MeshStorage) -> f64 {
+    use crate::predicates::tet_signed_volume;
+    let origin = [0.0, 0.0, 0.0];
     let mut volume = 0.0;
     for f in mesh.face_ids() {
         let verts: Vec<VertexId> = crate::traversal::FaceVertices::new(mesh, f).collect();
         if verts.len() != 3 {
             continue;
         }
-        let v0 = mesh.get_vertex(verts[0]).unwrap().position;
-        let v1 = mesh.get_vertex(verts[1]).unwrap().position;
-        let v2 = mesh.get_vertex(verts[2]).unwrap().position;
-        // signed volume of tetrahedron
-        let tetra = v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
-            + v1[0] * (v2[1] * v0[2] - v2[2] * v0[1])
-            + v2[0] * (v0[1] * v1[2] - v0[2] * v1[1]);
-        volume += tetra;
+        // 拓扑不一致时跳过，避免 panic
+        let (v0, v1, v2) = match (
+            mesh.get_vertex(verts[0]),
+            mesh.get_vertex(verts[1]),
+            mesh.get_vertex(verts[2]),
+        ) {
+            (Some(a), Some(b), Some(c)) => (a.position, b.position, c.position),
+            _ => continue,
+        };
+        // 四面体 (原点, v0, v1, v2) 的有符号体积
+        volume += tet_signed_volume(origin, v0, v1, v2);
     }
-    volume / 6.0
+    volume
 }
 
 // ============================================================
@@ -873,14 +889,23 @@ pub struct VertexCurvature {
 fn mixed_area_at_vertex(mesh: &MeshStorage, v: VertexId) -> f64 {
     let mut area = 0.0;
     for he in VertexRing::new(mesh, v) {
-        let h = mesh.get_halfedge(he).unwrap();
+        // 拓扑不一致时跳过，避免 panic
+        let h = match mesh.get_halfedge(he) {
+            Some(h) => h,
+            None => continue,
+        };
         let a = h.vertex; // tip
         let b = h.twin.and_then(|t| mesh.get_halfedge(t)).map(|t| t.vertex); // origin
         let Some(b) = b else { continue };
 
-        let pa = mesh.get_vertex(a).unwrap().position;
-        let pb = mesh.get_vertex(b).unwrap().position;
-        let pv = mesh.get_vertex(v).unwrap().position;
+        let (pa, pb, pv) = match (
+            mesh.get_vertex(a),
+            mesh.get_vertex(b),
+            mesh.get_vertex(v),
+        ) {
+            (Some(va), Some(vb), Some(vv)) => (va.position, vb.position, vv.position),
+            _ => continue,
+        };
 
         let a2 = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2);
         let b2 = (pv[0] - pa[0]).powi(2) + (pv[1] - pa[1]).powi(2) + (pv[2] - pa[2]).powi(2);
@@ -893,11 +918,11 @@ fn mixed_area_at_vertex(mesh: &MeshStorage, v: VertexId) -> f64 {
 
         if obtuse_at_v {
             // v 处钝角：用三角形面积的 1/2
-            let tri_area = face_area_from_points(pv, pa, pb);
+            let tri_area = vec3::triangle_area(pv, pa, pb);
             area += tri_area / 2.0;
         } else if obtuse_at_a || obtuse_at_b {
             // 其他钝角：用三角形面积的 1/4
-            let tri_area = face_area_from_points(pv, pa, pb);
+            let tri_area = vec3::triangle_area(pv, pa, pb);
             area += tri_area / 4.0;
         } else {
             // Voronoi 面积
@@ -906,22 +931,11 @@ fn mixed_area_at_vertex(mesh: &MeshStorage, v: VertexId) -> f64 {
             area += (b2 * cot_b + c2 * cot_a) / 8.0; // actually need cot at vertices a and b opposite to v
             // Standard formula: A_voronoi = 1/8 Σ (cot α_ij + cot β_ij) * ||v_j - v_i||²
             // Let me use a simpler approach: just use 1/3 of each incident triangle area
-            let tri_area = face_area_from_points(pv, pa, pb);
+            let tri_area = vec3::triangle_area(pv, pa, pb);
             area += tri_area / 3.0;
         }
     }
     if area < 1e-14 { 1e-14 } else { area }
-}
-
-fn face_area_from_points(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let cross = [
-        ab[1] * ac[2] - ab[2] * ac[1],
-        ab[2] * ac[0] - ab[0] * ac[2],
-        ab[0] * ac[1] - ab[1] * ac[0],
-    ];
-    0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
 }
 
 fn cotan_from_pos(o: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -1059,8 +1073,13 @@ pub fn surface_area_par(mesh: &MeshStorage) -> f64 {
 }
 
 /// 并行计算闭合网格的有向体积。
+///
+/// 与 [`mesh_volume`] 相同的算法（Shewchuk 鲁棒 `orient3d`），但使用 rayon
+/// 并行迭代所有三角面。
 pub fn mesh_volume_par(mesh: &MeshStorage) -> f64 {
+    use crate::predicates::tet_signed_volume;
     use rayon::prelude::*;
+    let origin = [0.0, 0.0, 0.0];
     let face_ids: Vec<_> = mesh.face_ids().collect();
     face_ids
         .par_iter()
@@ -1069,15 +1088,18 @@ pub fn mesh_volume_par(mesh: &MeshStorage) -> f64 {
             if verts.len() != 3 {
                 return 0.0;
             }
-            let v0 = mesh.get_vertex(verts[0]).unwrap().position;
-            let v1 = mesh.get_vertex(verts[1]).unwrap().position;
-            let v2 = mesh.get_vertex(verts[2]).unwrap().position;
-            v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
-                + v1[0] * (v2[1] * v0[2] - v2[2] * v0[1])
-                + v2[0] * (v0[1] * v1[2] - v0[2] * v1[1])
+            // 拓扑不一致时跳过，避免 panic（与串行版本 mesh_volume 一致）
+            let (v0, v1, v2) = match (
+                mesh.get_vertex(verts[0]),
+                mesh.get_vertex(verts[1]),
+                mesh.get_vertex(verts[2]),
+            ) {
+                (Some(a), Some(b), Some(c)) => (a.position, b.position, c.position),
+                _ => return 0.0,
+            };
+            tet_signed_volume(origin, v0, v1, v2)
         })
         .sum::<f64>()
-        / 6.0
 }
 
 /// 并行计算所有顶点的法向（按 vertex_ids 顺序）。
@@ -2072,5 +2094,218 @@ mod tests {
         bilateral_smooth_mesh(&mut mesh, 0.1, 0.1, 0);
         let pos_after = mesh.get_vertex(p0).unwrap().position;
         assert_eq!(pos_before, pos_after);
+    }
+
+    // ---------- 空/退化网格 ----------
+
+    #[test]
+    fn ray_mesh_intersects_empty_mesh_returns_false() {
+        let mesh = MeshStorage::new();
+        assert!(!ray_mesh_intersects([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], &mesh));
+    }
+
+    #[test]
+    fn mesh_volume_empty_mesh_returns_zero() {
+        let mesh = MeshStorage::new();
+        assert_eq!(mesh_volume(&mesh), 0.0);
+    }
+
+    #[test]
+    fn mesh_volume_par_empty_mesh_returns_zero() {
+        let mesh = MeshStorage::new();
+        assert_eq!(mesh_volume_par(&mesh), 0.0);
+    }
+
+    #[test]
+    fn surface_area_empty_mesh_returns_zero() {
+        let mesh = MeshStorage::new();
+        assert_eq!(surface_area(&mesh), 0.0);
+    }
+
+    #[test]
+    fn surface_area_par_empty_mesh_returns_zero() {
+        let mesh = MeshStorage::new();
+        assert_eq!(surface_area_par(&mesh), 0.0);
+    }
+
+    // ---------- 并行函数一致性（icosphere(1)） ----------
+
+    #[test]
+    fn surface_area_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let s = surface_area(&mesh);
+        let p = surface_area_par(&mesh);
+        assert!((s - p).abs() < 1e-10, "serial={} par={}", s, p);
+    }
+
+    #[test]
+    fn mesh_volume_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let s = mesh_volume(&mesh);
+        let p = mesh_volume_par(&mesh);
+        assert!((s - p).abs() < 1e-10, "serial={} par={}", s, p);
+    }
+
+    #[test]
+    fn vertex_normals_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let par = vertex_normals_par(&mesh);
+        let serial: Vec<[f64; 3]> = mesh
+            .vertex_ids()
+            .map(|v| vertex_normal(&mesh, v).unwrap_or([0.0, 0.0, 0.0]))
+            .collect();
+        assert_eq!(par.len(), serial.len());
+        for (i, (a, b)) in par.iter().zip(serial.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (a[c] - b[c]).abs() < 1e-10,
+                    "顶点 {} 法向分量 {} 不一致: {} vs {}",
+                    i,
+                    c,
+                    a[c],
+                    b[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_gaussian_curvatures_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let par = all_gaussian_curvatures_par(&mesh);
+        let serial: Vec<Option<f64>> = mesh
+            .vertex_ids()
+            .map(|v| gaussian_curvature(&mesh, v))
+            .collect();
+        assert_eq!(par.len(), serial.len());
+        for (i, (a, b)) in par.iter().zip(serial.iter()).enumerate() {
+            match (a, b) {
+                (Some(x), Some(y)) => assert!(
+                    (x - y).abs() < 1e-10,
+                    "顶点 {} 高斯曲率不一致: {} vs {}",
+                    i,
+                    x,
+                    y
+                ),
+                (None, None) => {}
+                _ => panic!(
+                    "顶点 {} 高斯曲率 None 不一致: {:?} vs {:?}",
+                    i, a, b
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn all_mean_curvatures_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let par = all_mean_curvatures_par(&mesh);
+        let serial: Vec<Option<f64>> = mesh
+            .vertex_ids()
+            .map(|v| mean_curvature(&mesh, v))
+            .collect();
+        assert_eq!(par.len(), serial.len());
+        for (i, (a, b)) in par.iter().zip(serial.iter()).enumerate() {
+            match (a, b) {
+                (Some(x), Some(y)) => assert!(
+                    (x - y).abs() < 1e-10,
+                    "顶点 {} 平均曲率不一致: {} vs {}",
+                    i,
+                    x,
+                    y
+                ),
+                (None, None) => {}
+                _ => panic!(
+                    "顶点 {} 平均曲率 None 不一致: {:?} vs {:?}",
+                    i, a, b
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn feature_edges_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        // icosphere(1) 相邻面法向夹角约 20–40°，取 0.3 rad 阈值可得到非空特征边集
+        let threshold = 0.3_f64;
+        let mut s = feature_edges(&mesh, threshold);
+        let mut p = feature_edges_par(&mesh, threshold);
+        s.sort();
+        p.sort();
+        assert_eq!(s, p, "feature_edges 串/并行结果不一致");
+    }
+
+    #[test]
+    fn ray_mesh_intersection_par_matches_serial() {
+        let mesh = crate::test_util::build_icosphere(1);
+        let origin = [2.0, 0.0, 0.0];
+        let direction = [-1.0, 0.0, 0.0];
+        let serial = ray_mesh_intersection(origin, direction, &mesh);
+        let par = ray_mesh_intersection_par(&mesh, origin, direction);
+        match serial {
+            Some(s_hit) => {
+                assert!(!par.is_empty(), "par 应至少有一个交点");
+                // par 返回所有交点，取 t 最小者与 serial 比较
+                let min_par = par
+                    .iter()
+                    .min_by(|a, b| a.t.partial_cmp(&b.t).unwrap())
+                    .unwrap();
+                assert!(
+                    (s_hit.t - min_par.t).abs() < 1e-10,
+                    "t 不一致: serial={} par={}",
+                    s_hit.t,
+                    min_par.t
+                );
+            }
+            None => {
+                assert!(par.is_empty(), "serial 无交点时 par 应为空");
+            }
+        }
+    }
+
+    // ---------- ray_mesh_intersects 正确性 ----------
+
+    #[test]
+    fn ray_mesh_intersects_origin_outside_returns_false() {
+        // ray_mesh_intersects 实现为奇偶判定（origin 是否在闭合网格内部）。
+        // 原点 (0,0,-5) 在球外，射线沿 +z 穿过球面（与 2 个三角面相交，偶数）→ 返回 false。
+        let mesh = crate::test_util::build_icosphere(1);
+        let result = ray_mesh_intersects([0.0, 0.0, -5.0], [0.0, 0.0, 1.0], &mesh);
+        assert!(!result, "原点在球外，奇偶判定应返回 false");
+    }
+
+    #[test]
+    fn ray_mesh_intersects_misses_returns_false() {
+        // 射线从远处射向 +x 方向，不与球面相交（0 个交点）。
+        let mesh = crate::test_util::build_icosphere(1);
+        let result = ray_mesh_intersects([10.0, 10.0, 10.0], [1.0, 0.0, 0.0], &mesh);
+        assert!(!result, "射线不与球面相交，应返回 false");
+    }
+
+    // ---------- mesh_volume 符号 ----------
+
+    #[test]
+    fn mesh_volume_cube_positive() {
+        // build_cube(1.0) 面 CCW 朝外，有向体积应为正 ≈ 1.0
+        let mesh = crate::primitives::build_cube(1.0);
+        let vol = mesh_volume(&mesh);
+        assert!(vol > 0.0, "立方体体积应为正: {}", vol);
+        assert!(
+            (vol - 1.0).abs() < 1e-9,
+            "边长 1 立方体体积应 ≈ 1.0: {}",
+            vol
+        );
+    }
+
+    #[test]
+    fn mesh_volume_par_cube_positive() {
+        let mesh = crate::primitives::build_cube(1.0);
+        let vol = mesh_volume_par(&mesh);
+        assert!(vol > 0.0, "立方体体积应为正: {}", vol);
+        assert!(
+            (vol - 1.0).abs() < 1e-9,
+            "边长 1 立方体体积应 ≈ 1.0: {}",
+            vol
+        );
     }
 }

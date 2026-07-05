@@ -51,6 +51,7 @@ pub fn mesh_to_vertex_index_buffers(mesh: &MeshStorage) -> (Vec<[f32; 3]>, Vec<u
     }
 
     let mut indices: Vec<u32> = Vec::with_capacity(mesh.face_count() * 3);
+    let mut skipped: u32 = 0;
     for f_id in mesh.face_ids() {
         let verts: Vec<u32> = FaceHalfEdges::new(mesh, f_id)
             .filter_map(|he| mesh.get_halfedge(he))
@@ -58,9 +59,13 @@ pub fn mesh_to_vertex_index_buffers(mesh: &MeshStorage) -> (Vec<[f32; 3]>, Vec<u
             .filter_map(|v| v_index.get(&v).copied())
             .collect();
         if verts.len() != 3 {
+            skipped += 1;
             continue; // 跳过非三角面
         }
         indices.extend_from_slice(&verts);
+    }
+    if skipped > 0 {
+        eprintln!("[halfedge::mesh_to_vertex_index_buffers] 警告：跳过 {skipped} 个非三角面");
     }
 
     (vertices, indices)

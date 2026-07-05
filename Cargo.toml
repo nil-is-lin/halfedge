@@ -23,6 +23,7 @@ exclude = [
 slotmap = "1.0"
 sprs = "0.11"
 rayon = "1"
+robust = "1.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -41,4 +42,8 @@ harness = false
 
 [[bench]]
 name = "subdiv"
+harness = false
+
+[[bench]]
+name = "geometry_algs"
 harness = false

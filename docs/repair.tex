@@ -1,0 +1,399 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 网格修复与洞填充模块设计文档} \\ \large \texttt{src/repair.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{repair.rs} 提供网格修复操作：洞填充、面删除、孤立元素清理、
+非流形检测和一键修复 pipeline。适用于处理导入模型中的拓扑缺陷——
+缺失面、退化面、孤立顶点等。
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{3.8cm}l@{}}
+  \toprule
+  \textbf{函数} & \textbf{功能} & \textbf{返回值} \\
+  \midrule
+  \texttt{remove\_face} & 删除面，创建边界半边环 & \texttt{Result<(), TopErr>} \\
+  \texttt{fill\_hole} & 填充单个洞 & \texttt{Result<Vec<FaceId>, TopErr>} \\
+  \texttt{fill\_all\_holes} & 填充所有洞 & \texttt{Result<Vec<Vec<FaceId>>, TopErr>} \\
+  \texttt{remove\_isolated\_vertices} & 删除孤立顶点 & \texttt{usize} \\
+  \texttt{remove\_degenerate\_faces} & 删除退化面 & \texttt{usize} \\
+  \texttt{detect\_nonmanifold\_edges} & 检测非流形边 & \texttt{Vec<HalfEdgeId>} \\
+  \texttt{detect\_nonmanifold\_vertices} & 检测非流形顶点 & \texttt{Vec<VertexId>} \\
+  \texttt{repair\_mesh} & 一键修复 pipeline & \texttt{Result<RepairStats, TopErr>} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{核心算法}
+
+\subsection{remove\_face：删除面创建洞}
+
+删除面 $f$ 及其关联的面侧半边，为每条暴露的边创建边界半边，
+使洞边界形成完整的半边环供后续 \texttt{fill\_hole} 使用。
+
+\subsubsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.65cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：输入 \texttt{face}};
+  \node[dec, below=of s] (d0) {面半边为空？};
+  \node[proc, right=1.6cm of d0, fill=green!12] (early) {删除面，返回 \texttt{Ok(())}};
+  \node[proc, below=of d0, fill=blue!8] (p1) {1. 收集面半边数据（克隆）};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 清空各 twin 的 twin 指向（$\text{twin.twin} \gets \text{None}$）};
+  \node[proc, below=of p2, fill=blue!8] (p3) {3. 删除面和面侧半边};
+  \node[dec, below=of p3] (d1) {twin 是边界半边？};
+  \node[proc, right=1.6cm of d1, fill=red!12] (del) {删除该边界半边（边两侧均无面）};
+  \node[proc, below=of d1, fill=yellow!15] (p4) {4a. 创建新边界半边 $b$（$\text{vertex} = \text{dst}$）};
+  \node[proc, below=of p4, fill=yellow!15] (p5) {4b. 配对 $b \leftrightarrow \text{twin}$（$\text{next/prev}$ 保持 \texttt{None}）};
+  \node[proc, below=of p5, fill=blue!8] (p6) {5. 修复所有顶点入口};
+  \node[startend, below=of p6, fill=green!12] (e) {返回 \texttt{Ok(())}};
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -- node[above, font=\scriptsize] {是} (early);
+  \draw[op] (d0) -- node[right, font=\scriptsize] {否} (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是（相邻面已删）} (del);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (e);
+  \draw[op] (del) |- (p6);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsubsection{边界半边的方向与 next/prev}
+
+新边界半边 $b_i$ 与被删除的面半边 $h_i$ 同向：
+\[
+  b_i.\text{vertex} = h_i.\text{vertex} = \text{dst}_i
+\]
+边界半边\textbf{不设置} \texttt{next/prev}（保持 \texttt{None}），因为：
+\begin{itemize}
+  \item \texttt{BoundaryLoop} 通过顶点环遍历（\texttt{next\_boundary\_halfedge}），
+        不依赖边界半边的 \texttt{next/prev}；
+  \item 当相邻面被连续删除时，不维护 \texttt{next/prev} 可避免复杂的链表拼接。
+\end{itemize}
+
+\subsubsection{相邻面已删除的处理}
+
+当删除面 $f_2$ 的某条面半边的 twin 是边界半边 $b$（说明相邻面 $f_1$ 已被删除），
+直接删除 $b$ 而非创建新边界半边——此时该边两侧均无面，不存在「洞边界」。
+
+\subsection{fill\_hole：洞填充}
+
+填充由 \texttt{boundary\_he} 指定的单个洞，返回新创建的面 ID 列表。
+
+\subsubsection{核心设计：不提前删除边界半边}
+
+\texttt{fill\_hole} \textbf{不提前删除}边界半边，而是让
+\texttt{add\_triangle} 的 twin 配对逻辑自然找到并删除它们。
+原因：\texttt{add\_triangle} 的 twin 配对搜索条件为
+$E.\text{vertex}=\text{src} \wedge E.\text{twin}.\text{vertex}=\text{dst}
+\wedge E.\text{twin}.\text{face}=\text{None}$。
+若提前删除边界半边，相邻面半边的 \texttt{twin} 变为 \texttt{None}，
+配对失败。
+
+\subsubsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.65cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：输入 \texttt{boundary\_he}};
+  \node[dec, below=of s] (d0) {\texttt{boundary\_he.face} $=$ \texttt{None}？};
+  \node[proc, right=1.6cm of d0, fill=red!12] (err1) {返回 \texttt{Err(Inconsistent)}};
+  \node[proc, below=of d0, fill=blue!8] (p1) {1. \texttt{BoundaryLoop} 收集边界环半边};
+  \node[dec, below=of p1] (d1) {$n < 3$？};
+  \node[proc, right=1.6cm of d1, fill=red!12] (err2) {返回 \texttt{Err(Inconsistent)}};
+  \node[proc, below=of d1, fill=blue!8] (p2) {2. 提取顶点坐标};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {3. \texttt{ear\_clipping\_3d} 三角化};
+  \node[proc, below=of p3, fill=yellow!15] (p4) {4. 清除边界半边 next/prev $\gets$ \texttt{None}};
+  \node[proc, below=of p4, fill=blue!8] (p5) {5. 对每个三角形调用 \texttt{add\_triangle}};
+  \node[proc, below=of p5, fill=green!12] (p6) {6. 修复顶点入口};
+  \node[startend, below=of p6, fill=green!12] (e) {返回 \texttt{Ok(filled\_faces)}};
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -- node[above, font=\scriptsize] {否} (err1);
+  \draw[op] (d0) -- node[right, font=\scriptsize] {是} (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (err2);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsubsection{清除 next/prev 的必要性}
+
+步骤 4 将边界半边的 \texttt{next/prev} 设为 \texttt{None}。原因：
+当 \texttt{add\_triangle} 删除某个边界半边 $b_i$ 时，环中其他边界半边
+$b_{i-1}$、$b_{i+1}$ 的 \texttt{next/prev} 可能仍指向 $b_i$，
+造成悬空指针。清除后 \texttt{next = None}，\texttt{validate\_mesh}
+跳过该项检查，不报错。
+
+\subsubsection{twin 配对追踪（以三角形洞为例）}
+
+设洞边界有 3 条半边 $b_0(A \to B)$、$b_1(B \to C)$、$b_2(C \to A)$，
+其 twin 为面半边 $f_0$、$f_1$、$f_2$。
+\texttt{BoundaryLoop} 收集 tip 序列 $[B, C, A]$，
+\texttt{ear\_clipping\_3d} 返回 $[[0, 1, 2]]$，即调用
+$\texttt{add\_triangle}(B, C, A)$：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{新边} & \textbf{搜索条件} & \textbf{匹配} & \textbf{操作} \\
+  \midrule
+  $h_0\!: B \to C$ & $E.\text{vertex}=B$, $E.\text{twin}.\text{vertex}=C$ & $E = f_1$ & 删除 $b_1$，配对 $h_0 \leftrightarrow f_1$ \\
+  $h_1\!: C \to A$ & $E.\text{vertex}=C$, $E.\text{twin}.\text{vertex}=A$ & $E = f_2$ & 删除 $b_2$，配对 $h_1 \leftrightarrow f_2$ \\
+  $h_2\!: A \to B$ & $E.\text{vertex}=A$, $E.\text{twin}.\text{vertex}=B$ & $E = f_0$ & 删除 $b_0$，配对 $h_2 \leftrightarrow f_0$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+三条边界半边全部被消耗，洞完全填充。
+
+\subsubsection{多三角形洞的内边处理}
+
+对 $n > 3$ 的洞，\texttt{ear\_clipping\_3d} 产生多个三角形。
+首三角形的非边界边（内边）由 \texttt{add\_triangle} 创建临时边界半边，
+后续三角形的 \texttt{add\_triangle} 调用会找到该临时边界半边并配对，
+最终所有边界半边被消耗。
+
+\subsection{fill\_all\_holes}
+
+枚举所有边界环，逐个调用 \texttt{fill\_hole}：
+
+\begin{lstlisting}
+let loops = boundary_loops(mesh);
+for boundary in &loops {
+    fill_hole(mesh, boundary[0])?;
+}
+\end{lstlisting}
+
+\subsection{remove\_degenerate\_faces}
+
+用 Shewchuk 鲁棒谓词 \texttt{is\_triangle\_degenerate\_3d} 检测
+三顶点共线的退化面，调用 \texttt{remove\_face} 删除之。
+
+\subsubsection{数据丢弃警告}
+
+面删除失败时不再静默，会通过 \texttt{eprintln!} 输出警告：
+\begin{center}
+\texttt{[halfedge::remove\_degenerate\_faces] 警告：N 个退化面删除失败}
+\end{center}
+
+\subsection{非流形检测}
+
+\subsubsection{detect\_nonmanifold\_edges}
+
+统计每条无向边被几个面共享。流形网格中每条边至多 2 个面；
+若 $> 2$ 则为非流形边。
+
+\subsubsection{detect\_nonmanifold\_vertices}
+
+对每个顶点检测 outgoing 环是否闭合。内部顶点应闭合，
+边界顶点应为开链。若 CCW 和 CW 两个方向均不闭合且
+边界半边数 $> 2$，则为非流形顶点。
+
+\subsection{repair\_mesh：一键修复 pipeline}
+
+\begin{center}
+\resizebox{0.85\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.6cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=8cm, minimum height=0.65cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {输入：待修复网格};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. \texttt{fill\_all\_holes}：填充所有洞};
+  \node[proc, below=of p1, fill=yellow!15] (p2) {2. \texttt{remove\_degenerate\_faces}：删除退化面};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {3. \texttt{remove\_isolated\_vertices}：删除孤立顶点};
+  \node[proc, below=of p3, fill=green!12] (p4) {4. \texttt{fix\_orientations}：法线一致化};
+  \node[startend, below=of p4, fill=green!12] (e) {返回 \texttt{RepairStats}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\texttt{RepairStats} 记录各项操作的统计信息：
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{字段} & \textbf{含义} \\
+  \midrule
+  \texttt{holes\_filled} & 填充的洞数量 \\
+  \texttt{isolated\_vertices\_removed} & 删除的孤立顶点数 \\
+  \texttt{degenerate\_faces\_removed} & 删除的退化面数 \\
+  \texttt{faces\_flipped} & 法线一致化翻转的面数 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{操作} & \textbf{时间复杂度} & \textbf{备注} \\
+  \midrule
+  \texttt{remove\_face}              & $O(k + V)$   & $k$ = 面边数，$V$ = 顶点修复 \\
+  \texttt{fill\_hole}                & $O(n^2 \cdot H)$ & $n$ = 洞顶点数，$H$ = 半边总数（twin 搜索） \\
+  \texttt{fill\_all\_holes}          & $O(\sum n_i^2 \cdot H)$ & 各洞独立处理 \\
+  \texttt{remove\_isolated\_vertices}& $O(V)$       & 线性扫描 \\
+  \texttt{remove\_degenerate\_faces} & $O(F \cdot H)$ & $F$ = 面数，$H$ = 半边搜索 \\
+  \texttt{detect\_nonmanifold\_edges}& $O(H)$       & 单遍扫描 \\
+  \texttt{detect\_nonmanifold\_vertices} & $O(V \cdot \bar{d})$ & $\bar{d}$ = 平均度数 \\
+  \texttt{repair\_mesh}              & 上述之和       & pipeline 顺序执行 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item \texttt{fill\_hole}：校验 \texttt{boundary\_he.face = None}，
+        否则返回 \texttt{Inconsistent}；
+  \item \texttt{fill\_hole}：边界环顶点数 $< 3$ 时返回 \texttt{Inconsistent}；
+  \item \texttt{remove\_face}：面半边为空时直接删除面并返回；
+  \item \texttt{remove\_face}：相邻面已删除时（twin 是边界半边），直接删除
+        该边界半边而非创建新边界；
+  \item \texttt{remove\_degenerate\_faces}：使用 Shewchuk 鲁棒谓词，
+        避免浮点阈值误判；
+  \item \texttt{detect\_nonmanifold\_vertices}：使用 \texttt{halfedge\_count + 1}
+        作为最大迭代次数，防止死循环；
+  \item 所有顶点入口修复使用 \texttt{find\_outgoing\_halfedge} 确保引用有效。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{fill\_hole\_basic} & 单面洞填充后无残留边界 \\
+  \texttt{fill\_all\_holes\_icosphere} & icosphere 单面洞一键填充 \\
+  \texttt{fill\_hole\_on\_closed\_mesh\_returns\_empty} & 闭合网格无洞 \\
+  \texttt{fill\_hole\_non\_boundary\_is\_error} & 非边界半边报错 \\
+  \texttt{remove\_isolated\_vertices\_basic} & 删除无关联顶点 \\
+  \texttt{remove\_face\_creates\_boundary} & 删除面后产生 3 条边界半边 \\
+  \texttt{remove\_face\_and\_fill\_restores} & 删除+填充恢复面数 \\
+  \texttt{detect\_nonmanifold\_edges\_closed\_mesh} & 闭合无非流形边 \\
+  \texttt{repair\_mesh\_basic} & 一键修复统计正确 \\
+  \texttt{fill\_hole\_quad\_hole} & grid 边界洞填充 \\
+  \texttt{remove\_and\_fill\_multiple\_faces} & 删除 2 面+填充 \\
+  \texttt{remove\_degenerate\_faces\_on\_good\_mesh} & 好网格无退化面 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 12 个单元测试；项目整体 \texttt{cargo test} 共 450 个用例。
+
+\section{设计权衡}
+
+\begin{itemize}
+  \item \textbf{不删除边界半边 vs 提前删除}：
+        \texttt{fill\_hole} 保留边界半边让 \texttt{add\_triangle}
+        自然配对，而非提前删除后手动重建 twin。后者需
+        手动建立 twin 关系，逻辑更复杂且易遗漏。
+
+  \item \textbf{边界半边 next/prev = None}：
+        \texttt{BoundaryLoop} 用顶点环遍历，
+        不依赖边界半边的 \texttt{next/prev}。设为
+        \texttt{None} 避免连续删除相邻面时的链表拼接问题，
+        \texttt{validate\_mesh} 对 \texttt{next = None} 跳过检查。
+
+  \item \texttt{ear\_clipping\_3d} \textbf{而非扇形三角化}：
+        对凹多边形洞，扇形三角化可能产生翻转面；
+        \texttt{ear\_clipping\_3d} 投影到主平面后使用耳切法，
+        能正确处理凹洞。
+
+  \item \textbf{非流形检测 vs 修复}：
+        当前仅提供检测，不自动修复非流形拓扑。
+        修复策略取决于应用场景，过早修复可能破坏用户意图。
+\end{itemize}
+
+\end{document}

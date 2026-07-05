@@ -73,9 +73,11 @@
     & \texttt{Bvh::new()}                  & 创建空 BVH \\
     & \texttt{Bvh::build(\&mesh)}          & 从网格构建（仅三角面），返回 \texttt{Bvh} \\
   \midrule
-  \multirow{2}{*}{查询}
+  \multirow{4}{*}{查询}
     & \texttt{bvh.ray\_intersection(o, d, \&mesh)} & 射线求最近交点，返回 \texttt{Option<RayHit>} \\
     & \texttt{bvh.nearest\_point(p, \&mesh)}      & 网格表面最近点，返回 \texttt{(FaceId, [f64;3], f64)} \\
+    & \texttt{bvh.faces\_in\_aabb(\&AABB, \&mesh)} & 返回 AABB 重叠的候选面（布尔运算用） \\
+    & \texttt{bvh.ray\_count\_hits(o, d, \&mesh)}  & 射线命中三角面总数（射线奇偶法用） \\
   \midrule
   \multirow{3}{*}{统计}
     & \texttt{bvh.node\_count() / leaf\_count() / depth()} & 节点数 / 叶子数 / 树深 \\
@@ -84,6 +86,19 @@
   \bottomrule
 \end{tabular}
 \end{center}
+
+\paragraph{为布尔运算新增的查询}
+\texttt{faces\_in\_aabb} 与 \texttt{ray\_count\_hits} 专为
+\texttt{boolean.rs} 的 corefinement 加速而新增：
+\begin{itemize}
+  \item \texttt{faces\_in\_aabb}：递归遍历 BVH，节点 AABB 与查询 AABB
+        不重叠则剪枝；叶子节点内逐面计算 AABB 精筛。返回的只是
+        \emph{候选集}，调用方仍需 \texttt{segment\_triangle\_intersection}
+        做精确判定。复杂度 $O(\log F + k)$，$k$ 为候选面数。
+  \item \texttt{ray\_count\_hits}：与 \texttt{ray\_intersection} 不同的
+        是\textbf{统计所有命中}而非返回最近交点，因为射线奇偶法需要
+        交点总数的奇偶性。复杂度 $O(\log F + k)$。
+\end{itemize}
 
 \section{数据结构}
 

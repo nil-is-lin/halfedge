@@ -49,7 +49,7 @@
 
 \title{\textbf{halfedge\,: 邻域遍历迭代器模块设计文档} \\ \large \texttt{src/traversal.rs}}
 \author{halfedge 库}
-\date{2026-07-04}
+\date{2026-07-06}
 
 \begin{document}
 \maketitle
@@ -93,9 +93,11 @@
     & \texttt{is\_closed(mesh)}         & 是否为闭合网格（无边界边） \\
     & \texttt{boundary\_loops(mesh)}    & 枚举所有边界环，返回 \texttt{Vec<Vec<HalfEdgeId>>} \\
   \midrule
-  \multirow{2}{*}{通用遍历原语}
+  \multirow{4}{*}{通用遍历原语}
     & \texttt{collect\_outgoing\_halfedges(v)} & 收集 $v$ 的 outgoing 半边（CCW，\texttt{Vec}） \\
     & \texttt{collect\_face\_halfedges(f)}     & 收集面 $f$ 边界环半边（\texttt{next} 顺序，\texttt{Vec}） \\
+    & \texttt{collect\_outgoing\_halfedges\_into(v, buf)} & 同上，填充调用方 \texttt{buf}（\textbf{内存复用}） \\
+    & \texttt{collect\_face\_halfedges\_into(f, buf)}     & 同上，填充调用方 \texttt{buf}（\textbf{内存复用}） \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -116,7 +118,7 @@
 \end{tabular}
 \end{center}
 
-\textbf{通用遍历原语}（\texttt{pub fn}）：模块还导出两个底层收集函数，
+\textbf{通用遍历原语}（\texttt{pub fn}）：模块还导出两对底层收集函数，
 作为下游构建自定义迭代器或分析工具的基础原语：
 \begin{itemize}
   \item \texttt{collect\_outgoing\_halfedges(\&mesh, v)}：返回 $v$ 的所有 outgoing
@@ -127,6 +129,46 @@
 二者内部实现均使用 \texttt{mesh.halfedge\_count()} 作为循环上界兜底，
 保证在拓扑不一致时也能终止。下游可直接复用这些经过充分测试的收集逻辑，
 而不必自己实现 CW+CCW 双向探测。
+
+\subsection{内存复用变体：\texttt{*\_into} 函数}
+\label{sec:into-variants}
+
+两个原语各有\textbf{内存复用}变体（后缀 \texttt{\_into}），签名如下：
+\begin{itemize}
+  \item \texttt{collect\_outgoing\_halfedges\_into(\&mesh, v, buf: \&mut Vec<HalfEdgeId>)}
+  \item \texttt{collect\_face\_halfedges\_into(\&mesh, f, buf: \&mut Vec<HalfEdgeId>)}
+\end{itemize}
+
+\textbf{语义}：\texttt{buf.clear()} 后填充，\textbf{不释放已分配容量}。
+返回 \texttt{Vec} 的版本内部即声明空 \texttt{buf}、调用 \texttt{\_into} 变体填充、
+最后返回 \texttt{buf}，二者产出完全一致。
+
+\textbf{适用场景}：热循环中反复遍历不同顶点 / 面的邻域，例如：
+\begin{lstlisting}
+let mut buf = Vec::new();
+for v in mesh.vertex_ids() {
+    collect_outgoing_halfedges_into(mesh, v, &mut buf);
+    // 使用 buf（容量复用，零额外分配）
+}
+\end{lstlisting}
+
+\textbf{与 lazy 的对比}：两者都降低分配开销，但侧重点不同——
+\texttt{*\_into} 适合需要随机访问或迭代期 \texttt{\&mut mesh} 的场景（保留 eager 的解耦特性），
+lazy 适合纯只读遍历（零堆分配，但持有借用）。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{维度} & \texttt{*\_into}（内存复用） & \texttt{Lazy}（延迟） \\
+  \midrule
+  堆分配        & 首次分配，后续复用容量     & 零堆分配 \\
+  迭代期借用    & 无（已释放）               & 持有 \texttt{\&MeshStorage} \\
+  迭代期 \texttt{\&mut mesh} & \checkmark & $\times$ \\
+  随机访问      & \checkmark（\texttt{buf[i]}） & $\times$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
 
 \section{核心设计：构造期收集，迭代期不持有借用}
 
@@ -288,7 +330,9 @@ lazy 版本不能用 \texttt{Vec} 存储，因此采用\textbf{两遍策略}：
         面边界遍历优势最大（$0.19$--$0.25\times$），因为每面仅 3 条半边，
         eager 的 \texttt{Vec} 分配开销远超迭代本身。
   \item \textbf{内存}：lazy 零堆分配；eager 在 1M 级别分配 $\sim$105 MB
-        （顶点环 45 MB + 面边界 60 MB）。
+        （顶点环 45 MB + 面边界 60 MB）。若需保留 eager 的「迭代期可 \texttt{\&mut mesh}」
+        特性又想避免重复分配，可使用 \texttt{*\_into} 内存复用变体（见 \S\ref{sec:into-variants}）：
+        在热循环外声明一次 \texttt{buf}，循环内 \texttt{buf.clear()} 后填充，容量自动复用。
   \item \textbf{一致性}：所有规模的 lazy 与 eager 产出数量完全一致
         （断言 $\sum d_v = |HE|$，$\sum d_f = 3|F|$）。
 \end{itemize}
@@ -735,11 +779,18 @@ if !mesh.contains_halfedge(he) {
   \multicolumn{2}{l}{\textit{场景七：顶点邻接无向边（VertexAdjacentEdges）}} \\
   \texttt{vertex\_adjacent\_edges\_triangle}                   & 单三角形 $v_0$ 关联 2 条无向边 \\
   \texttt{vertex\_adjacent\_edges\_icosphere}                  & icosphere(1) 关联边数 $=$ 度数 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景八：内存复用变体（*\_into）}} \\
+  \texttt{collect\_outgoing\_halfedges\_into\_matches\_original} & \texttt{\_into} 产出与原函数一致（icosphere 全顶点） \\
+  \texttt{collect\_face\_halfedges\_into\_matches\_original}     & \texttt{\_into} 产出与原函数一致（icosphere 全面） \\
+  \texttt{collect\_outgoing\_halfedges\_into\_reuses\_capacity}  & \texttt{buf} 容量跨调用不收缩 \\
+  \texttt{collect\_face\_halfedges\_into\_clears\_buffer}        & 预填垃圾数据后被 \texttt{clear}，长度 $=3$ \\
+  \texttt{collect\_outgoing\_halfedges\_into\_isolated\_vertex}  & 孤立顶点 \texttt{buf} 保持空 \\
   \bottomrule
 \end{longtable}
 }
 
-\texttt{cargo test} 全库共 \textbf{371 个}用例，全部通过（0 失败 / 0 警告）。
+\texttt{cargo test} 全库共 \textbf{503 个}用例，全部通过（0 失败 / 0 警告）。
 
 \section{设计取舍}
 
@@ -756,6 +807,11 @@ if !mesh.contains_halfedge(he) {
   \item \textbf{为何 lazy 与 eager 并存？} 两者面向不同场景：eager 适合迭代期需 \texttt{\&mut mesh}
         或随机访问；lazy 适合大规模只读遍历（零堆分配，基准测试快 $0.19$--$0.71\times$）。
         \texttt{::lazy} 构造函数返回独立的 \texttt{Lazy} 类型，调用方按需选择，无隐式开销。
+  \item \textbf{何时使用 \texttt{*\_into} 内存复用变体？} 当满足\textbf{全部}以下条件时优选：
+        (1) 热循环中反复遍历不同顶点 / 面；(2) 需要随机访问或迭代期 \texttt{\&mut mesh}
+        （故不能用 lazy）；(3) 单次遍历结果用完即弃。此时在循环外声明一次 \texttt{buf}，
+        循环内调用 \texttt{collect\_...\_into(\&mesh, id, \&mut buf)}，\texttt{buf} 容量自动复用，
+        避免每轮重新分配。若仅需纯只读遍历，\texttt{lazy} 仍是更优选择（零堆分配）。
   \item \textbf{为何 lazy 顶点环需要 CW 探测？} 开链顶点的 outgoing 环不是闭合的，
         不能像面边界那样「回到起点即终止」。CW 探测找到开链尽头后，从尽头沿 CCW 迭代
         即可覆盖整条链，且产出顺序与预收集版本完全一致。

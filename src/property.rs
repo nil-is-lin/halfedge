@@ -20,9 +20,10 @@
 //!
 //! - 每个类型 `T` 在每类（vertex/halfedge/face）中只能注册一个属性。
 //!   如需多个同类型属性，可用 newtype 包装：`struct Weight(f64); struct Temp(f64);`
-//! - 属性键为 slotmap key 的 idx 部分（通过 `Key::data().as_ffi()` 低 32 位提取），
-//!   删除元素后需调用 [`remove_vertex_all_props`](MeshProperties::remove_vertex_all_props)
-//!   等方法清理，否则槽位被复用时属性会错误地关联到新元素。
+//! - 属性键为 slotmap key 的**完整 64 位 ffi 值**（idx + version，参见 `idx_of`）。
+//!   slot 被复用时 version 递增，旧属性*不会*被新元素继承（成为孤儿条目）。
+//!   仍建议删除元素时调用 [`remove_vertex_all_props`](MeshProperties::remove_vertex_all_props)
+//!   等方法清理，以释放孤儿条目占用的内存。
 //!
 //! ## 使用示例
 //!
@@ -51,20 +52,26 @@ use crate::ids::{FaceId, HalfEdgeId, VertexId};
 use crate::storage::{Face, HalfEdge, MeshStorage, Vertex};
 
 // ============================================================
-// 内部辅助：从 slotmap key 提取 idx 部分
+// 内部辅助：从 slotmap key 提取唯一键
 // ============================================================
 
-/// 从 slotmap key 提取 idx（槽位索引）部分作为 `usize`。
+/// 从 slotmap key 提取**含 version 的完整键**作为 `usize`。
 ///
 /// slotmap 1.1.1 的 `KeyData` 字段为私有，公开 API 仅 `as_ffi() -> u64`。
-/// `as_ffi()` 编码为 `((version) << 32) | idx`，故低 32 位即 idx。
+/// `as_ffi()` 编码为 `((version) << 32) | idx`。
 ///
-/// 注意：idx 在 slot 复用时会被回收，因此 idx **不**唯一标识一个元素，
-/// 删除元素后必须同步清理对应属性，否则属性会错误关联到新元素。
+/// **关键设计**：使用完整 64 位键（idx + version）而非仅低 32 位 idx，
+/// 保证 slot 被复用时（version 递增）旧属性*不会*被新元素继承。
+/// 旧属性条目成为孤儿（永远不会被匹配），但不会造成正确性问题，
+/// 仅占用少量内存。如需清理孤儿，可调用 `PropertyStore::clear()`。
+///
+/// **平台假设**：依赖 `usize` 为 64 位（64-bit 平台）。32-bit 平台上
+/// version 会被截断，回退到旧行为（需手动清理）。
 #[inline]
 fn idx_of<K: Key>(id: K) -> usize {
-    let ffi = id.data().as_ffi();
-    (ffi & 0xFFFF_FFFF) as usize
+    // 完整 64 位 ffi 值（idx + version）作为键
+    // 在 64-bit 平台上 usize = u64，无损转换
+    id.data().as_ffi() as usize
 }
 
 // ============================================================
