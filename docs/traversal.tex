@@ -1,0 +1,774 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 邻域遍历迭代器模块设计文档} \\ \large \texttt{src/traversal.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{traversal.rs} 在 \texttt{storage.rs} 之上叠加\textbf{只读}拓扑遍历能力，
+提供 5 个预收集迭代器 + 6 个 lazy 迭代器 + 无向边/边界环迭代器 + k-ring 邻域 + 边界判定函数，
+覆盖半边网格最常见的邻域查询场景：
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{3}{*}{顶点迭代器}
+    & \texttt{VertexRing}          & $v$ 的所有 outgoing 半边（CCW） \\
+    & \texttt{VertexAdjacentVerts} & $v$ 的所有邻居顶点（CCW） \\
+    & \texttt{VertexAdjacentFaces} & $v$ 周围的所有面（CCW，跳过 \texttt{None}） \\
+  \midrule
+  \multirow{2}{*}{面迭代器}
+    & \texttt{FaceHalfEdges} & 面边界环上的所有半边（\texttt{next} 顺序） \\
+    & \texttt{FaceVertices}  & 面的所有顶点（每条半边的 tip） \\
+  \midrule
+  \multirow{3}{*}{无向边 / 边界环}
+    & \texttt{EdgeIter} / \texttt{MeshStorage::edge\_ids} & 遍历所有唯一无向边 \\
+    & \texttt{VertexAdjacentEdges}                        & 与顶点 $v$ 关联的所有唯一无向边 \\
+    & \texttt{BoundaryLoop} / \texttt{BoundaryLoopLazy}   & 遍历一个边界环（eager + lazy） \\
+  \midrule
+  \multirow{3}{*}{k-ring 邻域}
+    & \texttt{vertex\_two\_ring(v)} & 距离正好为 2 的顶点 \\
+    & \texttt{vertex\_k\_ring(v, k)} & 距离正好为 k 的顶点（BFS） \\
+    & \texttt{vertex\_k\_disk(v, k)} & 距离 $\le k$ 的所有顶点 \\
+  \midrule
+  \multirow{4}{*}{工具函数}
+    & \texttt{is\_boundary\_edge(he)}   & 半边所在边是否为边界边 \\
+    & \texttt{is\_boundary\_vertex(v)}  & 顶点是否位于网格边界 \\
+    & \texttt{is\_closed(mesh)}         & 是否为闭合网格（无边界边） \\
+    & \texttt{boundary\_loops(mesh)}    & 枚举所有边界环，返回 \texttt{Vec<Vec<HalfEdgeId>>} \\
+  \midrule
+  \multirow{2}{*}{通用遍历原语}
+    & \texttt{collect\_outgoing\_halfedges(v)} & 收集 $v$ 的 outgoing 半边（CCW，\texttt{Vec}） \\
+    & \texttt{collect\_face\_halfedges(f)}     & 收集面 $f$ 边界环半边（\texttt{next} 顺序，\texttt{Vec}） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+以上 5 个迭代器均有\textbf{延迟版本}（后缀 \texttt{Lazy}），通过 \texttt{::lazy()} 构造函数获取：
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{预收集版本} & \textbf{延迟版本} \\
+  \midrule
+  \texttt{VertexRing::new(\&mesh, v)}          & \texttt{VertexRing::lazy(\&mesh, v)} \\
+  \texttt{VertexAdjacentVerts::new(\&mesh, v)} & \texttt{VertexAdjacentVerts::lazy(\&mesh, v)} \\
+  \texttt{VertexAdjacentFaces::new(\&mesh, v)} & \texttt{VertexAdjacentFaces::lazy(\&mesh, v)} \\
+  \texttt{FaceHalfEdges::new(\&mesh, f)}       & \texttt{FaceHalfEdges::lazy(\&mesh, f)} \\
+  \texttt{FaceVertices::new(\&mesh, f)}        & \texttt{FaceVertices::lazy(\&mesh, f)} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{通用遍历原语}（\texttt{pub fn}）：模块还导出两个底层收集函数，
+作为下游构建自定义迭代器或分析工具的基础原语：
+\begin{itemize}
+  \item \texttt{collect\_outgoing\_halfedges(\&mesh, v)}：返回 $v$ 的所有 outgoing
+        半边（CCW 顺序），已处理开链 / 闭合环 / 孤立顶点等所有边界情况；
+  \item \texttt{collect\_face\_halfedges(\&mesh, f)}：返回面 $f$ 边界环上的所有
+        半边（\texttt{next} 顺序），已处理拓扑断开等异常情况。
+\end{itemize}
+二者内部实现均使用 \texttt{mesh.halfedge\_count()} 作为循环上界兜底，
+保证在拓扑不一致时也能终止。下游可直接复用这些经过充分测试的收集逻辑，
+而不必自己实现 CW+CCW 双向探测。
+
+\section{核心设计：构造期收集，迭代期不持有借用}
+
+Rust 的借用检查要求「同一时间要么有多个不可变借用，要么仅一个可变借用」。
+若迭代器在生命周期内持有 \texttt{\&mesh}，那么形如
+\begin{quote}
+\texttt{for he in VertexRing::new(\&mesh, v) \{ ... \}}
+\end{quote}
+的循环体内就无法再写 \texttt{mesh.get\_halfedge\_mut(...)}
+——这会显著限制上层使用场景（边遍历边修改拓扑）。
+
+\textbf{解法：}所有迭代器的构造函数签名都是
+\texttt{fn new(\&MeshStorage, Id) -> Self}，
+内部一次性把要遍历的 ID 收集进 \texttt{Vec<Id>}；构造函数返回后，对 \texttt{mesh}
+的不可变借用立即释放。迭代器结构体只保存 \texttt{(Vec<Id>, usize)}，与 \texttt{mesh}
+完全解耦。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.2cm,
+  box/.style={draw, rounded corners=2pt, minimum width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+  arrow/.style={-Stealth, thick}
+]
+  \node[box, fill=blue!10] (a) {调用 \texttt{VertexRing::new(\&mesh, v)}};
+  \node[box, fill=yellow!20, right=of a] (b) {借 \texttt{\&mesh}\\走旋转规则\\收集 \texttt{Vec<HalfEdgeId>}};
+  \node[box, fill=green!15, right=of b] (c) {返回 \texttt{VertexRing\{vec, 0\}}\\借用释放};
+  \node[box, fill=red!10, below=of c] (d) {迭代期间\\可自由 \texttt{\&mut mesh}};
+
+  \draw[arrow] (a) -- (b);
+  \draw[arrow] (b) -- (c);
+  \draw[arrow] (c) -- (d);
+\end{tikzpicture}
+\end{center}
+
+\section{延迟迭代器（lazy）：零堆分配替代方案}
+
+\subsection{设计动机与权衡}
+
+预收集版本（\texttt{::new}）在构造期分配 \texttt{Vec<Id>}，迭代期不持有借用——
+适合需要随机访问或迭代期修改网格的场景。但在\textbf{大规模只读遍历}中，
+每个迭代器的 \texttt{Vec} 分配成为不必要的开销。
+
+延迟版本（\texttt{::lazy}）在迭代期持有 \texttt{\&MeshStorage} 借用，逐跳查询 \texttt{next}/\texttt{prev}/\texttt{twin}，
+\textbf{零堆分配}。两种版本的权衡对比：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{维度} & \textbf{预收集 \texttt{::new}} & \textbf{延迟 \texttt{::lazy}} \\
+  \midrule
+  构造期时间   & $O(d)$（走 CW+CCW 收集）   & $O(d)$（仅 CW 探测尽头） \\
+  构造期空间   & $O(d)$（\texttt{Vec<Id>}） & $O(1)$（仅记录起点/终点） \\
+  迭代期时间   & $O(1)$ / \texttt{next}（数组下标） & $O(1)$ / \texttt{next}（指针追逐） \\
+  迭代期借用   & 无（已释放）               & 持有 \texttt{\&MeshStorage} \\
+  迭代期可 \texttt{\&mut mesh} & \checkmark & $\times$ \\
+  \texttt{FusedIterator}      & \checkmark & \checkmark \\
+  产出顺序一致性 & --- & 与预收集版本完全一致 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{lazy 顶点环算法：CW 探测 + CCW 迭代}
+
+预收集版本从 \texttt{start} 出发，先走 CCW 收集、再走 CW 补全、最后拼接。
+lazy 版本不能用 \texttt{Vec} 存储，因此采用\textbf{两遍策略}：
+
+\textbf{第 1 遍（构造期）——沿 CW 方向探测开链尽头：}
+\[
+\mathrm{cw\_next}(h) = h.\mathrm{twin}.\mathrm{next}
+\]
+从 \texttt{start} 出发，反复应用 $\mathrm{cw\_next}$，直到：
+\begin{itemize}
+  \item 回到 \texttt{start} $\Rightarrow$ \textbf{闭合环}，记录 \texttt{closed = true}；
+  \item 撞到 \texttt{None} $\Rightarrow$ \textbf{开链}，记录尽头 \texttt{cw\_end}。
+\end{itemize}
+
+\textbf{第 2 遍（迭代期）——沿 CCW 方向逐个产出：}
+\[
+\mathrm{ccw\_next}(h) = h.\mathrm{prev}.\mathrm{twin}
+\]
+\begin{itemize}
+  \item 闭合环：从原始 \texttt{start} 开始迭代，回到 \texttt{start} 时终止；
+  \item 开链：从 \texttt{cw\_end} 开始迭代，撞到 \texttt{None} 时终止。
+\end{itemize}
+
+\textbf{起点一致性证明}：预收集版本的产出顺序为 $[\text{CW 逆序},\ \text{start},\ \text{CCW}]$。
+对开链，CW 逆序的最后一个元素正是 CW 方向的尽头 \texttt{cw\_end}，因此 lazy 从 \texttt{cw\_end}
+开始沿 CCW 产出，顺序与预收集完全一致。对闭合环，两者都从 \texttt{start} 开始。
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=9cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {构造 \texttt{VertexRingLazy}};
+  \node[proc, below=of s, fill=blue!8] (p1) {$start \gets v.\mathrm{halfedge}$；若 \texttt{None} 返回空迭代器};
+  \node[proc, below=of p1, fill=blue!8] (p2) {$cw \gets start$；\quad \textbf{循环}：$n \gets cw.\mathrm{twin}.\mathrm{next}$};
+  \node[dec, below=of p2] (d1) {$n$ 的状态？};
+  \node[proc, below left=1.2cm of d1, xshift=-1.5cm, fill=green!12] (p3) {$n = start$\\$\Rightarrow$ 闭合环：$begin \gets start$\\$closed \gets \mathrm{true}$};
+  \node[proc, below right=1.2cm of d1, xshift=1.5cm, fill=yellow!15] (p4) {$n = \texttt{None}$\\$\Rightarrow$ 开链：$begin \gets cw$\\$closed \gets \mathrm{false}$};
+  \node[proc, below=2.0cm of d1, fill=blue!8] (p5) {$cw \gets n$；回到 $d1$};
+  \node[proc, below=of p3, xshift=1.5cm, fill=gray!8] (p6) {返回 \texttt{VertexRingLazy\{mesh, start=begin, current=Some(begin), closed\}}};
+  \node[startend, below=of p6, fill=green!12] (iter) {迭代期：$cur.\mathrm{prev}.\mathrm{twin}$ 前进};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {$=start$} (p3);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {=\texttt{None}} (p4);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {其他} (p5);
+  \draw[op, dashed] (p5.west) -- ++(-2.0,0) |- (d1.west);
+  \draw[op] (p3) |- (p6);
+  \draw[op] (p4) |- (p6);
+  \draw[op] (p6) -- (iter);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{lazy 面边界算法}
+
+面边界环始终是闭合的（长度 = 面边数），因此 lazy 版本更简单：
+从 \texttt{f.halfedge} 出发，沿 \texttt{next} 逐跳前进，回到起点时终止。
+
+\subsection{FusedIterator 语义}
+
+所有 lazy 迭代器实现 \texttt{std::iter::FusedIterator}，保证：
+\texttt{next()} 返回 \texttt{None} 后，继续调用永远返回 \texttt{None}。
+实现方式：\texttt{current} 字段为 \texttt{Option<HalfEdgeId>}，一旦置 \texttt{None}，
+\texttt{let cur = self.current?;} 立即返回 \texttt{None}。
+
+\subsection{基准测试结果}
+
+在 icosphere（单位球面细分网格）上对比 lazy 与 eager 的「构造 + 完整消费」总耗时
+与内存占用。测试环境：\texttt{cargo bench --release}，\texttt{std::time::Instant} 计时。
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}r|rrr|rrr|rr@{}}
+  \toprule
+   & \multicolumn{3}{c|}{\textbf{顶点环 VertexRing}} & \multicolumn{3}{c|}{\textbf{面边界 FaceHalfEdges}} & \multicolumn{2}{c}{\textbf{内存 (MB)}} \\
+  \textbf{规模} & eager (s) & lazy (s) & 比值 & eager (s) & lazy (s) & 比值 & eager & lazy \\
+  \midrule
+  $\sim$10K\;(n=5)  & 0.002 & 0.001 & 0.53$\times$ & 0.001 & 0.000 & 0.20$\times$ & 0.7 / 0.9 & 0 \\
+  $\sim$100K (n=7)  & 0.016 & 0.008 & 0.53$\times$ & 0.008 & 0.001 & 0.19$\times$ & 11.3 / 15.0 & 0 \\
+  $\sim$1M\;(n=8)   & 0.062 & 0.044 & 0.71$\times$ & 0.026 & 0.007 & 0.25$\times$ & 45.0 / 60.0 & 0 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{结论：}
+\begin{itemize}
+  \item \textbf{耗时}：lazy 在所有规模上均快于 eager（比值 $< 1$）。
+        面边界遍历优势最大（$0.19$--$0.25\times$），因为每面仅 3 条半边，
+        eager 的 \texttt{Vec} 分配开销远超迭代本身。
+  \item \textbf{内存}：lazy 零堆分配；eager 在 1M 级别分配 $\sim$105 MB
+        （顶点环 45 MB + 面边界 60 MB）。
+  \item \textbf{一致性}：所有规模的 lazy 与 eager 产出数量完全一致
+        （断言 $\sum d_v = |HE|$，$\sum d_f = 3|F|$）。
+\end{itemize}
+
+\section{顶点环绕：CCW 旋转规则}
+
+设 $h$ 是顶点 $v$ 的某条 outgoing 半边（即 $h.\mathrm{twin}.\mathrm{vertex} = v$），
+则绕 $v$ 旋转到下一条 outgoing 半边的两条等价操作：
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=6mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=red!70!black},
+  hecw/.style={-Stealth, thick, draw=green!50!black},
+  lab/.style={font=\footnotesize, sloped, above}
+]
+  % 中心顶点 v
+  \node[vert] (v) at (0,0) {$v$};
+  % 周围三个邻居
+  \node[vert] (w1) at (90:2)   {$w_1$};
+  \node[vert] (w2) at (210:2)  {$w_2$};
+  \node[vert] (w3) at (330:2)  {$w_3$};
+
+  % 三条 outgoing 半边
+  \draw[he] (v) -- node[lab] {$h$} (w1);
+  \draw[he] (v) -- node[lab] {$h'$} (w2);
+  \draw[he] (v) -- node[lab] {$h''$} (w3);
+
+  % CCW 旋转箭头
+  \draw[->, thick, dashed, draw=orange!80!black]
+    ($(w1)+(0.4,0.0)$) arc[start angle=0, end angle=-260, radius=0.4];
+
+  \node[below=2.4cm of v, font=\small, align=center] (legend)
+    {CCW 顺序：$h \to h' \to h'' \to h$（闭合）};
+\end{tikzpicture}
+\end{center}
+
+\subsection{两条旋转规则的推导}
+
+\textbf{CCW next:} $h \mapsto h.\mathrm{prev}.\mathrm{twin}$
+
+\begin{itemize}
+  \item $h.\mathrm{prev}$ 与 $h$ 同面，按 CCW 方向排在 $h$ 之前，结尾落在 $v$（因为 $h$ 起始于 $v$）；
+  \item $h.\mathrm{prev}.\mathrm{twin}$ 起始于 $v$，且属于「$h.\mathrm{prev}$ 这条边的另一侧邻接面」；
+  \item 因此跨过 $h.\mathrm{prev}$ 这条边相当于绕 $v$ 旋转到\textbf{逆时针方向上的相邻面}，得到下一条 outgoing 半边。
+\end{itemize}
+
+\textbf{CW next:} $h \mapsto h.\mathrm{twin}.\mathrm{next}$
+
+\begin{itemize}
+  \item $h.\mathrm{twin}$ 是反向半边，结尾落在 $v$；
+  \item $h.\mathrm{twin}.\mathrm{next}$ 起始于 $v$，与 $h$ 处于同一条边界的另一侧；
+  \item 跨过 $h$ 这条边相当于绕 $v$ 旋转到\textbf{顺时针方向上的相邻面}。
+\end{itemize}
+
+\subsection{算法：单三角面片实例}
+
+设单个三角面片 $F=(h_0, h_1, h_2)$，其中 $h_0:v_0\to v_1$，$h_1:v_1\to v_2$，$h_2:v_2\to v_0$，
+每条 $h_i$ 的 twin $t_i$ 是边界半边（$\mathrm{face}=\texttt{None}$，无 \texttt{next}/\texttt{prev}）。
+
+对 $v_0$，$v_0.\mathrm{halfedge}=h_0$：
+
+\begin{enumerate}
+  \item \textbf{CCW 方向}：$h_0 \to h_0.\mathrm{prev}.\mathrm{twin} = h_2.\mathrm{twin} = t_2$；
+        再走 $t_2.\mathrm{prev}.\mathrm{twin}$，但 $t_2.\mathrm{prev}=\texttt{None}$，停止。
+  \item 未闭合 $\Rightarrow$ 是边界顶点，向 CW 方向补全：
+        $h_0 \to h_0.\mathrm{twin}.\mathrm{next} = t_0.\mathrm{next}=\texttt{None}$，立即停止。
+  \item 拼接：$[\,]\,.\mathrm{reverse}() + [h_0, t_2] = [h_0, t_2]$。
+\end{enumerate}
+
+最终输出 $[h_0, t_2]$，CCW 角度顺序：$h_0$（$0^\circ$） $\to t_2$（$90^\circ$）。
+
+\section{算法流程图}
+
+\subsection{顶点 outgoing 半边收集}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=8.5cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$v$};
+  \node[proc, below=of s, fill=blue!8] (p1) {取 $start \gets v.\mathrm{halfedge}$；若 \texttt{None} 返回空};
+  \node[proc, below=of p1, fill=blue!8] (p2) {$result \gets [start]$；\quad $he \gets start$};
+  \node[dec, below=of p2] (d1) {CCW: $n \gets he.\mathrm{prev}.\mathrm{twin}$};
+  \node[dec, below=of d1] (d2) {$n$ 是否等于 \texttt{start}？};
+  \node[proc, below left=of d2, xshift=-1.4cm, fill=green!12] (p3) {$n=\texttt{start}$\\$\Rightarrow$ 闭合，返回 $result$};
+  \node[proc, below right=of d2, xshift=1.4cm, fill=red!10] (p4) {$n\ne\texttt{start}$\\$\Rightarrow$ $result.\mathrm{push}(n)$;\quad $he \gets n$;\quad 回到 $d1$};
+  \node[proc, below=3.0cm of d2, fill=yellow!15] (p5) {$n=\texttt{None}$（撞边界）\\$\Rightarrow$ 转向 CW 方向补全};
+  \node[dec, below=of p5] (d3) {CW: $p \gets he.\mathrm{twin}.\mathrm{next}$};
+  \node[proc, below=of d3, fill=blue!8] (p6) {$backward.\mathrm{push}(p)$;\quad $he \gets p$;\quad 回到 $d3$};
+  \node[proc, below=of p6, fill=green!12] (p7) {$backward.\mathrm{reverse}()$；\\$backward.\mathrm{extend}(result)$；\\返回 $backward$};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (d1);
+  \draw[op] (d1) -- (d2);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {是} (p3);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {否（\texttt{Some}）} (p4);
+  \draw[op] (d2) -- node[right, font=\footnotesize] {\texttt{None}} (p5);
+  \draw[op] (p5) -- (d3);
+  \draw[op] (d3) -- node[right, font=\footnotesize] {\texttt{Some}} (p6);
+  \draw[op] (d3.east) -- ++(1.6,0) |- node[above, near end, font=\footnotesize] {\texttt{None}} (p7);
+  \draw[op, dashed] (p4.west) -- ++(-2.0,0) |- (d1.west);
+  \draw[op, dashed] (p6.west) -- ++(-2.0,0) |- (d3.west);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{面边界半边收集}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.7cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=7.5cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.4cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$f$};
+  \node[proc, below=of s, fill=blue!8] (p1) {$start \gets f.\mathrm{halfedge}$；\quad $result \gets [start]$};
+  \node[dec, below=of p1] (d1) {$n \gets he.\mathrm{next}$};
+  \node[dec, below=of d1] (d2) {$n = start$？};
+  \node[proc, below left=of d2, xshift=-1.0cm, fill=green!12] (p3) {返回 $result$（闭合）};
+  \node[proc, below right=of d2, xshift=1.0cm, fill=blue!8] (p4) {$result.\mathrm{push}(n)$；\quad $he\gets n$；\quad 回到 $d1$};
+  \node[proc, below=2.4cm of d2, fill=red!10] (p5) {$n=\texttt{None}$ $\Rightarrow$ 拓扑断开，返回当前 $result$};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- (d2);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {是} (p3);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {否} (p4);
+  \draw[op] (d2) -- node[right, font=\footnotesize] {\texttt{None}} (p5);
+  \draw[op, dashed] (p4.west) -- ++(-1.6,0) |- (d1.west);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{边界判定}
+
+\subsection{边界边}
+
+记 $h$ 的 twin 为 $h^\star$。半边 $h$ 所在的边是边界边，当且仅当：
+\[
+\boxed{\ \mathrm{is\_boundary\_edge}(h)
+\;=\; \bigl(h.\mathrm{face}=\texttt{None}\bigr)
+\;\vee\; \bigl(h^\star=\texttt{None}\bigr)
+\;\vee\; \bigl(h^\star.\mathrm{face}=\texttt{None}\bigr)\ }
+\]
+三种情形分别对应：「$h$ 自己是边界半边」「$h$ 没有 twin（拓扑未完整缝合）」
+「$h$ 的对侧是边界半边」。任何一种都意味着该边只有 0 或 1 个相邻面。
+
+\paragraph{无效 ID 语义}
+若 $h$ 已被删除或从未分配，\texttt{is\_boundary\_edge} 返回 \texttt{false}。
+\textbf{理由}：已删除的句柄不再代表任何边，因此既非内部边也非边界边。
+调用者若需区分「无效」与「非边界」，应先调用
+\texttt{MeshStorage::contains\_halfedge}：
+\begin{lstlisting}
+if !mesh.contains_halfedge(he) {
+    // he 无效，与"非边界边"区分处理
+} else if is_boundary_edge(&mesh, he) {
+    // he 是有效的边界边
+} else {
+    // he 是有效的内部边
+}
+\end{lstlisting}
+
+\subsection{边界顶点}
+
+顶点 $v$ 是边界顶点，当且仅当它关联的任一 outgoing 半边所在边为边界边：
+\[
+\mathrm{is\_boundary\_vertex}(v)
+\;=\; \exists\, h \in \mathrm{VertexRing}(v):\ \mathrm{is\_boundary\_edge}(h).
+\]
+
+等价表述：内部顶点的 outgoing 半边集形成一个\textbf{闭合} CCW 环；边界顶点的 outgoing 半边集
+形成\textbf{开链}，两端都是边界半边。
+
+\section{复杂度}
+
+设顶点 $v$ 的度为 $d_v$，面 $f$ 的边数为 $d_f$（三角形为 3）：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{API} & \textbf{构造时间} & \textbf{构造空间} & \textbf{每次 \texttt{next()}} \\
+  \midrule
+  \texttt{VertexRing}            & $O(d_v)$ & $O(d_v)$ & $O(1)$ \\
+  \texttt{VertexAdjacentVerts}   & $O(d_v)$ & $O(d_v)$ & $O(1)$ \\
+  \texttt{VertexAdjacentFaces}   & $O(d_v)$ & $O(d_v)$ & $O(1)$ \\
+  \texttt{FaceHalfEdges}         & $O(d_f)$ & $O(d_f)$ & $O(1)$ \\
+  \texttt{FaceVertices}          & $O(d_f)$ & $O(d_f)$ & $O(1)$ \\
+  \midrule
+  \texttt{VertexRingLazy}        & $O(d_v)$ & $O(1)$   & $O(1)$ \\
+  \texttt{VertexAdjacentVertsLazy} & $O(d_v)$ & $O(1)$ & $O(1)$ \\
+  \texttt{VertexAdjacentFacesLazy} & $O(d_v)$ & $O(1)$ & $O(1)$ \\
+  \texttt{FaceHalfEdgesLazy}     & $O(1)$   & $O(1)$   & $O(1)$ \\
+  \texttt{FaceVerticesLazy}      & $O(1)$   & $O(1)$   & $O(1)$ \\
+  \midrule
+  \texttt{is\_boundary\_edge}    & $O(1)$   & --- & --- \\
+  \texttt{is\_boundary\_vertex}  & $O(d_v)$ & --- & --- \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{健壮性}
+
+本模块对所有可能的 panic 路径都加了守卫：
+
+\begin{itemize}
+  \item \texttt{v.halfedge} 或 \texttt{f.halfedge} 为 \texttt{None} $\Rightarrow$ 返回空 \texttt{Vec}（eager）或空迭代器（lazy）；
+  \item 中途任一 \texttt{get\_halfedge} 返回 \texttt{None}（半边被并发删除等） $\Rightarrow$
+        \texttt{and\_then} 链路平滑返回 \texttt{None}，循环停止；
+  \item 主循环上界设为 \texttt{mesh.halfedge\_count() + 1}，对不一致拓扑（如自指环）兜底，避免死循环；
+  \item lazy 迭代器的 \texttt{current} 字段为 \texttt{Option}，撞到边界或回到起点后置 \texttt{None}，
+        后续调用 \texttt{next()} 立即返回 \texttt{None}（\texttt{FusedIterator} 语义）；
+  \item \texttt{is\_boundary\_edge} 对无效 \texttt{he} 返回 \texttt{false}（非 panic）；
+  \item \texttt{is\_boundary\_vertex} 对无效 / 孤立 $v$ 返回 \texttt{false}。
+\end{itemize}
+
+\section{顶点邻接无向边：VertexAdjacentEdges}
+
+\texttt{VertexAdjacentEdges} 是预收集迭代器，产出与顶点 $v$ 关联的所有
+\textbf{唯一无向边}（\texttt{EdgeId}）。
+
+\subsection{构造与算法}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {\texttt{VertexAdjacentEdges::new(\&mesh, v)}};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. \texttt{collect\_outgoing\_halfedges(\&mesh, v)} $\to$ $H_v$};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 对每个 $h \in H_v$ 计算 $\mathrm{canonical}(h) = \min(h, h^\star)$（无 twin 取自身）};
+  \node[proc, below=of p2, fill=blue!8] (p3) {3. 用 \texttt{HashSet} 去重，保留首次出现的规范半边};
+  \node[proc, below=of p3, fill=blue!8] (p4) {4. 将每个规范半边封装为 \texttt{EdgeId}，存入 \texttt{Vec<EdgeId>}};
+  \node[startend, below=of p4] (e) {返回迭代器};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{与 EdgeIter 的关系}
+
+\begin{itemize}
+  \item \texttt{EdgeIter} 枚举\textbf{整张网格}的所有无向边；
+  \item \texttt{VertexAdjacentEdges} 只枚举\textbf{与指定顶点 $v$ 关联}的无向边
+        （即 $v$ 的 outgoing 半边所在边）；
+  \item 两者共用相同的「规范半边」约定：twin 对中 key 较小者，边界半边取自身；
+  \item 对闭合网格，\texttt{VertexAdjacentEdges} 的产出数等于顶点度数
+        （\texttt{VertexRing::new(\&mesh, v).count()}）。
+\end{itemize}
+
+\subsection{复杂度}
+
+构造期 $O(d(v))$，其中 $d(v)$ 是顶点 $v$ 的度数；迭代期 $O(1)$ per step。
+实现 \texttt{ExactSizeIterator}，\texttt{size\_hint} 返回精确剩余数。
+
+\section{统计信息与诊断}
+\label{sec:stats}
+
+\subsection{迭代器统计接口}
+
+为方便调试与性能分析，所有 14 个迭代器（5 个预收集 + 5 个 lazy + \texttt{EdgeIter} + \texttt{VertexAdjacentEdges} + \texttt{BoundaryLoop} + \texttt{BoundaryLoopLazy}）统一提供：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{方法} & \textbf{预收集版本} & \textbf{lazy 版本} \\
+  \midrule
+  \texttt{count\_hint(\&self) -> Option<usize>}
+    & \texttt{Some(剩余数量)} & \texttt{None} \\
+  \texttt{is\_empty(\&self) -> bool}
+    & \texttt{cursor >= vec.len()} & \texttt{current.is\_none()} \\
+  \texttt{ExactSizeIterator}
+    & \checkmark（提供 \texttt{len()}） & $\times$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{设计要点：}
+\begin{itemize}
+  \item \texttt{count\_hint} 是 inherent 方法，不消费迭代器（\texttt{count()} 会消费 \texttt{self}）；
+  \item 预收集版本额外实现 \texttt{ExactSizeIterator}，
+        \texttt{size\_hint} 精确返回 \texttt{(n, Some(n))}（$n$ 为剩余数）；
+  \item lazy 版本的 \texttt{is\_empty} 仅检查 \texttt{current} 是否 \texttt{None}，
+        不预探测长度，保持 $O(1)$。
+\end{itemize}
+
+\subsection{MeshStorage 诊断方法}
+
+\texttt{MeshStorage} 提供 3 个拓扑诊断方法，用于评估网格规模与迭代器内存开销：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{方法} & \textbf{公式} & \textbf{复杂度} \\
+  \midrule
+  \texttt{max\_vertex\_valence()} & $\max_{v \in V} d_v$ & $O(V \cdot \bar{d}) = O(E)$ \\
+  \texttt{euler\_characteristic()} & $\chi = V - E + F$ & $O(1)$ \\
+  \texttt{genus()} & $g = (2 - \chi) / 2$ & $O(1)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{说明：}
+\begin{itemize}
+  \item $E = |\text{HE}| / 2$（假设每条边有 twin，流形网格成立）；
+  \item 闭合球面 $\chi = 2$，亏格 $g$ 的闭合曲面 $\chi = 2 - 2g$；
+  \item 带边界曲面的亏格公式更复杂，\texttt{genus()} 按闭合曲面公式计算，仅作诊断参考；
+  \item \texttt{max\_vertex\_valence} 用于评估预收集迭代器内存：
+        $\text{总量} \approx V \times (\bar{d} \times 8 + 24)$ 字节。
+\end{itemize}
+
+\subsection{基准测试：count\_hint vs count}
+
+在 1M 顶点 icosphere 上对比 \texttt{count\_hint} 与 \texttt{count} 的开销
+（两者都包含构造 VertexRing 的 $O(d)$ 时间）：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lrr@{}}
+  \toprule
+  \textbf{操作} & \textbf{1M 耗时} & \textbf{复杂度} \\
+  \midrule
+  eager \texttt{count\_hint} & 0.066s & $O(d)$ 构造 + $O(1)$ 读 len \\
+  eager \texttt{count}        & 0.063s & $O(d)$ 构造 + $O(n)$ 遍历 Vec \\
+  lazy  \texttt{count\_hint} & 0.024s & $O(d)$ 构造 + $O(1)$ 返回 None \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{分析：} \texttt{count\_hint} 与 \texttt{count} 耗时接近，因为主要开销在
+\texttt{VertexRing::new} 的构造阶段（收集半边到 Vec），而非 \texttt{count} 的遍历阶段。
+\texttt{count\_hint} 的核心价值不在速度，而在：
+\begin{enumerate}
+  \item \textbf{不消费迭代器}——可在循环中先检查长度再决定是否消费；
+  \item \textbf{明确长度已知性}——lazy 版本返回 \texttt{None}，调用者不会误判；
+  \item \textbf{语义清晰}——\texttt{count()} 的默认实现会消费整个迭代器，
+        对 lazy 版本是 $O(n)$，而 \texttt{count\_hint} 始终 $O(1)$。
+\end{enumerate}
+
+\section{单元测试覆盖}
+
+\texttt{src/traversal.rs} 末尾共 62 个测试，分六组场景：
+
+{\scriptsize
+\renewcommand{\arraystretch}{1.18}
+\begin{longtable}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{覆盖点} \\
+  \midrule
+  \endhead
+  \multicolumn{2}{l}{\textit{场景一：单个三角面片（覆盖基本顺序与边界）}} \\
+  \texttt{face\_halfedges\_in\_ccw\_order}       & 面 \texttt{next} 顺序 $[h_0,h_1,h_2]$ \\
+  \texttt{face\_vertices\_in\_ccw\_order}        & 面顶点 $[v_1,v_2,v_0]$ \\
+  \texttt{vertex\_ring\_around\_v0}              & $v_0$ outgoing $=[h_0,t_2]$ \\
+  \texttt{vertex\_ring\_around\_v1}              & $v_1$ outgoing $=[h_1,t_0]$ \\
+  \texttt{vertex\_adjacent\_verts\_around\_v0}   & $v_0$ 邻居 $=[v_1,v_2]$ \\
+  \texttt{vertex\_adjacent\_faces\_around\_v0}   & $v_0$ 邻接面 $=[F]$ \\
+  \texttt{boundary\_detection\_for\_single\_triangle} & 全部 6 条半边都是边界边 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景二：两三角形拼成的四边形（覆盖共享边与开链 v0）}} \\
+  \texttt{two\_triangle\_corner\_vertices\_are\_still\_boundary} & 4 个顶点都是边界顶点 \\
+  \texttt{two\_triangle\_shared\_vertex\_has\_three\_outgoing}   & $v_0$ 度为 3 \\
+  \texttt{two\_triangle\_v0\_has\_two\_adjacent\_faces}          & $v_0$ 邻接面 $=[F_1,F_2]$ \\
+  \texttt{shared\_edge\_is\_not\_boundary}                       & 共享边非边界 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景三：3 三角形闭合扇形（覆盖内部顶点 / 闭合环）}} \\
+  \texttt{closed\_fan\_center\_is\_interior}                       & 中心 $c$ 非边界 \\
+  \texttt{closed\_fan\_outer\_vertices\_are\_boundary}             & 外圈 3 顶点都是边界 \\
+  \texttt{closed\_fan\_center\_ring\_closes\_with\_three\_outgoing} & $c$ outgoing 数=3，闭合 \\
+  \texttt{closed\_fan\_center\_adjacent\_faces\_yields\_three}     & $c$ 邻接 3 个面 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景四：lazy 迭代器与预收集版本一致性}} \\
+  \texttt{lazy\_vertex\_ring\_matches\_eager\_on\_single\_triangle} & 单三角面片 lazy = eager \\
+  \texttt{lazy\_vertex\_ring\_matches\_eager\_on\_closed\_fan}      & 闭合扇形 lazy = eager \\
+  \texttt{lazy\_vertex\_ring\_matches\_eager\_on\_two\_triangles}   & 两三角形开链 lazy = eager \\
+  \texttt{lazy\_face\_halfedges\_matches\_eager}                    & 面边界 lazy = eager \\
+  \texttt{lazy\_face\_vertices\_matches\_eager}                     & 面顶点 lazy = eager \\
+  \texttt{lazy\_adjacent\_verts\_matches\_eager}                    & 邻接顶点 lazy = eager \\
+  \texttt{lazy\_adjacent\_faces\_matches\_eager}                    & 邻接面 lazy = eager \\
+  \texttt{lazy\_iterators\_handle\_invalid\_ids}                    & 无效 / 孤立 ID 返回空 \\
+  \texttt{lazy\_iterators\_are\_fused}                              & \texttt{next()} 返回 \texttt{None} 后继续 fused \\
+  \texttt{lazy\_iterators\_on\_icosphere}                           & icosphere(1) 全顶点 lazy = eager \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景五：统计信息与诊断方法}} \\
+  \texttt{eager\_count\_hint\_returns\_some\_remaining}  & 预收集 \texttt{count\_hint} 返回精确剩余数 \\
+  \texttt{eager\_is\_empty\_on\_invalid\_ids}            & 无效 ID 的 \texttt{is\_empty} 返回 true \\
+  \texttt{eager\_exact\_size\_iterator\_size\_hint}      & \texttt{size\_hint} 返回精确 (lower, Some(upper)) \\
+  \texttt{lazy\_count\_hint\_returns\_none}              & lazy \texttt{count\_hint} 恒返回 None \\
+  \texttt{lazy\_is\_empty\_on\_valid\_and\_invalid}      & lazy \texttt{is\_empty} 正确判定 \\
+  \texttt{lazy\_is\_empty\_after\_exhaustion}            & 耗尽后 \texttt{is\_empty} 为 true \\
+  \texttt{max\_vertex\_valence\_single\_triangle}        & 单三角形最大度数 = 2 \\
+  \texttt{max\_vertex\_valence\_closed\_fan}             & 闭合扇形最大度数 = 3 \\
+  \texttt{max\_vertex\_valence\_empty\_mesh}             & 空网格返回 0 \\
+  \texttt{max\_vertex\_valence\_isolated\_vertices}      & 孤立顶点返回 0 \\
+  \texttt{max\_vertex\_valence\_icosphere}               & icosphere(1) 度数在 [5,6] \\
+  \texttt{euler\_characteristic\_single\_triangle}       & $\chi = 1$，$g = 0$ \\
+  \texttt{euler\_characteristic\_closed\_fan}            & $\chi = 1$ \\
+  \texttt{euler\_characteristic\_icosphere\_is\_two}     & 球面 $\chi = 2$，$g = 0$ \\
+  \texttt{euler\_characteristic\_empty\_mesh}            & 空网格 $\chi = 0$ 不 panic \\
+  \midrule
+  \multicolumn{2}{l}{\textit{通用：设计约束与无效输入}} \\
+  \texttt{iterator\_does\_not\_hold\_borrow}    & 迭代器存活期可同时 \texttt{\&mut mesh} \\
+  \texttt{can\_modify\_mesh\_during\_iteration} & 收集后可基于 ID 修改网格 \\
+  \texttt{invalid\_or\_isolated\_ids\_yield\_empty} & 孤立 / 已删除 ID 安全返回空或 \texttt{false} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景六：无向边迭代器、闭合判定与边界环}} \\
+  \texttt{edge\_count\_single\_triangle}                       & 单三角形 \texttt{edge\_count}=3 \\
+  \texttt{edge\_count\_two\_triangles}                         & 两三角形共享边 \texttt{edge\_count}=5 \\
+  \texttt{edge\_count\_closed\_fan}                            & 闭合扇形 \texttt{edge\_count}=6 \\
+  \texttt{edge\_count\_empty}                                 & 空网格 \texttt{edge\_count}=0 \\
+  \texttt{edge\_ids\_single\_triangle\_yields\_three\_unique\_edges} & 3 条无向边互不相同 \\
+  \texttt{edge\_ids\_two\_triangles\_yields\_five\_unique\_edges}    & 5 条无向边 \\
+  \texttt{edge\_ids\_on\_icosphere}                            & icosphere(1) 120 条边 \\
+  \texttt{edge\_id\_vertices\_on\_icosphere}                   & 边的两端点查询 \\
+  \texttt{edge\_iter\_is\_exact\_size}                         & \texttt{EdgeIter} 实现 \texttt{ExactSizeIterator} \\
+  \texttt{edge\_count\_matches\_euler}                         & 欧拉公式验证 \texttt{edge\_count} \\
+  \texttt{is\_closed\_single\_triangle\_is\_false}             & 单三角形非闭合 \\
+  \texttt{is\_closed\_closed\_fan\_is\_false}                  & 扇形非闭合 \\
+  \texttt{is\_closed\_icosphere\_is\_true}                     & icosphere 闭合 \\
+  \texttt{boundary\_loop\_single\_triangle}                    & 单三角形 1 个边界环 \\
+  \texttt{boundary\_loop\_icosphere\_is\_empty}                & 闭合网格无边界环 \\
+  \texttt{boundary\_loop\_lazy\_matches\_eager}                & lazy 与 eager 一致 \\
+  \texttt{boundary\_loop\_detects\_multiple\_loops}            & 多边界环检测 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{场景七：顶点邻接无向边（VertexAdjacentEdges）}} \\
+  \texttt{vertex\_adjacent\_edges\_triangle}                   & 单三角形 $v_0$ 关联 2 条无向边 \\
+  \texttt{vertex\_adjacent\_edges\_icosphere}                  & icosphere(1) 关联边数 $=$ 度数 \\
+  \bottomrule
+\end{longtable}
+}
+
+\texttt{cargo test} 全库共 \textbf{371 个}用例，全部通过（0 失败 / 0 警告）。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何不实现 \texttt{DoubleEndedIterator}？} 双向迭代要求保存可逆状态，
+        但本实现的核心目标是「不持有借用」与「遍历期可修改网格」，双向能力会带来
+        额外 API 表面积而收益有限。保持极简。
+  \item \textbf{为何不在构造期直接 yield？} Rust 的 \texttt{Iterator} trait 要求
+        \texttt{next()} 返回 \texttt{Option}，但\textbf{不能}在迭代期间持有 \texttt{\&mesh}。
+        把收集与迭代解耦是同时满足「不持有借用」与「符合 \texttt{Iterator} trait」的唯一简洁方案。
+  \item \textbf{为何用 \texttt{halfedge\_count()} 作为循环上界？} 在流形一致网格中，
+        正确的旋转环长度严格不超过半边总数。一旦拓扑不一致，该上界保证算法必然终止，
+        而不会进入死循环——这是\textbf{健壮性}与\textbf{性能}的零代价折中。
+  \item \textbf{为何 lazy 与 eager 并存？} 两者面向不同场景：eager 适合迭代期需 \texttt{\&mut mesh}
+        或随机访问；lazy 适合大规模只读遍历（零堆分配，基准测试快 $0.19$--$0.71\times$）。
+        \texttt{::lazy} 构造函数返回独立的 \texttt{Lazy} 类型，调用方按需选择，无隐式开销。
+  \item \textbf{为何 lazy 顶点环需要 CW 探测？} 开链顶点的 outgoing 环不是闭合的，
+        不能像面边界那样「回到起点即终止」。CW 探测找到开链尽头后，从尽头沿 CCW 迭代
+        即可覆盖整条链，且产出顺序与预收集版本完全一致。
+  \item \textbf{为何 \texttt{count\_hint} 返回 \texttt{Option} 而非 \texttt{usize}？}
+        预收集版本知道精确长度（\texttt{Some}），lazy 版本长度未知（\texttt{None}）。
+        返回 \texttt{Option} 让调用者明确区分两种情况，避免对 lazy 迭代器误用
+        \texttt{len()} 导致运行时错误。
+  \item \textbf{为何 \texttt{max\_vertex\_valence} 放在 \texttt{traversal.rs} 而非
+        \texttt{storage.rs}？} 该方法依赖 \texttt{VertexRing} 遍历顶点 outgoing 环，
+        而 \texttt{VertexRing} 定义在 \texttt{traversal.rs} 中。Rust 允许在多个模块
+        对同一类型 \texttt{impl} 方法，故将依赖遍历的方法放在遍历模块，保持
+        \texttt{storage.rs} 的存储层纯粹性。\texttt{euler\_characteristic} 和
+        \texttt{genus} 仅需计数，放在 \texttt{storage.rs} 中。
+\end{itemize}
+
+\end{document}

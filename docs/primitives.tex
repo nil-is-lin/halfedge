@@ -1,0 +1,228 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 几何图元生成模块设计文档} \\ \large \texttt{src/primitives.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{primitives.rs} 提供 6 个程序化图元构建器，每个返回完整的 \texttt{MeshStorage}：
+CCW 朝外法向、容量预分配、调用 \texttt{add\_triangle} 自动建立半边拓扑。
+所有图元位于原点，参数化生成。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{图元} & \textbf{API} & \textbf{顶点数} & \textbf{面数} \\
+  \midrule
+  立方体   & \texttt{build\_cube(size)}                              & $8$ & $12$ \\
+  UV 球    & \texttt{build\_uv\_sphere(r, slices, stacks)}           & $(s{+}1)(t{+}1)$ & $2 \cdot s \cdot t$ \\
+  圆柱     & \texttt{build\_cylinder(r, h, slices)}                  & $2s + 2$ & $4s$ \\
+  圆锥     & \texttt{build\_cone(r, h, slices)}                      & $s + 2$ & $2s$ \\
+  圆环     & \texttt{build\_torus(R, r, mj, mn)}                     & $mj \cdot mn$ & $2 \cdot mj \cdot mn$ \\
+  网格     & \texttt{build\_grid(w, d, sx, sz)}                      & $(s_x{+}1)(s_z{+}1)$ & $2 \cdot s_x \cdot s_z$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{参数化公式}
+
+\subsection{立方体}
+
+$h = \text{size} / 2$，8 顶点位于 $(\pm h, \pm h, \pm h)$。
+底面 $-z$（4 顶点 CCW）+ 顶面 $+z$（4 顶点 CCW），共 12 三角形（每面 2 个）。
+委托 \texttt{build\_mesh\_from\_vertices\_and\_faces} 一次成型。
+
+\subsection{UV 球}
+
+极角 $\phi$ 从 $+y$ 极（$0$）到 $-y$ 极（$\pi$），方位角 $\theta \in [0, 2\pi)$：
+
+\begin{align}
+  \phi_i &= \frac{\pi \cdot i}{\text{stacks}},\quad i = 0, \dots, \text{stacks} \\
+  \theta_j &= \frac{2\pi \cdot j}{\text{slices}},\quad j = 0, \dots, \text{slices} \\
+  y_{i,j} &= r \cos\phi_i, \quad r_{\text{ring},i} = r \sin\phi_i \\
+  x_{i,j} &= r_{\text{ring},i} \cos\theta_j, \quad z_{i,j} = r_{\text{ring},i} \sin\theta_j
+\end{align}
+
+每个 $(i, j)$ 单元分裂为 2 三角形：$(a, b, c)$ + $(c, b, d)$，
+其中 $a=v_{i,j}, b=v_{i,j+1}, c=v_{i+1,j}, d=v_{i+1,j+1}$。
+
+\paragraph{缝合警告} 列 $j = \text{slices}$ 与 $j = 0$ 是\textbf{重复顶点}（位置相同但 ID 不同），
+形成拓扑接缝而非闭合环。
+
+\subsection{圆柱}
+
+沿 $y$ 轴，$y \in [-h/2, +h/2]$。两中心顶点（顶 / 底）+ $s$ 个圆环顶点（顶 / 底各一）：
+
+\[
+  \theta_i = \frac{2\pi \cdot i}{\text{slices}},\quad
+  x_i = r \cos\theta_i,\quad
+  z_i = r \sin\theta_i.
+\]
+
+每 $i$ 产生 4 三角形：侧面 2 + 顶帽 1 + 底帽 1，环用 $(i+1) \bmod s$ 闭合。
+
+\subsection{圆锥}
+
+顶点 $(0, +h/2, 0)$，底面圆心 $(0, -h/2, 0)$，底圆环：
+\[
+  \theta_i = \frac{2\pi \cdot i}{\text{slices}},\quad
+  \text{ring}_i = (r\cos\theta_i,\ -h/2,\ r\sin\theta_i).
+\]
+
+每 $i$ 产生 2 三角形：侧面 $(apex, ring_{i+1}, ring_i)$ + 底面 $(base_c, ring_i, ring_{i+1})$。
+
+\subsection{圆环}
+
+环面位于 $xz$ 平面，主半径 $R$（环中心到管中心），副半径 $r$（管半径）：
+\begin{align}
+  \theta_i &= \frac{2\pi \cdot i}{mj},\quad i = 0, \dots, mj - 1 \\
+  \phi_j &= \frac{2\pi \cdot j}{mn},\quad j = 0, \dots, mn - 1 \\
+  R'_{j} &= R + r \cos\phi_j \\
+  x_{i,j} &= R'_j \cos\theta_i,\quad
+  z_{i,j} = R'_j \sin\theta_i,\quad
+  y_{i,j} = r \sin\phi_j
+\end{align}
+
+每 $(i, j)$ 单元 2 三角形，索引 $ni = (i+1) \bmod mj$，$nj = (j+1) \bmod mn$ 实现环向闭合。
+
+\subsection{网格}
+
+$xz$ 平面 $y = 0$，$x \in [-w/2, +w/2]$，$z \in [-d/2, +d/2]$，按 $s_x \times s_z$ 单元细分：
+\[
+  x_{ix} = -\frac{w}{2} + \frac{w \cdot ix}{s_x},\quad
+  z_{iz} = -\frac{d}{2} + \frac{d \cdot iz}{s_z}.
+\]
+
+每单元 2 三角形：$(a, b, c)$ + $(c, b, d)$，与 UV 球相同的分裂模式。
+
+\section{参数钳制}
+
+所有构建器对参数应用最小值钳制，防止退化：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{参数} & \textbf{最小值} \\
+  \midrule
+  \texttt{slices}（球 / 圆柱 / 圆锥） & $3$ \\
+  \texttt{stacks}（球）                & $2$ \\
+  \texttt{major\_segments} / \texttt{minor\_segments}（环） & $3$ \\
+  \texttt{segments\_x} / \texttt{segments\_z}（网格）       & $1$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{容量预分配}
+
+每个构建器（除 \texttt{build\_cube} 委托给统一构建器外）入口处调用
+\texttt{mesh.reserve(v, he, f)}，半边容量按 \texttt{faces * 6}（每三角面 3 内部 + 3 潜在边界 twin）
+预分配，使构建期间 rehash 次数为 0。
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{构建器} & \textbf{时间复杂度} \\
+  \midrule
+  \texttt{build\_cube}        & $O(1)$ \\
+  \texttt{build\_uv\_sphere}  & $O(\text{slices} \cdot \text{stacks})$ \\
+  \texttt{build\_cylinder}    & $O(\text{slices})$ \\
+  \texttt{build\_cone}        & $O(\text{slices})$ \\
+  \texttt{build\_torus}       & $O(mj \cdot mn)$ \\
+  \texttt{build\_grid}        & $O(s_x \cdot s_z)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+所有构建器对输出规模线性，无嵌套搜索。
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{cube\_is\_closed}              & \texttt{build\_cube(2.0)}：$V=8$，$F=12$，校验通过 \\
+  \texttt{uv\_sphere\_is\_closed}        & \texttt{build\_uv\_sphere(1, 16, 8)}：$F > 0$，校验通过 \\
+  \texttt{cylinder\_counts}              & \texttt{build\_cylinder(1, 2, 16)}：$V=34$，$F=64$，校验通过 \\
+  \texttt{torus\_counts}                 & \texttt{build\_torus(2, 0.5, 16, 8)}：$V=128$，$F=256$，校验通过 \\
+  \texttt{cone\_counts}                  & \texttt{build\_cone(1, 2, 16)}：$V=18$，$F=32$，校验通过 \\
+  \texttt{grid\_counts}                  & \texttt{build\_grid(2, 2, 4, 4)}：$V=25$，$F=32$ \\
+  \texttt{primitives\_pass\_validation}  & 6 个图元小参数下 \texttt{validate\_mesh} 全通过 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 \textbf{7 个}单元测试，全库共 \textbf{371 个}。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何 \texttt{add\_triangle} 的 \texttt{Result} 被忽略？} 参数化构建器
+        通过索引算术保证拓扑合法，错误不应发生。若发生（索引 bug），
+        测试中的 \texttt{validate\_mesh} 会暴露。生产代码可改为 \texttt{expect}。
+  \item \textbf{为何 UV 球保留接缝重复顶点？} 简化索引生成（无需模运算闭合），
+        代价是接缝处多一列顶点。如需拓扑闭合，应使用 \texttt{build\_torus} 风格的
+        $(i+1) \bmod n$ 索引。
+  \item \textbf{为何参数钳制而非返回 \texttt{Result}？} 钳制给调用方零开销的「安全默认」，
+        避免 API 复杂化。调用方仍可传入大值得到大网格，不会失败。
+\end{itemize}
+
+\end{document}

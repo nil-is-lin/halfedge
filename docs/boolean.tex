@@ -1,0 +1,254 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 布尔运算模块设计文档} \\ \large \texttt{src/boolean.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{boolean.rs} 在两个闭合流形三角网格 $A$、$B$ 之上执行\textbf{集合运算}
+（并、交、差、对称差），返回新的 \texttt{MeshStorage}。
+
+\textbf{算法路线}：基于射线投射的\textbf{逐面内外分类}（point-in-polyhedron
+by ray parity），而非 BSP / CSG 切割。每个输入三角形作为整体保留或丢弃，
+不进行跨越边界的几何切割。
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  枚举   & \texttt{BoolOp}                            & \texttt{Union}/\texttt{Intersection}/\texttt{Difference}/\texttt{SymmetricDifference} \\
+  核心   & \texttt{boolean\_operation(a, b, op)}      & 按 \texttt{op} 分派，返回新 \texttt{MeshStorage} \\
+  \midrule
+  \multirow{4}{*}{快捷}
+         & \texttt{boolean\_union(a, b)}              & $A \cup B$ \\
+         & \texttt{boolean\_intersection(a, b)}       & $A \cap B$ \\
+         & \texttt{boolean\_difference(a, b)}         & $A - B$ \\
+         & \texttt{boolean\_symmetric\_difference(a, b)} & $A \triangle B$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{BoolOp 分类规则}
+
+\texttt{classify(op, inside\_a, inside\_b)} 根据 $A$、$B$ 内外状态决定保留：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{op} & \textbf{保留条件} & \textbf{集合表达} \\
+  \midrule
+  \texttt{Union}              & \texttt{inside\_a || inside\_b} & $A \cup B$ \\
+  \texttt{Intersection}       & \texttt{inside\_a \&\& inside\_b} & $A \cap B$ \\
+  \texttt{Difference}         & \texttt{inside\_a \&\& !inside\_b} & $A \setminus B$ \\
+  \texttt{SymmetricDifference}& \texttt{inside\_a != inside\_b} & $A \triangle B$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{核心算法：射线投射内外判定}
+
+\subsection{Möller-Trumbore 射线-三角形求交}
+
+设射线 $\vec{R}(t) = \vec{O} + t\vec{D}$，三角形 $(\vec{V}_0, \vec{V}_1, \vec{V}_2)$，
+求解重心坐标参数 $(t, u, v)$：
+\[
+  \vec{O} + t\vec{D} = (1-u-v)\vec{V}_0 + u\vec{V}_1 + v\vec{V}_2.
+\]
+
+\textbf{接受条件}：
+\begin{itemize}
+  \item $|\det| \ge 10^{-14}$（非平行）；
+  \item $u \ge 0$，$v \ge 0$，$u + v \le 1$（在三角形内）；
+  \item $t > 10^{-12}$（在前向半空间，避免自交）。
+\end{itemize}
+
+\subsection{点在网格内外判定（射线奇偶法）}
+
+\texttt{point\_inside\_point(point, mesh)} 沿 $+x$ 方向发射射线，
+统计与三角面交点数：
+\[
+  \text{inside}(\vec{p}) \;\Longleftrightarrow\; \#\{\text{hits}\} \bmod 2 = 1.
+\]
+假设网格闭合且法向一致。复杂度 $O(F)$。
+
+\subsection{面分类：双侧法向偏移采样}
+
+对每个面 $f$（中心 $\vec{c}$，法向 $\vec{n}$），为避免中心点恰好落在另一网格表面，
+沿法向两侧各偏移 $\varepsilon$ 采样：
+\[
+  \vec{p}_{\text{out}} = \vec{c} + \varepsilon\hat{n},\quad
+  \vec{p}_{\text{in}}  = \vec{c} - \varepsilon\hat{n},
+\]
+其中 $\varepsilon = 10^{-4} / \|\vec{n}\|$（$\|\vec{n}\| < 10^{-14}$ 时回退 $\varepsilon = 10^{-4}$）。
+
+\textbf{保守 AND 规则}：
+\[
+  \text{inside} = \text{inside}(\vec{p}_{\text{in}}) \;\wedge\; \neg\,\text{inside}(\vec{p}_{\text{out}}).
+\]
+
+\subsection{整体流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.6cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {输入：$A$, $B$, \texttt{op}};
+  \node[proc, below=of s, fill=blue!8] (p1) {对 $A$ 的每个面 $f$：计算中心 $\vec{c}$、法向 $\vec{n}$、偏移 $\varepsilon$};
+  \node[proc, below=of p1, fill=blue!8] (p2) {采样 $\vec{p}_{\text{out}}, \vec{p}_{\text{in}}$，调用 \texttt{point\_inside\_mesh}（对 $B$）};
+  \node[proc, below=of p2, fill=blue!8] (p3) {保守 AND 规则得 $\text{inside}_b(f)$；对称地得 $\text{inside}_a(g)$};
+  \node[proc, below=of p3, fill=blue!8] (p4) {对每个面调用 \texttt{classify(op, inside\_a, inside\_b)} 决定保留};
+  \node[proc, below=of p4, fill=blue!8] (p5) {保留面经 \texttt{get\_or\_add\_vertex}（量化 $10^{-9}$ 去重）+ \texttt{add\_triangle} 重建};
+  \node[startend, below=of p5, fill=green!12] (e) {返回新 \texttt{MeshStorage}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{顶点去重}
+
+\texttt{get\_or\_add\_vertex} 通过量化网格去重：
+\[
+  \text{key} = \bigl(\lfloor 10^{9} \cdot x \rceil,\ \lfloor 10^{9} \cdot y \rceil,\ \lfloor 10^{9} \cdot z \rceil\bigr) \in \mathbb{Z}^3.
+\]
+\texttt{HashMap<[i64;3], VertexId>} 缓存已添加顶点；阈值 $10^{-9}$ 内的位置视为同一点。
+这保证保留三角形之间的共享顶点能被识别，使 \texttt{add\_triangle} 自动配对 twin。
+
+\section{复杂度}
+
+设 $F_a = $ \texttt{mesh\_a.face\_count()}，$F_b = $ \texttt{mesh\_b.face\_count()}，
+$K = $ 保留三角形数。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{函数} & \textbf{时间复杂度} \\
+  \midrule
+  \texttt{point\_inside\_mesh}        & $O(F)$（遍历所有面求交） \\
+  \texttt{ray\_triangle\_intersection}& $O(1)$ \\
+  \texttt{classify}                   & $O(1)$ \\
+  \texttt{get\_or\_add\_vertex}       & $O(1)$ 均摊 \\
+  \texttt{boolean\_operation}         & $O(F_a \cdot F_b)$（每面两次 \texttt{point\_inside\_mesh}） \\
+  四个快捷函数                          & $O(F_a \cdot F_b)$（委托 \texttt{boolean\_operation}） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{注意}：复杂度在面数乘积上，对稠密网格不友好。无加速结构（BVH / 八叉树）。
+
+\section{限制}
+
+\begin{itemize}
+  \item 仅支持\textbf{闭合流形三角网格}；非闭合网格的内外判定无定义；
+  \item 共面退化情形（两三角形共面）可能误判；
+  \item 跨越边界的三角形\textbf{不被切割}：保留与否取决于其重心分类结果，
+        对部分重叠网格是\textbf{近似}的（内部面正确移除，但边界接缝不重新三角化）；
+  \item \texttt{add\_triangle} 的 \texttt{Result} 被显式忽略（\texttt{let \_ = ...}），
+        拓扑错误被静默吞掉。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{union\_disjoint\_cubes}                       & 不相交两立方体并集：$F = 24$（无丢弃） \\
+  \texttt{union\_overlapping\_cubes}                    & 重叠两立方体并集：$4 \le F \le 24$（内部面被丢弃） \\
+  \texttt{intersection\_overlapping\_cubes}             & 重叠立方体交集非空（$V > 0$） \\
+  \texttt{intersection\_disjoint\_cubes}                & 不相交立方体交集为空（$F = 0$） \\
+  \texttt{difference\_self\_is\_empty}                  & $A - A$ 近似空（$F \le 2$，容差考虑射线伪影） \\
+  \texttt{symmetric\_difference\_disjoint\_equals\_union} & 不相交时对称差面数 $=$ 并集面数 \\
+  \texttt{intersection\_contains\_cube}                 & 两相同立方体交集 $\ge 6$ 面 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 \textbf{7 个}单元测试，全库共 \textbf{371 个}。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何用射线投射而非 BSP / CSG 切割？} 实现简洁，无需计算交线、
+        重新三角化跨越边界的面。对完全包含 / 完全不相交的情形结果精确；
+        部分重叠是近似。适合快速原型与几何查询。
+  \item \textbf{为何两侧法向偏移采样？} 重心可能恰好落在另一网格表面
+        （如两立方体共面时），单侧采样会产生歧义。两侧采样 + AND 规则
+        提供保守的鲁棒判定。
+  \item \textbf{为何 \texttt{add\_triangle} 的错误被忽略？} 布尔结果中可能出现
+        退化三角形（共线顶点）或重复面，\texttt{add\_triangle} 会返回 \texttt{Err}。
+        当前实现选择丢弃错误三角形继续，保证调用方拿到非空结果。
+        生产环境应改为收集错误并报告。
+  \item \textbf{为何顶点量化去重？} 浮点位置直接比较不可靠（$10^{-16}$ 误差）。
+        量化到 $10^{-9}$ 网格既保证共享顶点被识别，又允许微小数值漂移。
+\end{itemize}
+
+\end{document}

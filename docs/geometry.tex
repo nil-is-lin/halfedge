@@ -1,0 +1,684 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 几何工具模块设计文档} \\ \large \texttt{src/geometry.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{geometry.rs} 在 \texttt{storage.rs} 与 \texttt{traversal.rs} 之上叠加
+\textbf{几何查询}与\textbf{几何处理}能力，提供 35+ 个公共函数与
+\texttt{AABB} / \texttt{RayHit} / \texttt{VertexCurvature} /
+\texttt{EdgeLengthStats} / \texttt{MeshQualityStats} 五类结构体：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{6}{*}{查询}
+    & \texttt{edge\_length(mesh, he)}        & 半边两端欧氏距离 \\
+    & \texttt{face\_area(mesh, f)}           & 三角面积 $\frac{1}{2}|(\vec{B}-\vec{A})\times(\vec{C}-\vec{A})|$ \\
+    & \texttt{face\_normal(mesh, f)}         & 面法向（归一化叉积） \\
+    & \texttt{face\_min\_angle(mesh, f)}     & 三角面最小内角（弧度） \\
+    & \texttt{vertex\_normal(mesh, v)}       & 顶点法向（面积加权平均） \\
+    & \texttt{dihedral\_angle(mesh, he)}     & 相邻面二面角（特征边检测用） \\
+  \midrule
+  \multirow{3}{*}{特征边}
+    & \texttt{is\_feature\_edge(mesh, he, $\theta$)} & 二面角 $\ge \theta$ 时为特征边 \\
+    & \texttt{feature\_edges(mesh, $\theta$)}        & 枚举所有特征边 \\
+    & \texttt{cotan\_laplacian(mesh, v)}             & 余切拉普拉斯（离散微分算子） \\
+  \midrule
+  \multirow{2}{*}{多边形}
+    & \texttt{polygon\_area(\&[pos])}        & 任意多边形面积（Newell 方法） \\
+    & \texttt{polygon\_normal(\&[pos])}      & 任意多边形法向（Newell 方法） \\
+  \midrule
+  \multirow{4}{*}{平滑}
+    & \texttt{laplacian\_smooth\_vertex}     & 单顶点拉普拉斯位置（统一权重） \\
+    & \texttt{laplacian\_smooth\_mesh}       & 整网拉普拉斯平滑（批量更新） \\
+    & \texttt{taubin\_smooth\_mesh}          & Taubin $\lambda/\mu$ 双滤波（保体积） \\
+    & \texttt{bilateral\_smooth\_mesh}       & 双边滤波（保特征边） \\
+  \midrule
+  \multirow{2}{*}{距离}
+    & \texttt{point\_triangle\_distance}     & 点到三角形最近距离（Ericson 算法，返回 \texttt{f64}） \\
+    & \texttt{closest\_point\_on\_triangle}  & 点到三角形最近点（同源算法，返回 \texttt{[f64;3]}） \\
+  \midrule
+  \multirow{4}{*}{网格质量}
+    & \texttt{face\_aspect\_ratio(mesh, f)}  & 长宽比 $= L_{\max} / L_{\min}$，等边为 1 \\
+    & \texttt{face\_radius\_ratio(mesh, f)}  & 半径比 $= 8(s{-}a)(s{-}b)(s{-}c)/(abc)$，归一化 $[0,1]$ \\
+    & \texttt{edge\_length\_stats(mesh)}     & 全网边长统计 \texttt{EdgeLengthStats} \\
+    & \texttt{mesh\_quality(mesh)}           & 全网质量汇总 \texttt{MeshQualityStats} \\
+  \midrule
+  \multirow{3}{*}{包围盒}
+    & \texttt{AABB}                          & 轴对齐包围盒结构体（\texttt{new/from\_points/extend/union}） \\
+    & \texttt{AABB::center / diagonal / is\_empty} & 中心、对角线长度、空判定 \\
+    & \texttt{mesh\_aabb(mesh)} / \texttt{mesh\_centroid(mesh)} & 整网包围盒 / 质心 \\
+  \midrule
+  \multirow{4}{*}{射线求交}
+    & \texttt{RayHit}                                 & 交点信息（位置、$t$、\texttt{FaceId}、重心坐标） \\
+    & \texttt{ray\_triangle\_intersection}            & Möller-Trumbore 三角形求交，返回 $(t,u,v)$ \\
+    & \texttt{ray\_mesh\_intersection}                & 最近交点 $O(F)$ \\
+    & \texttt{ray\_mesh\_intersects}                  & 奇偶判定内外（射线法） \\
+  \midrule
+  \multirow{2}{*}{整网度量}
+    & \texttt{surface\_area(mesh)}                    & 所有三角面面积之和 \\
+    & \texttt{mesh\_volume(mesh)}                     & 闭合网格有向体积（散度定理） \\
+  \midrule
+  \multirow{4}{*}{离散曲率}
+    & \texttt{VertexCurvature}                        & 顶点曲率信息（$K, H, \kappa_1, \kappa_2$） \\
+    & \texttt{gaussian\_curvature(mesh, v)}           & 高斯曲率 $K = (2\pi - \sum\theta)/A_\text{mixed}$ \\
+    & \texttt{mean\_curvature(mesh, v)}               & 平均曲率 $H = \|\Delta v\|/(2 A_\text{mixed})$ \\
+    & \texttt{principal\_curvatures(mesh, v)}         & 主曲率 $\kappa_{1,2} = H \pm \sqrt{H^2-K}$ \\
+    & \texttt{vertex\_curvature(mesh, v)}             & 一次调用返回上述四值 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{设计原则}
+
+\begin{itemize}
+  \item 大多数查询函数返回 \texttt{Option<T>}：若句柄失效或几何退化
+        （零面积、零长度），返回 \texttt{None} 而非 panic；
+        \texttt{point\_triangle\_distance} 因对任意输入均有定义，直接返回 \texttt{f64}；
+  \item 修改型函数（如 \texttt{laplacian\_smooth\_mesh}）先收集所有新位置到
+        \texttt{Vec}，再批量写回，避免「先更新的顶点影响后更新顶点」的顺序依赖；
+  \item 拓扑约定与 \texttt{traversal.rs} 一致：\texttt{HalfEdge.vertex} 是 tip，
+        \texttt{twin.vertex} 是 origin，面边界环按 \texttt{next} 顺序遍历，CCW 朝向。
+\end{itemize}
+
+\section{几何查询公式}
+
+\subsection{边长}
+
+设半边 $h$ 的两端 $A = h.\mathrm{twin}.\mathrm{vertex}$（origin），
+$B = h.\mathrm{vertex}$（tip），位置 $\vec{p}_A, \vec{p}_B$，则
+\[
+  L(h) = \|\vec{p}_B - \vec{p}_A\|_2.
+\]
+
+\subsection{三角面积与面法向}
+
+设面 $F$ 的三顶点位置 $\vec{A}, \vec{B}, \vec{C}$（按 CCW 顺序），定义边向量
+$\vec{e}_1 = \vec{B} - \vec{A}$，$\vec{e}_2 = \vec{C} - \vec{A}$，则
+\begin{align}
+  A(F) &= \tfrac{1}{2} \|\vec{e}_1 \times \vec{e}_2\|, \\
+  \hat{n}(F) &= \frac{\vec{e}_1 \times \vec{e}_2}{\|\vec{e}_1 \times \vec{e}_2\|}.
+\end{align}
+退化三角形（$\|\vec{e}_1 \times \vec{e}_2\| < 10^{-12}$）的 \texttt{face\_normal}
+返回 \texttt{None}。
+
+\subsection{最小内角}
+
+三内角分别由顶点 $A, B, C$ 处的两条边向量求出，取最小值：
+\[
+  \theta_{\min}(F) = \min\bigl(
+    \angle(\vec{AB}, \vec{AC}),\,
+    \angle(\vec{BA}, \vec{BC}),\,
+    \angle(\vec{CA}, \vec{CB})
+  \bigr),
+\]
+其中
+\[
+  \angle(\vec{u}, \vec{v}) = \arccos\!\left(\frac{\vec{u} \cdot \vec{v}}{\|\vec{u}\|\,\|\vec{v}\|}\right).
+\]
+
+\subsection{顶点法向（面积加权）}
+
+顶点 $v$ 的法向是其邻接面法向的面积加权平均：
+\[
+  \hat{n}_v = \frac{\displaystyle\sum_{f \in N(v)} A_f \cdot \hat{n}_f}
+                   {\displaystyle\left\| \sum_{f \in N(v)} A_f \cdot \hat{n}_f \right\|}.
+\]
+孤立顶点（无邻接面）或所有邻接面都退化时返回 \texttt{None}。
+
+\textbf{为何用面积加权？} 对均匀网格，面积加权等价于余切权重，且无需额外除零守卫；
+对非均匀网格，大面积面的法向贡献更大，符合视觉直觉。
+
+\section{拉普拉斯平滑}
+
+\subsection{统一权重公式}
+
+顶点 $v$ 的拉普拉斯位置（不修改网格）：
+\[
+  \vec{p}_v' = \frac{1}{|N(v)|} \sum_{u \in N(v)} \vec{p}_u,
+\]
+其中 $N(v)$ 是 $v$ 的邻接顶点集合。孤立顶点返回原位置。
+
+\subsection{整网显式迭代}
+
+\texttt{laplacian\_smooth\_mesh(mesh, $\lambda$, iterations)} 每次迭代使用显式更新：
+\[
+  \vec{p}_v \leftarrow (1 - \lambda)\, \vec{p}_v + \lambda\, \vec{p}_v',
+  \qquad \lambda \in (0, 1].
+\]
+
+\textbf{批量更新策略}：每次迭代先收集所有 $(v, \vec{p}_v')$ 到 \texttt{Vec}，
+再批量写回。这避免了 Jacobi 式顺序依赖：若边写边读，先更新的顶点会污染后更新顶点的
+邻居平均。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=9cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始迭代};
+  \node[proc, below=of s, fill=blue!8] (p1) {遍历所有 $v$：计算 $\vec{p}_v' = \frac{1}{|N(v)|}\sum \vec{p}_u$};
+  \node[proc, below=of p1, fill=yellow!15] (p2) {收集 $(v, \vec{p}_v')$ 到 \texttt{Vec}（不写回）};
+  \node[proc, below=of p2, fill=green!12] (p3) {遍历 \texttt{Vec}：$\vec{p}_v \leftarrow (1-\lambda)\vec{p}_v + \lambda \vec{p}_v'$};
+  \node[proc, below=of p3, fill=red!10] (p4) {迭代计数 $-1$；若 $>0$ 回到 p1};
+  \node[startend, below=of p4] (e) {结束};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}
+\end{center}
+
+\subsection{重心保留性}
+
+统一权重拉普拉斯平滑保留网格整体重心。证明：每轮迭代后总顶点和
+\[
+  \sum_v \vec{p}_v' = \sum_v \frac{1}{|N(v)|} \sum_{u \in N(v)} \vec{p}_u
+  = \sum_u \vec{p}_u \cdot \underbrace{\sum_{v \in N(u)} \frac{1}{|N(v)|}}_{\text{对 } u \text{ 的总权重}},
+\]
+对无向图，$\sum_{v \in N(u)} \frac{1}{|N(v)|}$ 关于 $u$ 对称求和后等于 1，故
+$\sum_v \vec{p}_v' = \sum_u \vec{p}_u$，重心不变。
+
+\section{点到三角形距离：Ericson 算法}
+
+\subsection{Voronoi 区域划分}
+
+将三角形所在平面划分为 7 个 Voronoi 区域：3 个顶点域（$V_A, V_B, V_C$）、
+3 条边域（$E_{AB}, E_{AC}, E_{BC}$）、1 个面域（$F$）。查询点 $P$ 在平面上的
+投影点所属区域决定最近点。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=5mm, inner sep=0pt, font=\footnotesize},
+  region/.style={font=\footnotesize, align=center}
+]
+  % 三角形顶点
+  \node[vert] (a) at (0,0) {$A$};
+  \node[vert] (b) at (5,0) {$B$};
+  \node[vert] (c) at (2.5,4) {$C$};
+  % 三角形边
+  \draw[thick] (a) -- (b) -- (c) -- (a);
+  % 区域标签
+  \node[region] at (2.5,1.3) {$F$（面域）};
+  \node[region] at (0.5,1.5) {$E_{AC}$};
+  \node[region] at (4.5,1.5) {$E_{BC}$};
+  \node[region] at (2.5,-0.5) {$E_{AB}$};
+  \node[region] at (-0.9,-0.9) {$V_A$};
+  \node[region] at (5.9,-0.9) {$V_B$};
+  \node[region] at (2.5,5.0) {$V_C$};
+  % 法向虚线
+  \draw[dashed, gray] (2.5,1.3) -- (2.5,-1.5);
+  \node[font=\scriptsize, gray] at (3.1,-1.2) {投影};
+\end{tikzpicture}
+\end{center}
+
+\subsection{判别流程}
+
+定义点积
+\begin{align*}
+  d_1 = \vec{AB} \cdot \vec{AP}, &\quad d_2 = \vec{AC} \cdot \vec{AP}, \\
+  d_3 = \vec{AB} \cdot \vec{BP}, &\quad d_4 = \vec{AC} \cdot \vec{BP}, \\
+  d_5 = \vec{AB} \cdot \vec{CP}, &\quad d_6 = \vec{AC} \cdot \vec{CP},
+\end{align*}
+以及叉积极性
+\[
+  v_a = d_3 d_6 - d_5 d_4,\quad
+  v_b = d_5 d_2 - d_1 d_6,\quad
+  v_c = d_1 d_4 - d_3 d_2.
+\]
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=8cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  term/.style={draw, rounded corners=2pt, fill=green!12, minimum width=4cm, minimum height=0.7cm, font=\small, align=center}
+]
+  \node[proc, fill=blue!8] (p0) {计算 $d_1 \dots d_6$ 与 $v_a, v_b, v_c$};
+  \node[dec, below=of p0] (d1) {$d_1 \le 0 \wedge d_2 \le 0$？};
+  \node[term, right=1.4cm of d1] (tA) {顶点域 $V_A$ \\ $\to \|\vec{AP}\|$};
+  \node[dec, below=of d1] (d2) {$d_3 \ge 0 \wedge d_4 \le d_3$？};
+  \node[term, right=1.4cm of d2] (tB) {顶点域 $V_B$ \\ $\to \|\vec{BP}\|$};
+  \node[dec, below=of d2] (d3) {$v_c \le 0 \wedge d_1 \ge 0 \wedge d_3 \le 0$？};
+  \node[term, right=1.4cm of d3] (tAB) {边域 $E_{AB}$ \\ $\to$ 投影到 $AB$};
+  \node[dec, below=of d3] (d4) {$d_6 \ge 0 \wedge d_5 \le d_6$？};
+  \node[term, right=1.4cm of d4] (tC) {顶点域 $V_C$ \\ $\to \|\vec{CP}\|$};
+  \node[dec, below=of d4] (d5) {$v_b \le 0 \wedge d_2 \ge 0 \wedge d_6 \le 0$？};
+  \node[term, right=1.4cm of d5] (tAC) {边域 $E_{AC}$};
+  \node[dec, below=of d5] (d6) {$v_a \le 0 \wedge (d_4-d_3) \ge 0 \wedge (d_5-d_6) \ge 0$？};
+  \node[term, right=1.4cm of d6] (tBC) {边域 $E_{BC}$};
+  \node[term, below=of d6, fill=green!18] (tF) {面域 $F$：重心坐标 \\ $(1-v-w, v, w)$, $v=v_b/\Sigma$, $w=v_c/\Sigma$};
+  \draw[op] (p0) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (tA);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (tB);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {否} (d3);
+  \draw[op] (d3) -- node[above, font=\scriptsize] {是} (tAB);
+  \draw[op] (d3) -- node[right, font=\scriptsize] {否} (d4);
+  \draw[op] (d4) -- node[above, font=\scriptsize] {是} (tC);
+  \draw[op] (d4) -- node[right, font=\scriptsize] {否} (d5);
+  \draw[op] (d5) -- node[above, font=\scriptsize] {是} (tAC);
+  \draw[op] (d5) -- node[right, font=\scriptsize] {否} (d6);
+  \draw[op] (d6) -- node[above, font=\scriptsize] {是} (tBC);
+  \draw[op] (d6) -- node[right, font=\scriptsize] {否} (tF);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{退化处理}
+
+若 $\Sigma = v_a + v_b + v_c$ 接近零（$< 10^{-20}$），三角形退化（共线），
+此时退化为三顶点最近距离：
+\[
+  d_{\min} = \min\bigl(\|\vec{AP}\|, \|\vec{BP}\|, \|\vec{CP}\|\bigr).
+\]
+
+\subsection{复杂度}
+
+$O(1)$，无循环、无开方（除最后一次距离计算）。
+
+\subsection{closest\_point\_on\_triangle：返回最近点}
+
+\texttt{closest\_point\_on\_triangle(p, a, b, c)} 与 \texttt{point\_triangle\_distance}
+同源（Ericson 5.1.5），但返回最近点本身 $\vec{P}^*$ 而非距离 $\|\vec{p} - \vec{P}^*\|$：
+\[
+  \vec{P}^* =
+  \begin{cases}
+    \vec{A} & \text{顶点域 } V_A \\
+    \vec{B} & \text{顶点域 } V_B \\
+    \vec{C} & \text{顶点域 } V_C \\
+    \vec{A} + v \cdot \vec{AB} & \text{边域 } E_{AB},\ v = \frac{\vec{AP}\cdot\vec{AB}}{\|\vec{AB}\|^2} \\
+    \vec{A} + w \cdot \vec{AC} & \text{边域 } E_{AC} \\
+    \vec{B} + w \cdot (\vec{C}-\vec{B}) & \text{边域 } E_{BC} \\
+    \vec{A} + v \vec{AB} + w \vec{AC} & \text{面域 } F,\ (v, w) = (v_b, v_c)/\Sigma
+  \end{cases}
+\]
+退化三角形（$\Sigma < 10^{-20}$）退化为最近顶点。
+
+\textbf{用途}：BVH 最近点查询、属性插值（重心坐标插值 UV/法向）等需要后续
+几何运算的场景。
+
+\section{射线求交：Möller-Trumbore}
+
+\subsection{三角形求交}
+
+设射线 $\vec{R}(t) = \vec{O} + t\vec{D}$，三角形顶点 $\vec{V}_0, \vec{V}_1, \vec{V}_2$，
+边向量 $\vec{E}_1 = \vec{V}_1 - \vec{V}_0$，$\vec{E}_2 = \vec{V}_2 - \vec{V}_0$。
+Möller-Trumbore 算法求解：
+\[
+  \vec{O} + t\vec{D} = (1 - u - v)\vec{V}_0 + u\vec{V}_1 + v\vec{V}_2.
+\]
+
+\begin{align}
+  \vec{P} &= \vec{D} \times \vec{E}_2 \\
+  \det &= \vec{E}_1 \cdot \vec{P} \\
+  u &= \frac{(\vec{O} - \vec{V}_0) \cdot \vec{P}}{\det} \\
+  \vec{Q} &= (\vec{O} - \vec{V}_0) \times \vec{E}_1 \\
+  v &= \frac{\vec{D} \cdot \vec{Q}}{\det} \\
+  t &= \frac{\vec{E}_2 \cdot \vec{Q}}{\det}
+\end{align}
+
+\textbf{接受条件}：$|\det| \ge 10^{-14}$，$u, v \in [0, 1]$，$u + v \le 1$，$t \ge 10^{-12}$。
+返回 \texttt{Some((t, u, v))}，否则 \texttt{None}。
+
+\subsection{网格求交}
+
+\texttt{ray\_mesh\_intersection} 遍历所有三角面，对每个调用 \texttt{ray\_triangle\_intersection}，
+保留 $t$ 最小者，封装为 \texttt{RayHit}：
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{字段} & \textbf{含义} \\
+  \midrule
+  \texttt{position} & 交点位置 $\vec{O} + t\vec{D}$ \\
+  \texttt{t}        & 参数 $t$（原点到交点距离） \\
+  \texttt{face}     & 相交的 \texttt{FaceId} \\
+  \texttt{barycentric} & 重心坐标 $(u, v)$，第三坐标 $= 1-u-v$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{复杂度}：$O(F)$（遍历所有面），无加速结构。
+
+\subsection{奇偶判定}
+
+\texttt{ray\_mesh\_intersects} 沿射线方向统计与三角面的交点数，
+\[
+  \text{inside}(O) \Leftrightarrow \#\{\text{hits}\} \bmod 2 = 1.
+\]
+假设网格闭合且法向一致。常用于点在网格内外判定。
+
+\section{整网度量：表面积与体积}
+
+\subsection{表面积}
+
+\[
+  S = \sum_{f \in F} \texttt{face\_area}(f).
+\]
+跳过退化面（\texttt{face\_area} 返回 \texttt{None}）。
+
+\subsection{有向体积（散度定理）}
+
+对闭合三角网格，散度定理给出：
+\[
+  V = \frac{1}{6} \sum_{f=(v_0, v_1, v_2)} \bigl[
+    \vec{v}_0 \cdot (\vec{v}_1 \times \vec{v}_2)
+  \bigr].
+\]
+
+\textbf{符号约定}：CCW 朝外面 → $V > 0$；非闭合网格结果无意义。
+等价于对每面有符号四面体体积求和。
+
+\section{离散曲率（Meyer et al. 2003）}
+
+\subsection{混合面积}
+
+对顶点 $v$ 的邻接三角形，按角度分类：
+
+\begin{itemize}
+  \item \textbf{非钝角}：使用 Voronoi 面积 $A_v = \frac{1}{8}\sum_j (\cot\alpha_j + \cot\beta_j)\|v_j - v\|^2$；
+  \item \textbf{$v$ 处钝角}：取三角形面积 $/ 2$；
+  \item \textbf{其他顶点处钝角}：取三角形面积 $/ 4$。
+\end{itemize}
+
+实现中若 Voronoi 项退化，回退为重心面积（三角形面积 $/ 3$）。
+最小面积阈值 $10^{-14}$ 防止除零。
+
+\subsection{高斯曲率}
+
+\[
+  K(v) = \frac{2\pi - \sum_{j} \theta_j}{A_{\text{mixed}}(v)},
+\]
+其中 $\theta_j$ 是 $v$ 处各三角形内角，$\sum \theta_j$ 为 $v$ 周围角度和。
+内部顶点 $K$ 在球面顶点接近 $1/r^2$，平面区域接近 $0$。
+\textbf{边界顶点返回 $0$}（无定义）。
+
+\subsection{平均曲率}
+
+利用余切拉普拉斯 $\Delta v$：
+\[
+  H(v) = \frac{\|\Delta v\|}{2 \, A_{\text{mixed}}(v)}.
+\]
+$\Delta v$ 由 \texttt{cotan\_laplacian} 计算。
+若 $\|\Delta v\| < 10^{-14}$，返回 $0$；\textbf{边界顶点返回 $0$}。
+
+\subsection{主曲率}
+
+由高斯与平均曲率反解：
+\[
+  \kappa_{1, 2} = H \pm \sqrt{H^2 - K}.
+\]
+若判别式 $H^2 - K < 0$（数值误差），取 $\kappa_1 = \kappa_2 = H$。
+
+\subsection{复杂度与退化守卫}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{复杂度} & \textbf{退化守卫} \\
+  \midrule
+  \texttt{gaussian\_curvature}  & $O(d_v)$ & 边界返回 0；面积 $< 10^{-14}$ 钳为 $10^{-14}$ \\
+  \texttt{mean\_curvature}      & $O(d_v)$ & $\|\Delta v\| < 10^{-14}$ 返回 0；边界返回 0 \\
+  \texttt{principal\_curvatures}& $O(d_v)$ & 判别式 $< 0$ 时取 $\kappa_1 = \kappa_2 = H$ \\
+  \texttt{vertex\_curvature}    & $O(d_v)$ & 综合上述三函数 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{高级平滑：Taubin 与 Bilateral}
+
+\subsection{Taubin $\lambda/\mu$ 双滤波}
+
+Taubin 1995 提出\textbf{双步滤波}：每轮迭代先正向（$\lambda$ 步）再负向（$\mu$ 步）拉普拉斯，
+\textbf{$|\mu| > \lambda$} 保证体积不收缩：
+\begin{align}
+  \vec{p}_v^{(k+1/2)} &= (1 - \lambda)\, \vec{p}_v^{(k)} + \lambda\, \vec{p}_v^{\prime(k)}, \\
+  \vec{p}_v^{(k+1)}   &= (1 - \mu)\, \vec{p}_v^{(k+1/2)} + \mu\, \vec{p}_v^{\prime(k+1/2)}.
+\end{align}
+\textbf{典型参数}：$\lambda = 0.5, \mu = -0.53$（接近最佳频率响应）。
+
+\paragraph{实现细节} \texttt{laplacian\_smooth\_mesh} 当 $\lambda \le 0$ 时早返，
+无法直接用于 $\mu$ 步（负值）。故内部使用\textbf{私有辅助}
+\texttt{laplacian\_step\_signed(mesh, lambda)}，不检查 $\lambda$ 符号，
+允许负值传递。\texttt{taubin\_smooth\_mesh} 对 $\lambda$ 与 $\mu$ 步都调用此辅助。
+
+\paragraph{与拉普拉斯平滑对比} 拉普拉斯平滑会持续收缩体积（每轮 $\approx 1\%$）；
+Taubin 双滤波在 $|\mu| > \lambda$ 时理论上保体积，实测体积变化 $\ll 1\%$。
+
+\subsection{双边滤波（Bilateral）}
+
+双边滤波在拉普拉斯基础上引入\textbf{空间权重}（$\sigma_c$）与\textbf{法向权重}（$\sigma_s$）：
+\[
+  \vec{p}_v' = \vec{p}_v + \frac{1}{W}\sum_{u \in N(v)}
+    \underbrace{\exp\!\left(-\frac{\|\vec{p}_u - \vec{p}_v\|^2}{2\sigma_c^2}\right)}_{\text{空间权重}}
+    \cdot \underbrace{\exp\!\left(-\frac{\langle \vec{n}_v, \vec{p}_u - \vec{p}_v \rangle^2}{2\sigma_s^2}\right)}_{\text{法向权重}}
+    \cdot (\vec{p}_u - \vec{p}_v),
+\]
+其中 $W = \sum_u w_c \cdot w_s$。
+
+\begin{itemize}
+  \item \textbf{$\sigma_c$}：空间尺度，控制邻域影响范围。设为平均边长 $\bar{L}$ 时最佳；
+  \item \textbf{$\sigma_s$}：法向尺度，控制特征保持。设为顶点到切平面距离的标准差；
+  \item \textbf{特征保持}：跨过尖锐特征（二面角大）的顶点对法向差异大，$w_s$ 衰减快，
+        平滑几乎不传播。这使双边滤波\textbf{能磨平噪声但保留特征边}。
+\end{itemize}
+
+\paragraph{实现细节} 内部调用 \texttt{vertex\_normal} 计算每个顶点法向；
+\texttt{length}（不是 \texttt{norm}）计算向量长度。零次迭代直接返回原网格。
+
+\section{网格质量度量}
+
+\subsection{单面度量}
+
+\paragraph{长宽比 \texttt{face\_aspect\_ratio}}
+\[
+  r_{\text{aspect}}(f) = \frac{L_{\max}}{L_{\min}},
+\]
+其中 $L_{\max}$ 与 $L_{\min}$ 是三角形三边长的最大 / 最小值。
+\textbf{等边三角形} $r = 1$；退化三角形（任一边长 $< 10^{-14}$）返回 \texttt{None}。
+
+\paragraph{半径比 \texttt{face\_radius\_ratio}}
+\[
+  r_{\text{radius}}(f) = \frac{8(s-a)(s-b)(s-c)}{abc}, \quad
+  s = \frac{a+b+c}{2},
+\]
+其中 $a, b, c$ 是三边长，$s$ 是半周长。
+\textbf{归一化到 $[0, 1]$}：等边三角形 $r = 1$；退化三角形 $r = 0$。
+此度量同时反映形状与面积分布，是工程上最常用的三角形质量度量。
+
+\subsection{全网度量}
+
+\paragraph{\texttt{EdgeLengthStats}} 全网边长统计：
+\begin{lstlisting}
+pub struct EdgeLengthStats {
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    pub variance: f64,
+    pub count: usize,
+}
+impl EdgeLengthStats {
+    pub fn std_dev(&self) -> f64 { self.variance.sqrt() }
+    pub fn ratio(&self) -> f64   { self.max / self.min }
+}
+\end{lstlisting}
+\textbf{用途}：各向同性重网格化（\texttt{isotropic\_remesh}）的目标边长设定、
+网格质量诊断。
+
+\paragraph{\texttt{MeshQualityStats}} 全网质量汇总：
+\begin{itemize}
+  \item 各面 \texttt{aspect\_ratio} 与 \texttt{radius\_ratio} 的最小 / 最大 / 均值；
+  \item 边长统计 \texttt{EdgeLengthStats}；
+  \item 总面数、总顶点数。
+\end{itemize}
+\texttt{mesh\_quality(mesh)} 一次调用返回上述全部信息，
+便于在细分 / 简化 / 重网格化后做质量诊断。
+
+\subsection{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{复杂度} & \textbf{退化守卫} \\
+  \midrule
+  \texttt{face\_aspect\_ratio}    & $O(1)$ & 任一边长 $< 10^{-14}$ 返回 \texttt{None} \\
+  \texttt{face\_radius\_ratio}    & $O(1)$ & 同上 \\
+  \texttt{edge\_length\_stats}    & $O(E)$ & 空网格 \texttt{count = 0} \\
+  \texttt{mesh\_quality}          & $O(F + E)$ & 空网格返回 \texttt{MeshQualityStats::default()} \\
+  \texttt{taubin\_smooth\_mesh}   & $O(V \cdot d_v \cdot N)$ & 0 次迭代直接返回 \\
+  \texttt{bilateral\_smooth\_mesh}& $O(V \cdot d_v \cdot N)$ & 0 次迭代直接返回 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫汇总}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{edge\_length}         & 顶点缺失 / twin 缺失 & 返回 \texttt{None} \\
+  \texttt{face\_normal}         & 叉积长度 $< 10^{-12}$ & 返回 \texttt{None} \\
+  \texttt{face\_min\_angle}     & 边向量长度 $< 10^{-12}$ & 该角返回 $0$ \\
+  \texttt{vertex\_normal}       & 累加向量长度 $< 10^{-12}$ & 返回 \texttt{None} \\
+  \texttt{normalize}（内部）    & 输入长度 $< 10^{-12}$ & 返回原向量 \\
+  \texttt{point\_triangle\_distance} & $\Sigma < 10^{-20}$ & 退化为顶点距离 \\
+  \texttt{closest\_point\_on\_triangle} & $\Sigma < 10^{-20}$ & 退化为最近顶点 \\
+  \texttt{face\_aspect\_ratio}  & 任一边长 $< 10^{-14}$ & 返回 \texttt{None} \\
+  \texttt{face\_radius\_ratio}  & 任一边长 $< 10^{-14}$ & 返回 0 \\
+  \texttt{edge\_length\_stats}  & 空网格 & \texttt{count = 0}，其余字段为 NaN \\
+  \texttt{taubin\_smooth\_mesh} & 0 次迭代 & 直接返回原网格 \\
+  \texttt{bilateral\_smooth\_mesh} & 0 次迭代 & 直接返回原网格 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{edge\_length\_basic}                       & 单位三角形边长 $= 1$ 与 $\sqrt{2}$ \\
+  \texttt{edge\_length\_invalid\_returns\_none}      & 无效句柄返回 \texttt{None} \\
+  \texttt{face\_area\_unit\_triangle}                & 面积 $= 0.5$ \\
+  \texttt{face\_normal\_ccw\_points\_up}             & CCW 朝向 $+z$ \\
+  \texttt{vertex\_normal\_corner\_of\_triangle}      & 单三角形顶点法向 $= +z$ \\
+  \texttt{face\_min\_angle\_unit\_triangle}          & 等腰直角三角形 $\theta_{\min} = \pi/4$ \\
+  \texttt{face\_min\_angle\_equilateral}             & 等边三角形 $\theta_{\min} = \pi/3$ \\
+  \texttt{laplacian\_smooth\_vertex\_isolated\_returns\_original} & 孤立顶点返回原位置 \\
+  \texttt{laplacian\_smooth\_vertex\_two\_neighbors} & 邻居平均位置正确 \\
+  \texttt{laplacian\_smooth\_mesh\_preserves\_centroid} & 整网平滑保留重心 \\
+  \texttt{point\_triangle\_distance\_*}（4 项）      & 面域 / 上方 / 顶点域 / 边域 \\
+  \texttt{degenerate\_face\_returns\_none\_for\_normal} & 共线三角形法向 \texttt{None} \\
+  \texttt{aabb\_unit\_triangle}                     & 单位三角形 AABB 包围盒 \\
+  \texttt{aabb\_empty\_mesh}                        & 空网格 AABB 不 panic \\
+  \texttt{aabb\_center\_and\_diagonal}              & AABB 中心与对角线正确 \\
+  \texttt{aabb\_on\_icosphere}                      & icosphere AABB 范围 $[-1,1]^3$ \\
+  \texttt{centroid\_basic}                          & 网格质心计算 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{射线求交}} \\
+  \texttt{ray\_triangle\_hit}                       & 单位三角形 $t = 2$、$u = v = 0.5$ \\
+  \texttt{ray\_triangle\_miss\_parallel}            & 射线与三角形平行返回 \texttt{None} \\
+  \texttt{test\_ray\_mesh\_intersects}              & icosphere 内部点判定为 \texttt{true} \\
+  \texttt{test\_ray\_mesh\_intersection\_icosphere} & 沿 $+z$ 射线击中北极面，\texttt{face} 有效 \\
+  \texttt{test\_ray\_mesh\_intersection\_miss}      & 远离网格的射线返回 \texttt{None} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{整网度量}} \\
+  \texttt{surface\_area\_icosphere}                 & icosphere 表面积 $\approx 4\pi$ \\
+  \texttt{volume\_icosphere}                        & icosphere 体积 $\approx \frac{4}{3}\pi$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{离散曲率}} \\
+  \texttt{gaussian\_curvature\_icosphere}           & 球面顶点 $K \approx 1/r^2$ \\
+  \texttt{mean\_curvature\_icosphere}               & 球面顶点 $H \approx 1/r$ \\
+  \texttt{principal\_curvatures\_nonzero}           & $\kappa_1, \kappa_2 > 0$ 且 $\kappa_1 \approx \kappa_2$ \\
+  \texttt{vertex\_curvature\_struct}                & \texttt{VertexCurvature} 四字段一致 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{网格质量度量}} \\
+  \texttt{aspect\_ratio\_equilateral\_is\_one}      & 等边三角形 $r_{\text{aspect}} = 1$ \\
+  \texttt{aspect\_ratio\_degenerate\_returns\_none} & 退化三角形返回 \texttt{None} \\
+  \texttt{radius\_ratio\_equilateral\_is\_one}      & 等边三角形 $r_{\text{radius}} = 1$ \\
+  \texttt{radius\_ratio\_degenerate\_is\_zero}      & 退化三角形返回 0 \\
+  \texttt{edge\_length\_stats\_icosphere\_consistent} & icosphere 边长统计合理 \\
+  \texttt{mesh\_quality\_icosphere\_returns\_finite\_stats} & 全网质量统计有限 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{高级平滑}} \\
+  \texttt{taubin\_smooth\_preserves\_volume\_better\_than\_laplacian} & Taubin 体积收缩远小于拉普拉斯 \\
+  \texttt{bilateral\_smooth\_runs\_on\_icosphere}   & 双边滤波在 icosphere 上可运行 \\
+  \texttt{taubin\_smooth\_zero\_iterations\_is\_noop} & 0 次迭代不变网格 \\
+  \texttt{bilateral\_smooth\_zero\_iterations\_is\_noop} & 0 次迭代不变网格 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/geometry.rs} 共 \textbf{41 个}单元测试，全库共 \textbf{371 个}。
+
+\end{document}

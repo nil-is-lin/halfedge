@@ -1,0 +1,427 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: BVH 加速结构模块设计文档} \\ \large \texttt{src/bvh.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{bvh.rs} 在 \texttt{geometry.rs} 之上叠加\textbf{空间加速结构}能力，
+将射线求交与最近点查询从 $O(F)$ 暴力扫描降到平均 $O(\log F)$。
+对大网格（$> 10^3$ 面）有数量级加速，对小网格（$< 64$ 面）BVH 自身常数
+开销可能让它略慢于暴力。
+
+\textbf{核心 API}：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{2}{*}{构建}
+    & \texttt{Bvh::new()}                  & 创建空 BVH \\
+    & \texttt{Bvh::build(\&mesh)}          & 从网格构建（仅三角面），返回 \texttt{Bvh} \\
+  \midrule
+  \multirow{2}{*}{查询}
+    & \texttt{bvh.ray\_intersection(o, d, \&mesh)} & 射线求最近交点，返回 \texttt{Option<RayHit>} \\
+    & \texttt{bvh.nearest\_point(p, \&mesh)}      & 网格表面最近点，返回 \texttt{(FaceId, [f64;3], f64)} \\
+  \midrule
+  \multirow{3}{*}{统计}
+    & \texttt{bvh.node\_count() / leaf\_count() / depth()} & 节点数 / 叶子数 / 树深 \\
+    & \texttt{bvh.is\_empty()}                                & 是否无三角面 \\
+    & \texttt{LEAF\_MAX\_FACES}（常量 = 8）                   & 叶子节点最大面数 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{数据结构}
+
+BVH 是一棵二叉树，节点统一表示为 \texttt{BvhNode}：
+
+\begin{lstlisting}
+struct BvhNode {
+    aabb: AABB,                 // 节点合并包围盒
+    left: Option<usize>,        // 内部节点：左子索引
+    right: Option<usize>,       // 内部节点：右子索引
+    faces: Vec<FaceId>,         // 叶子节点：面 ID 列表
+}
+\end{lstlisting}
+
+\begin{itemize}
+  \item \textbf{内部节点}：\texttt{left} 与 \texttt{right} 都为 \texttt{Some}，
+        \texttt{faces} 为空；
+  \item \textbf{叶子节点}：\texttt{left} 与 \texttt{right} 都为 \texttt{None}，
+        \texttt{faces} 非空；
+  \item \texttt{is\_leaf()} 通过 \texttt{left.is\_none() \&\& right.is\_none()} 判定。
+\end{itemize}
+
+\texttt{Bvh} 持有 \texttt{nodes: Vec<BvhNode>} 与 \texttt{root: Option<usize>}，
+全部节点存储在连续 \texttt{Vec} 中（cache-friendly）。
+
+\section{构建算法}
+
+\subsection{整体流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. 收集每面 \texttt{(FaceId, AABB, center)}（跳过非三角 / 退化）};
+  \node[dec, below=of p1] (d1) {prims 为空？};
+  \node[proc, right=2.0cm of d1, fill=red!10] (empty) {返回空 \texttt{Bvh}};
+  \node[proc, below=of d1, fill=blue!8] (p2) {2. 调用 \texttt{build\_recursive(prims, nodes)}};
+  \node[startend, below=of p2] (e) {返回 \texttt{Bvh}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (empty);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (p2);
+  \draw[op] (p2) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{递归分裂}
+
+\texttt{build\_recursive} 对当前 \texttt{prims} 列表：
+
+\begin{enumerate}
+  \item 计算 \textbf{节点 AABB}：所有 primitive AABB 的合并；
+  \item \textbf{终止条件}：若 $|\text{prims}| \le \texttt{LEAF\_MAX\_FACES} = 8$，
+        创建叶子节点（保存面 ID 列表）并返回；
+  \item \textbf{选择最长轴}：计算 AABB 对角线 $\vec{d}$，取
+        $\text{axis} = \arg\max_i d_i$；
+  \item \textbf{按面中心排序}：\texttt{prims.sort\_by} 按 $\text{center[axis]}$ 升序；
+  \item \textbf{中位数划分}：\texttt{mid = prims.len() / 2}，
+        \texttt{right\_prims = prims.split\_off(mid)}；
+  \item \textbf{占位父节点}：先 \texttt{push} 父节点（\texttt{left/right = None}），
+        再递归构建左右子树，最后回填索引。
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {进入 build\_recursive};
+  \node[proc, below=of s, fill=blue!8] (p1) {计算节点 AABB（合并所有 primitive）};
+  \node[proc, below=of p1, fill=yellow!15] (p2) {$|\text{prims}| \le 8$？创建叶子返回};
+  \node[proc, below=of p2, fill=blue!8] (p3) {选最长轴 axis $= \arg\max_i d_i$};
+  \node[proc, below=of p3, fill=blue!8] (p4) {按 center[axis] 排序 prims};
+  \node[proc, below=of p4, fill=blue!8] (p5) {mid $= |\text{prims}| / 2$；right $\gets$ prims.split\_off(mid)};
+  \node[proc, below=of p5, fill=green!12] (p6) {占位父节点；递归 left $=$ build\_recursive(prims)};
+  \node[proc, below=of p6, fill=green!12] (p7) {递归 right $=$ build\_recursive(right\_prims)};
+  \node[proc, below=of p7, fill=green!18] (p8) {回填 nodes[idx].left / right};
+  \node[startend, below=of p8] (e) {返回 idx};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (p7);
+  \draw[op] (p7) -- (p8);
+  \draw[op] (p8) -- (e);
+\end{tikzpicture}
+\end{center}
+
+\subsection{退化守卫}
+
+构建时跳过：
+\begin{itemize}
+  \item 非三角面（边界环长度 $\ne 3$）；
+  \item 顶点缺失的面；
+  \item 退化三角形（AABB 对角线 $< 10^{-14}$，含重复顶点或共线顶点）。
+\end{itemize}
+
+\subsection{复杂度}
+
+\begin{itemize}
+  \item 时间：$O(F \log F)$（每层 $O(F)$ 排序，共 $\log F$ 层）；
+  \item 空间：$O(F)$（节点数 $\le 2F - 1$，满二叉树上限）；
+  \item 树深：平均 $O(\log F)$，最坏 $O(F)$（极端退化输入）。
+\end{itemize}
+
+\section{射线-AABB 求交：Slab 法}
+
+\subsection{公式}
+
+AABB 由 \texttt{min} / \texttt{max} 三对值定义。对每个轴 $i \in \{x, y, z\}$，
+slab 范围是 $[\text{min}_i, \text{max}_i]$。射线 $\vec{R}(t) = \vec{O} + t\vec{D}$
+在轴 $i$ 上的进入/退出参数：
+\[
+  t_i^{\min} = \frac{\text{min}_i - O_i}{D_i}, \quad
+  t_i^{\max} = \frac{\text{max}_i - O_i}{D_i},
+\]
+若 $t_i^{\min} > t_i^{\max}$ 互换。
+
+\textbf{相交条件}：
+\[
+  t_{\text{enter}} = \max_i \min(t_i^{\min}, t_i^{\max}), \quad
+  t_{\text{exit}}  = \min_i \max(t_i^{\min}, t_i^{\max}),
+\]
+\[
+  t_{\text{enter}} \le t_{\text{exit}} \quad \wedge \quad t_{\text{exit}} \ge 0.
+\]
+
+\subsection{平行 slab 处理}
+
+若 $|D_i| < 10^{-14}$（射线与 slab 平行），则需 $O_i \in [\text{min}_i, \text{max}_i]$，
+否则不相交。
+
+\subsection{返回值}
+
+返回 \texttt{Option<(t\_enter, t\_exit)>}：
+\begin{itemize}
+  \item \texttt{t\_enter}：射线进入 AABB 的参数（可为负，原点在 AABB 内时）；
+  \item \texttt{t\_exit}：射线离开 AABB 的参数。
+\end{itemize}
+
+\section{射线-网格求交（BVH 加速）}
+
+\subsection{递归算法}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {进入 ray\_recursive(node)};
+  \node[dec, below=of s] (d1) {ray\_aabb 命中？};
+  \node[proc, right=2.0cm of d1, fill=red!10] (miss) {剪枝返回};
+  \node[dec, below=of d1] (d2) {$t_{\text{enter}} > \text{best\_t}$？};
+  \node[proc, right=2.0cm of d2, fill=red!10] (prune) {剪枝返回};
+  \node[dec, below=of d2] (d3) {是叶子？};
+  \node[proc, right=2.0cm of d3, fill=green!12] (leaf) {对每个面调用 M\"oller-Trumbore；更新 best};
+  \node[proc, below=of d3, fill=blue!8] (inner) {选最近 AABB 优先；递归 first / second};
+  \node[startend, below=of inner] (e) {返回};
+  \draw[op] (s) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {否} (miss);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {是} (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (prune);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {否} (d3);
+  \draw[op] (d3) -- node[above, font=\scriptsize] {是} (leaf);
+  \draw[op] (d3) -- node[right, font=\scriptsize] {否} (inner);
+  \draw[op] (inner) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{剪枝条件}
+
+\begin{enumerate}
+  \item \textbf{AABB 剪枝}：射线与节点 AABB 不相交 → 整个子树跳过；
+  \item \textbf{距离剪枝}：当前已知最近交点 \texttt{best\_t} 小于 AABB 进入参数
+        \texttt{t\_enter} → 子树不可能产生更近交点；
+  \item \textbf{叶子求交}：对叶子节点内的每个面调用
+        \texttt{ray\_triangle\_intersection}（M\"oller-Trumbore），
+        更新 \texttt{best} 为 $t$ 最小者。
+\end{enumerate}
+
+\subsection{子节点访问顺序}
+
+内部节点的两个子节点都先计算 \texttt{ray\_aabb} 的 \texttt{t\_enter}，
+\textbf{优先访问 t 较小者}。这样后续子树访问时 \texttt{best\_t} 已被更新为更紧的上界，
+剪枝效率更高。
+
+\subsection{复杂度}
+
+平均 $O(\log F)$；最坏 $O(F)$（射线擦过大量 AABB）。
+
+\section{最近点查询（BVH 加速）}
+
+\subsection{点-AABB 最近距离平方}
+
+对查询点 $\vec{P}$ 与 AABB：
+\[
+  d^2(\vec{P}, \text{AABB}) = \sum_{i} \max(0, \text{min}_i - P_i)^2 + \max(0, P_i - \text{max}_i)^2.
+\]
+点在 AABB 内时距离为 0。
+
+\subsection{递归算法}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {进入 nearest\_recursive(node)};
+  \node[proc, below=of s, fill=blue!8] (p1) {计算 $d^2_{\text{aabb}} = $ point\_aabb\_distance\_sq};
+  \node[dec, below=of p1] (d1) {$d^2_{\text{aabb}} > \text{best\_d}^2$？};
+  \node[proc, right=2.0cm of d1, fill=red!10] (prune) {剪枝返回};
+  \node[dec, below=of d1] (d2) {是叶子？};
+  \node[proc, right=2.0cm of d2, fill=green!12] (leaf) {对每个面调用 closest\_point\_on\_triangle；更新 best};
+  \node[proc, below=of d2, fill=blue!8] (inner) {按 AABB 距离升序访问子节点};
+  \node[startend, below=of inner] (e) {返回};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (prune);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (leaf);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {否} (inner);
+  \draw[op] (inner) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{剪枝条件}
+
+\textbf{AABB 距离剪枝}：若节点 AABB 的最近距离平方
+$d^2_{\text{aabb}}$ 大于当前已知最近距离平方 $\text{best\_d}^2$，
+则该子树不可能产生更近的交点 → 剪枝。
+
+\textbf{子节点访问顺序}：内部节点的两个子节点都先计算 \texttt{point\_aabb\_distance\_sq}，
+\textbf{按距离升序访问}。先访问近的子树，使 \texttt{best\_d} 更紧，剪枝更高效。
+
+\subsection{复杂度}
+
+平均 $O(\log F)$；最坏 $O(F)$（查询点周围面密度极高）。
+
+\section{与暴力算法的关系}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{操作} & \textbf{暴力（geometry.rs）} & \textbf{BVH（bvh.rs）} & \textbf{加速比（大网格）} \\
+  \midrule
+  射线求交   & \texttt{ray\_mesh\_intersection} $O(F)$ & \texttt{bvh.ray\_intersection} $O(\log F)$ & $\sim F / \log F$ \\
+  最近点     & 遍历面 + \texttt{point\_triangle\_distance} $O(F)$ & \texttt{bvh.nearest\_point} $O(\log F)$ & $\sim F / \log F$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{何时用 BVH}：
+\begin{itemize}
+  \item 网格 $> 10^3$ 面，且需多次射线 / 最近点查询；
+  \item BVH 构建开销 $O(F \log F)$，单次查询摊销下值得。
+\end{itemize}
+
+\textbf{何时用暴力}：
+\begin{itemize}
+  \item 网格 $< 64$ 面，BVH 常数开销不划算；
+  \item 仅需一次或几次查询，构建开销无法摊销。
+\end{itemize}
+
+\section{退化守卫汇总}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{Bvh::build}            & 空网格 / 无三角面 & 返回空 \texttt{Bvh}（\texttt{root = None}） \\
+  \texttt{Bvh::build}            & 退化三角形（共线 / 重复顶点） & 跳过该面 \\
+  \texttt{ray\_intersection}     & 空 BVH & 返回 \texttt{None} \\
+  \texttt{nearest\_point}        & 空 BVH & 返回 \texttt{None} \\
+  \texttt{ray\_aabb}             & 射线与 slab 平行 & 检查原点是否在 slab 内 \\
+  \texttt{ray\_aabb}             & AABB 在射线反方向 & \texttt{t\_exit < 0} 返回 \texttt{None} \\
+  \texttt{point\_aabb\_distance\_sq} & 点在 AABB 内 & 返回 0 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{构建}} \\
+  \texttt{build\_empty\_mesh}                         & 空网格 BVH 为空 \\
+  \texttt{build\_two\_triangles\_basic}               & 2 面 $\le 8$ → 单叶子节点 \\
+  \texttt{large\_mesh\_bvh\_depth\_is\_logarithmic}   & icosphere(3) 80 面 BVH 深度 $\le 12$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{射线求交}} \\
+  \texttt{ray\_hit\_first\_triangle}                  & 射线命中第一个三角形 \\
+  \texttt{ray\_hit\_second\_triangle\_when\_first\_missed} & 射线只命中第二个三角形 \\
+  \texttt{ray\_miss\_returns\_none}                   & 远离网格的射线返回 \texttt{None} \\
+  \texttt{ray\_returns\_nearest\_hit}                 & icosphere 球面命中半径 $\approx 1$ \\
+  \texttt{icosphere\_bvh\_consistent\_with\_brute\_force\_ray} & BVH 与暴力算法 $t$ 一致 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{最近点}} \\
+  \texttt{nearest\_point\_on\_triangle\_returns\_vertex} & 远点最近点为顶点 \\
+  \texttt{nearest\_point\_inside\_triangle}           & 三角形上方点投影到面 \\
+  \texttt{nearest\_point\_far\_away\_picks\_closer\_triangle} & 选择更近的三角形 \\
+  \texttt{icosphere\_bvh\_consistent\_with\_brute\_force\_nearest} & BVH 与暴力最近距离一致 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{辅助函数}} \\
+  \texttt{ray\_aabb\_basic\_hit}                      & 射线-AABB 命中 / 未命中 \\
+  \texttt{ray\_aabb\_parallel\_slab}                  & 平行 slab 边界条件 \\
+  \texttt{point\_aabb\_distance\_basic}               & 点-AABB 距离（内部 / 角落 / 面外） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/bvh.rs} 共 \textbf{15 个}单元测试，全库共 \textbf{371 个}。
+
+\end{document}

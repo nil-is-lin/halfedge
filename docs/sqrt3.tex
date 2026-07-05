@@ -1,0 +1,390 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: √3 细分模块设计文档} \\ \large \texttt{src/subdiv/sqrt3.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{sqrt3.rs} 在 \texttt{traversal.rs}、\texttt{io.rs} 之上叠加
+\textbf{基于 √3（Sqrt3）细分的网格光滑}能力。参考 Kobbelt 2000
+\textit{A Variable Approximation Approach for Iterative Mesh Simplification}。
+
+与 Loop 细分（4× 面增长）相比，√3 细分每次面数增长 3 倍，在渐进式细分中
+提供更细粒度的控制，是 Loop 的重要补充。
+
+\subsection{核心 API}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{8.5cm}@{}}
+  \toprule
+  \textbf{API} & \textbf{语义} \\
+  \midrule
+  \texttt{sqrt3\_subdivide(\&mesh)} & √3 细分一次，返回新网格，$F'=3F$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{依赖关系}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{依赖模块} & \textbf{用途} \\
+  \midrule
+  \texttt{storage} & \texttt{MeshStorage} 容器 \\
+  \texttt{io} & \texttt{build\_mesh\_from\_vertices\_and\_faces}（构建新网格） \\
+  \texttt{traversal} & \texttt{FaceHalfEdges}、\texttt{VertexRing}、\texttt{is\_boundary\_vertex} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{算法概述}
+
+√3 细分是\textbf{插值型}细分方案，分三步：
+
+\begin{enumerate}
+  \item \textbf{面点插入}：每个三角面插入重心 $c_f = \frac{v_0+v_1+v_2}{3}$；
+  \item \textbf{边翻转}：每条原始内部边 $(v_0, v_1)$ 翻转为连接两侧面点 $(c_1, c_2)$；
+        原始边界边保留 fan 三角形；
+  \item \textbf{顶点松弛}：内部顶点按 $\alpha_n$ 权重松弛，边界顶点保持原位置。
+\end{enumerate}
+
+\section{面点（Face Point）}
+
+每个三角面 $f = (v_0, v_1, v_2)$ 的面点为重心：
+$$
+  c_f = \frac{v_0 + v_1 + v_2}{3}
+$$
+
+与 Catmull-Clark（所有顶点平均）不同，√3 仅使用三角面的三个顶点。
+
+\section{边翻转（Edge Flip）}
+
+\subsection{内部边}
+
+设原始内部边 $h$：$v_0 \to v_1$，所在面 $f_1$（面点 $c_1$）；
+twin：$v_1 \to v_0$，所在面 $f_2$（面点 $c_2$）。
+
+fan 阶段两个三角形 $(v_0, v_1, c_1)$ 和 $(v_1, v_0, c_2)$ 被替换为翻转后的
+两个三角形：
+$$
+  (v_0, c_2, c_1), \quad (v_1, c_1, c_2)
+$$
+两者均为 CCW 朝向（见下文方向推导）。
+
+\subsection{边界边}
+
+原始边界边 $h$：$v_0 \to v_1$，所在面 $f$（面点 $c$）；twin 无面。
+fan 三角形 $(v_0, v_1, c)$ 保留（无法翻转）。
+
+\subsection{翻转后三角形的方向推导}
+
+设 $h$：$v_0 \to v_1$，face $f_1 = (v_0, v_1, v_2)$ CCW（$v_2$ 在边左侧），
+twin face $f_2 = (v_1, v_0, v_3)$ CCW（$v_3$ 在边右侧）。
+$c_1$ 在 $f_1$ 内（左侧），$c_2$ 在 $f_2$ 内（右侧）。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=6mm, inner sep=0pt, font=\small},
+  fp/.style={circle, draw=red!70!black, fill=red!10, minimum size=6mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  newhe/.style={-Stealth, thick, draw=red!70!black},
+  lab/.style={font=\footnotesize}
+]
+  % 左图：翻转前
+  \node[vert] (v0a) at (0,0) {$v_0$};
+  \node[vert] (v1a) at (2,0) {$v_1$};
+  \node[vert] (v2a) at (1.5,1.5) {$v_2$};
+  \node[vert] (v3a) at (0.5,-1.5) {$v_3$};
+  \node[fp] (c1a) at (1.2,0.5) {$c_1$};
+  \node[fp] (c2a) at (0.8,-0.5) {$c_2$};
+  \draw[he] (v0a) -- node[lab,above]{$h$} (v1a);
+  \draw[he] (v1a) -- (v2a);
+  \draw[he] (v2a) -- (v0a);
+  \draw[he] (v1a) -- (v3a);
+  \draw[he] (v3a) -- (v0a);
+  \draw[newhe] (v0a) -- (c1a);
+  \draw[newhe] (c1a) -- (v1a);
+  \draw[newhe] (v1a) -- (c2a);
+  \draw[newhe] (c2a) -- (v0a);
+  \node[below=1.8cm of v0a, xshift=1cm, font=\small] {翻转前：fan（4 三角形）};
+
+  % 右图：翻转后
+  \node[vert] (v0b) at (5,0) {$v_0$};
+  \node[vert] (v1b) at (7,0) {$v_1$};
+  \node[fp] (c1b) at (6.2,0.5) {$c_1$};
+  \node[fp] (c2b) at (5.8,-0.5) {$c_2$};
+  \draw[newhe] (v0b) -- (c2b);
+  \draw[newhe] (c2b) -- (c1b);
+  \draw[newhe] (c1b) -- (v0b);
+  \draw[newhe] (v1b) -- (c1b);
+  \draw[newhe] (c1b) -- (c2b);
+  \draw[newhe] (c2b) -- (v1b);
+  \node[below=1.5cm of v0b, xshift=1cm, font=\small] {翻转后：2 三角形（$v_0,c_2,c_1$）+（$v_1,c_1,c_2$）};
+\end{tikzpicture}
+\end{center}
+
+\textbf{方向验证}（以 $v_0$ 处三角形为例）：
+取 $v_0=(0,0)$, $v_1=(1,0)$, $v_2=(0.5, 0.866)$, $v_3=(0.5, -0.866)$,
+则 $c_1=(0.5, 0.289)$（上）, $c_2=(0.5, -0.289)$（下）。
+三角形 $(v_0, c_2, c_1)$ 的叉积 $(c_2-v_0)\times(c_1-v_0) = 0.289 > 0$，故 CCW。✓
+
+\section{顶点松弛}
+
+\subsection{内部顶点}
+
+内部顶点 $v$（valence $= n$）的新位置：
+$$
+  v' = (1 - \alpha_n)\, v + \frac{\alpha_n}{n} \sum_{j=1}^{n} v_j
+$$
+其中 $v_j$ 为原始 1-ring 邻居顶点（旧位置），权重：
+$$
+  \alpha_n = \frac{4 - 2\cos(2\pi/n)}{9}
+$$
+
+\textbf{正则点}（$n=6$）：$\alpha_6 = \frac{4 - 2\cos(\pi/3)}{9} = \frac{3}{9} = \frac{1}{3}$。
+
+\textbf{度数 3}（$n=3$）：$\alpha_3 = \frac{4 - 2\cos(2\pi/3)}{9} = \frac{5}{9}$。
+
+\subsection{边界顶点}
+
+边界顶点保持原位置（简化处理；原始论文使用三次样条，此处略）。
+
+\section{规模变化}
+
+设原始网格有 $V$ 顶点、$E$ 边、$F$ 面：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lcc@{}}
+  \toprule
+  \textbf{量} & \textbf{公式} & \textbf{说明} \\
+  \midrule
+  $V'$ & $V + F$ & 原始顶点 + 面点 \\
+  $F'$ & $3F$ & 内部边贡献 2 三角形 + 边界边贡献 1 三角形 \\
+  $E'$（闭合） & $\tfrac{9F}{2}$ & 闭合三角网格 $3F' = 2E'$，故 $E' = 9F/2$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{闭合网格验证}（闭合三角网格）：
+$V' = V + F$，$F' = 3F$，$E' = 3F'/2 = 9F/2$。
+$$
+  V' - E' + F' = (V + F) - \tfrac{9F}{2} + 3F = V + 4F - \tfrac{9F}{2} = V - \tfrac{F}{2}
+$$
+由 $V - 3F/2 + F = 2$ 得 $V - F/2 = 2$，故 $V' - E' + F' = 2$。✓
+Euler 示性数保持不变。
+
+\subsection{示例：icosphere(0)}
+
+$V=12$, $F=20$, $E=30$。细分后：
+$$V' = 12 + 20 = 32, \quad F' = 60, \quad E' = 90, \quad V'-E'+F' = 32-90+60 = 2.$$
+
+\section{算法流程}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.7cm,
+  block/.style={rectangle, draw=blue!60!black, fill=blue!5, minimum width=10cm, minimum height=0.8cm, align=center, font=\small},
+  decision/.style={diamond, draw=orange!70!black, fill=orange!5, aspect=2.5, align=center, font=\small},
+  arrow/.style={-Stealth, thick, draw=gray!60!black}
+]
+  \node[block] (s1) {1. 收集原始顶点 \& 三角面，建立 ID→索引映射};
+  \node[block, below=of s1] (s2) {2. 计算每个面的重心面点 $c_f = (v_0+v_1+v_2)/3$};
+  \node[block, below=of s2] (s3) {3. 构建新顶点数组：[原始顶点, 面点]};
+  \node[block, below=of s3] (s4) {4. 松弛原始顶点（内部用 $\alpha_n$ 权重，边界保持）};
+  \node[block, below=of s4] (s5) {5. 遍历每条边（去重）：};
+  \node[block, below=of s5, minimum width=10cm] (s5a) {\quad 内部边 → 翻转，2 三角形 $(v_0,c_2,c_1)$ + $(v_1,c_1,c_2)$};
+  \node[block, below=of s5a, minimum width=10cm] (s5b) {\quad 边界边 → fan，1 三角形 $(v_0,v_1,c)$};
+  \node[block, below=of s5b] (s6) {6. \texttt{build\_mesh\_from\_vertices\_and\_faces} 构建新网格};
+  \node[block, below=of s6] (s7) {7. 返回新 \texttt{MeshStorage}};
+
+  \draw[arrow] (s1) -- (s2);
+  \draw[arrow] (s2) -- (s3);
+  \draw[arrow] (s3) -- (s4);
+  \draw[arrow] (s4) -- (s5);
+  \draw[arrow] (s5) -- (s5a);
+  \draw[arrow] (s5a) -- (s5b);
+  \draw[arrow] (s5b) -- (s6);
+  \draw[arrow] (s6) -- (s7);
+\end{tikzpicture}
+\end{center}
+
+\section{与 Loop / Catmull-Clark 对比}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{特性} & \textbf{Loop} & \textbf{Catmull-Clark} & \textbf{√3} \\
+  \midrule
+  面增长倍数 & $4\times$ & $4k \to 2k$（三角化） & $3\times$ \\
+  输入要求 & 三角形 & 任意多边形 & 三角形 \\
+  顶点更新类型 & 逼近型 & 逼近型 & 插值型（松弛后近似） \\
+  新顶点来源 & 边中点 & 边点 + 面点 & 面点（重心） \\
+  边界处理 & 1/8-3/4-1/8 & 1/8-6/8-1/8 & 保持原位置 \\
+  连续两次效果 & 光滑（4×） & 光滑（4k×） & 更细粒度控制（3×） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+√3 的 $3\times$ 面增长（而非 $4\times$）使其在渐进式细分中提供更细粒度的控制，
+适合需要中间精度层级的场景。
+
+\section{复杂度分析}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{阶段} & \textbf{时间复杂度} & \textbf{空间复杂度} \\
+  \midrule
+  收集顶点 \& 面 & $O(V + F)$ & $O(V + F)$ \\
+  计算面点 & $O(F)$ & $O(F)$ \\
+  顶点松弛 & $O(V \cdot \bar{v})$ & $O(V)$ \\
+  边遍历 \& 构建面 & $O(E)$ & $O(F')$ \\
+  构建新网格 & $O(V' + F')$ & $O(V' + F')$ \\
+  \midrule
+  \textbf{总计} & $O(V + E + F)$ & $O(V + F)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+其中 $\bar{v}$ 为平均顶点 valence（通常 6）。对闭合三角网格 $E = 3F/2$，
+总计 $O(F)$。
+
+\section{退化健壮性}
+
+\begin{itemize}
+  \item \textbf{除零}：$\alpha_n$ 在 $n=0$ 时返回 0（守卫）；
+  \item \textbf{孤立顶点}：valence $=0$ 时保持原位置；
+  \item \textbf{无效 ID}：所有 \texttt{mesh.get\_*} 返回 \texttt{None} 时跳过；
+  \item \textbf{空网格}：$n_{\text{orig}}=0$ 或 $n_{\text{faces}}=0$ 时直接返回；
+  \item \textbf{非三角面}：面边界环长度 $\neq 3$ 时跳过该面；
+  \item \textbf{拓扑断开}：半边无 twin 时跳过该边；
+  \item \textbf{退化边}：$i_o = i_t$（自环）时跳过。
+\end{itemize}
+
+\section{测试覆盖}
+
+{\footnotesize
+\renewcommand{\arraystretch}{1.18}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{6cm}p{9cm}@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证内容} \\
+  \midrule
+  \endhead
+  \multicolumn{2}{l}{\textit{规模验证}} \\
+  \texttt{sqrt3\_icosphere0\_vertex\_face\_count} & icosphere(0) $V{=}12,F{=}20 \to V'{=}32,F'{=}60$ \\
+  \texttt{sqrt3\_icosphere1\_vertex\_face\_count} & icosphere(1) $V{=}42,F{=}80 \to V'{=}122,F'{=}240$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{拓扑校验}} \\
+  \texttt{sqrt3\_icosphere0\_passes\_validation} & icosphere(0) 细分后通过完整校验 \\
+  \texttt{sqrt3\_icosphere2\_passes\_validation} & icosphere(2) 细分后通过完整校验 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{Euler 示性数}} \\
+  \texttt{sqrt3\_preserves\_euler\_characteristic} & icosphere(0..2) 细分前后 $\chi=2$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{与 Loop 对比}} \\
+  \texttt{sqrt3\_vs\_loop\_face\_growth} & icosphere(1)：Loop $F'{=}320$，√3 $F'{=}240$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{连续细分}} \\
+  \texttt{sqrt3\_multiple\_iterations\_stay\_valid} & 连续 2 次 √3 均通过校验，$V{=}92,F{=}180$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{边界网格}} \\
+  \texttt{sqrt3\_single\_triangle} & 单三角形 $V'{=}4,F'{=}3$，校验通过 \\
+  \texttt{sqrt3\_open\_quad} & 开四边形 $V'{=}6,F'{=}6$，校验通过 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{位置正确性}} \\
+  \texttt{sqrt3\_face\_point\_at\_centroid} & 面点位于重心 $(1/3, 1/3, 0)$ \\
+  \texttt{sqrt3\_internal\_vertex\_relaxation} & 四面体 $v_0$ 松弛后位于 $(5/27,5/27,5/27)$ \\
+  \midrule
+  \multicolumn{2}{l}{\textit{α 权重}} \\
+  \texttt{sqrt3\_alpha\_regular\_valence\_6} & $\alpha_6 = 1/3$ \\
+  \texttt{sqrt3\_alpha\_valence\_3} & $\alpha_3 = 5/9$ \\
+  {\tiny\texttt{sqrt3\_alpha\_zero\_valence\_returns\_zero}} & $n=0$ 守卫不 panic \\
+  \midrule
+  \multicolumn{2}{l}{\textit{空网格}} \\
+  \texttt{sqrt3\_empty\_mesh} & 空网格返回空网格 \\
+  \bottomrule
+\end{longtable}
+}
+
+共 15 个单元测试，全部通过。全库 \texttt{cargo test} 共 371 个用例，0 失败。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何用 $V' = V + F$ 而非 $V + E$（Loop）？}
+        √3 仅插入面点（重心），不插入边中点。面点通过边翻转自然连接，
+        无需额外的边点。这使面数增长 $3\times$（而非 $4\times$）。
+  \item \textbf{为何边界顶点保持原位置？}
+        原始论文使用三次样条更新边界顶点，但实现复杂。保持原位置是
+        常见的简化策略，确保边界不退化。
+  \item \textbf{为何松弛用原始邻居而非新邻居（面点）？}
+        标准实现（Kobbelt 2000）使用原始 1-ring 邻居的旧位置计算松弛，
+        保证算法的线性时间复杂度。若用新邻居（面点）需先构建新拓扑再回查。
+  \item \textbf{为何直接构建新网格而非在原网格上操作？}
+        边翻转涉及大量拓扑修改（每条内部边都要翻转），在原网格上逐个翻转
+        容易引入中间状态的不一致。直接收集新三角形列表一次性构建新网格更安全。
+  \item \textbf{为何遍历所有半边而非仅 outgoing？}
+        每条无向边对应两条半边，用 \texttt{HashSet} 去重确保每条边只处理一次。
+        遍历所有半边保证不遗漏任何边（包括边界边）。
+\end{itemize}
+
+\end{document}

@@ -1,0 +1,339 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 内置属性模块设计文档} \\ \large \texttt{src/builtin\_attrs.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{builtin\_attrs.rs} 在 \texttt{property.rs} 泛型属性系统之上，
+为\textbf{常见几何属性}（顶点法向 / UV / 颜色 / 面法向）提供强类型 Newtype 包装与
+便捷函数，并实现\textbf{OBJ 属性感知 IO}（\texttt{v/vt/vn} 解析与序列化）。
+
+\section{为什么需要 Newtype 包装？}
+
+\texttt{property.rs} 的属性系统基于 \texttt{TypeId} 区分属性类型：
+\[
+  \text{属性键} = \texttt{TypeId::of::<T>()}
+\]
+\texttt{TypeId} 由 Rust 编译器为每个 \texttt{'static} 类型自动分配，相同类型共享同一 ID。
+\textbf{问题}：若想为顶点同时附加 \texttt{[f64; 3]} 类型的「法向」与「颜色」，
+二者 \texttt{TypeId} 相同，会互相覆盖。
+
+\textbf{解决方案}：用 Newtype 包装，让每个语义属性有独立类型：
+
+\begin{lstlisting}
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VertexNormal(pub [f64; 3]);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VertexColor(pub [f64; 3]);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VertexUv(pub [f64; 2]);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FaceNormal(pub [f64; 3]);
+\end{lstlisting}
+
+\texttt{VertexNormal} 与 \texttt{VertexColor} 现在是\textbf{不同类型}，
+\texttt{TypeId::of::<VertexNormal>()} $\ne$ \texttt{TypeId::of::<VertexColor>()}，
+可以共存于同一 \texttt{MeshProperties} 容器。
+
+\section{API 表}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{4}{*}{Newtype}
+    & \texttt{VertexNormal([f64;3])} & 顶点法向（单位向量） \\
+    & \texttt{VertexColor([f64;3])}  & 顶点颜色 RGB，每通道 $\in [0, 1]$ \\
+    & \texttt{VertexUv([f64;2])}     & 顶点 UV 纹理坐标 \\
+    & \texttt{FaceNormal([f64;3])}   & 面法向（单位向量） \\
+  \midrule
+  \multirow{4}{*}{注册}
+    & \texttt{add\_vertex\_normal(\&mut props)}    & 注册顶点法向属性，返回句柄 \\
+    & \texttt{add\_vertex\_colors(\&mut props)}    & 注册顶点颜色属性 \\
+    & \texttt{add\_vertex\_uvs(\&mut props)}       & 注册顶点 UV 属性 \\
+    & \texttt{add\_face\_normal(\&mut props)}      & 注册面法向属性 \\
+  \midrule
+  \multirow{2}{*}{批量计算}
+    & \texttt{populate\_vertex\_normal(mesh, props, h)} & 用 \texttt{vertex\_normal} 填充所有顶点 \\
+    & \texttt{populate\_face\_normal(mesh, props, h)}   & 用 \texttt{face\_normal} 填充所有面 \\
+  \midrule
+  \multirow{3}{*}{收集}
+    & \texttt{collect\_vertex\_normal(mesh, props, h) $\to$ Vec<[f64;3]>} & 按顶点顺序提取法向 \\
+    & \texttt{collect\_vertex\_uvs(mesh, props, h) $\to$ Vec<[f64;2]>}    & 按顶点顺序提取 UV \\
+    & \texttt{collect\_vertex\_colors(mesh, props, h) $\to$ Vec<[f64;3]>} & 按顶点顺序提取颜色 \\
+  \midrule
+  批量安装 & \texttt{install\_vertex\_attrs(props, normals, uvs, colors, ids)} & 一次性注册并填充 \\
+  \midrule
+  \multirow{2}{*}{OBJ 属性感知}
+    & \texttt{parse\_obj\_with\_attrs(text) $\to$ (Mesh, Props)} & 解析 OBJ 并提取 \texttt{vt}/\texttt{vn} \\
+    & \texttt{format\_obj\_with\_attrs(mesh, props, n\_h, uv\_h) $\to$ String} & 序列化带 \texttt{vt}/\texttt{vn} 的 OBJ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{属性数据流}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.7cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=4.5cm, minimum height=1.2cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  store/.style={draw, cylinder, shape border rotate=90, aspect=0.3, minimum height=1.5cm, minimum width=3cm, font=\small, fill=blue!8}
+]
+  \node[store] (obj) {OBJ 文本};
+  \node[proc, right=1.6cm of obj, fill=yellow!15] (parser) {\texttt{parse\_obj\_with\_attrs} \\ 解析 v / vt / vn / f};
+  \node[proc, right=1.6cm of parser, fill=green!12] (mesh) {\texttt{MeshStorage} \\ + \texttt{MeshProperties}};
+  \node[proc, below=1.2cm of mesh, fill=red!10] (writer) {\texttt{format\_obj\_with\_attrs} \\ 写出 v / vt / vn / f};
+  \node[store, left=1.6cm of writer] (out) {OBJ 文本};
+
+  \draw[op] (obj) -- (parser);
+  \draw[op] (parser) -- (mesh);
+  \draw[op] (mesh) -- (writer);
+  \draw[op] (writer) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\section{OBJ 属性感知 IO}
+
+\subsection{解析：parse\_obj\_with\_attrs}
+
+输入：OBJ 文本，含 \texttt{v} / \texttt{vt} / \texttt{vn} / \texttt{f} 行。
+输出：\texttt{(MeshStorage, MeshProperties)}，属性系统已注册
+\texttt{VertexNormal} 与 \texttt{VertexUv}（仅在输入含对应行时）。
+
+\paragraph{面行格式} 支持 4 种：
+\begin{itemize}
+  \item \texttt{f v1 v2 v3} —— 仅顶点；
+  \item \texttt{f v1/vt1 v2/vt2 v3/vt3} —— 顶点 + UV；
+  \item \texttt{f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3} —— 顶点 + UV + 法向；
+  \item \texttt{f v1//vn1 v2//vn2 v3//vn3} —— 顶点 + 法向（无 UV）。
+\end{itemize}
+
+\paragraph{属性映射} 每个面顶点 \texttt{(vt, vn)} 索引（1-based）映射到顶点：
+\begin{enumerate}
+  \item 收集所有 \texttt{vt} 行到 \texttt{texcoords: Vec<[f64;2]>}；
+  \item 收集所有 \texttt{vn} 行到 \texttt{normals: Vec<[f64;3]>}；
+  \item 遍历每个面顶点 \texttt{(v\_idx, vt\_idx, vn\_idx)}：
+        \texttt{vert\_normal[v\_idx] = normals[vn\_idx - 1]}；
+  \item 按顶点顺序注册属性并填充 \texttt{MeshProperties}。
+\end{enumerate}
+
+\paragraph{同顶点多面引用} 同一顶点可能被多个面引用，
+\textbf{后面的面覆盖前面的}（OBJ 标准允许同顶点在不同面有不同 UV/法向，
+本实现按顶点而非按面顶点存储属性，故取最后一次赋值）。
+
+\subsection{序列化：format\_obj\_with\_attrs}
+
+输出顺序：
+\begin{enumerate}
+  \item 所有 \texttt{v} 行（顶点位置）；
+  \item 所有 \texttt{vt} 行（若 \texttt{uv\_handle} 为 \texttt{Some}）；
+  \item 所有 \texttt{vn} 行（若 \texttt{normal\_handle} 为 \texttt{Some}）；
+  \item 所有 \texttt{f} 行，按 \texttt{v/vt/vn} 格式输出（依据已注册属性选择）。
+\end{enumerate}
+
+\paragraph{面行格式选择}
+\begin{itemize}
+  \item 同时有 UV 和法向：\texttt{f v/vt/vn v/vt/vn v/vt/vn}；
+  \item 仅有 UV：\texttt{f v/vt v/vt v/vt}；
+  \item 仅有法向：\texttt{f v//vn v//vn v//vn}；
+  \item 都无：\texttt{f v v v}。
+\end{itemize}
+
+未设置属性的顶点写 0 占位（\texttt{vt 0 0} 或 \texttt{vn 0 0 0}）。
+
+\section{批量安装：install\_vertex\_attrs}
+
+\texttt{install\_vertex\_attrs(props, normals, uvs, colors, vertex\_ids)}
+用于从外部数据（如其他 IO 库解析结果）一次性注册并填充属性：
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8] (p1) {若 normals 为 \texttt{Some}：注册 \texttt{VertexNormal}，按索引填充};
+  \node[proc, below=of p1, fill=blue!8] (p2) {若 uvs 为 \texttt{Some}：注册 \texttt{VertexUv}，按索引填充};
+  \node[proc, below=of p2, fill=blue!8] (p3) {若 colors 为 \texttt{Some}：注册 \texttt{VertexColor}，按索引填充};
+  \node[startend, below=of p3] (e) {返回};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (e);
+\end{tikzpicture}
+\end{center}
+
+\textbf{部分输入}：任一参数为 \texttt{None} 则跳过对应属性，
+\texttt{has\_vertex\_prop::<T>()} 对应返回 \texttt{false}。
+
+\section{与 property.rs 的关系}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{维度} & \texttt{property.rs}（泛型） & \texttt{builtin\_attrs.rs}（内置） \\
+  \midrule
+  类型      & 任意 \texttt{T: 'static}              & 固定 4 种 Newtype \\
+  句柄      & \texttt{PropertyHandle<T>}            & 同左（直接复用） \\
+  存储      & \texttt{HashMap<TypeId, Box<dyn ErasedProperty>>} & 同左 \\
+  注册      & \texttt{add\_vertex\_prop::<T>()}     & \texttt{add\_vertex\_normal(\&mut props)} \\
+  读写      & \texttt{get/set\_vertex\_prop}        & 同左 \\
+  语义      & 无（用户自定义）                       & 法向 / UV / 颜色 / 面法向 \\
+  IO 联动   & 无                                    & \texttt{parse\_obj\_with\_attrs} 等 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{builtin\_attrs} 完全建立在 \texttt{property.rs} 之上，不修改其底层存储。
+用户可同时使用两者：自定义泛型属性与内置属性互不冲突。
+
+\section{退化守卫}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{populate\_vertex\_normal} & 顶点法向不可计算（孤立 / 边界退化） & 跳过该顶点 \\
+  \texttt{populate\_face\_normal}   & 面法向不可计算（共线） & 跳过该面 \\
+  \texttt{populate\_face\_normal}   & 空网格 & 安全返回（无 panic） \\
+  \texttt{collect\_vertex\_normal}  & 顶点未设置法向 & 填 \texttt{[0, 0, 0]} \\
+  \texttt{collect\_vertex\_colors}  & 顶点未设置颜色 & 填 \texttt{[1, 1, 1]}（白） \\
+  \texttt{collect\_vertex\_uvs}     & 顶点未设置 UV & 填 \texttt{[0, 0]} \\
+  \texttt{parse\_obj\_with\_attrs}  & OBJ 无 \texttt{vn} 行 & 不注册 \texttt{VertexNormal} \\
+  \texttt{parse\_obj\_with\_attrs}  & 面索引越界 & 返回 \texttt{IndexOutOfRange} 错误 \\
+  \texttt{parse\_obj\_with\_attrs}  & 面顶点数 $< 3$ & 返回 \texttt{NotTriangular} 错误 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{使用示例}
+
+\subsection{为 icosphere 计算顶点法向并写出 OBJ}
+
+\begin{lstlisting}
+use halfedge::*;
+use halfedge::builtin_attrs::*;
+
+let mesh = test_util::build_icosphere(2);
+let mut props = MeshProperties::new();
+let n_handle = add_vertex_normals(&mut props);
+populate_vertex_normals(&mesh, &mut props, n_handle);
+
+let obj = format_obj_with_attrs(&mesh, &props,
+    Some(n_handle), None);
+// obj 现在含 v / vn / f 行，f 行格式为 "f v//vn v//vn v//vn"
+\end{lstlisting}
+
+\subsection{从带属性的 OBJ 加载}
+
+\begin{lstlisting}
+let text = std::fs::read_to_string("model.obj")?;
+let (mesh, props) = parse_obj_with_attrs(&text)?;
+// props 已注册 VertexNormal 与 VertexUv（若 OBJ 含 vn / vt 行）
+\end{lstlisting}
+
+\subsection{批量安装自定义属性}
+
+\begin{lstlisting}
+let mesh = build_icosphere(0);
+let ids: Vec<VertexId> = mesh.vertex_ids().collect();
+let mut props = MeshProperties::new();
+
+let normals: Vec<[f64; 3]> = ids.iter().map(|_| [0.0, 1.0, 0.0]).collect();
+let uvs: Vec<[f64; 2]> = ids.iter().enumerate()
+    .map(|(i, _)| [i as f64 * 0.1, 0.0])
+    .collect();
+
+install_vertex_attrs(&mut props, Some(&normals), Some(&uvs), None, &ids);
+assert!(props.has_vertex_prop::<VertexNormal>());
+assert!(props.has_vertex_prop::<VertexUv>());
+assert!(!props.has_vertex_prop::<VertexColor>());
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{vertex\_normal\_roundtrip}        & icosphere 顶点法向为单位向量 \\
+  \texttt{face\_normal\_roundtrip}          & 所有面法向已写入 \\
+  \texttt{vertex\_color\_default\_is\_white} & 未设置颜色返回默认白 \\
+  \texttt{vertex\_uv\_set\_and\_get}        & UV 设置后可读取 \\
+  \texttt{install\_vertex\_attrs\_handles\_partial\_input} & 仅传法向不注册 UV/Color \\
+  \texttt{install\_vertex\_attrs\_all\_three} & 三种属性同时安装 \\
+  \texttt{newtype\_default\_is\_zero}       & Newtype 默认值为零 \\
+  \texttt{missing\_handle\_returns\_none}   & 未注册句柄读取返回 \texttt{None} \\
+  \texttt{populate\_face\_normal\_skips\_invalid} & 空网格不 panic \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/builtin\_attrs.rs} 共 \textbf{9 个}单元测试，全库共 \textbf{371 个}。
+
+\end{document}

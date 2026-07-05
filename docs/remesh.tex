@@ -1,0 +1,261 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 各向同性重网格化模块设计文档} \\ \large \texttt{src/remesh.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{remesh.rs} 实现\textbf{各向同性重网格化}（isotropic remeshing）：
+通过迭代式分裂长边、折叠短边、翻转边均衡度数、切向拉普拉斯平滑，
+将网格边长驱向目标长度，生成均匀三角形。
+
+\textbf{参考}：Botsch \& Kobbelt, ``A Remeshing Approach to Multiresolution
+Modeling''（2004）。
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  核心   & \texttt{isotropic\_remesh(mesh, target, iter, reproject)} & 完整 4 步迭代流水线 \\
+  快捷   & \texttt{quick\_remesh(mesh)}                              & 自动目标长度 + 3 次迭代 \\
+  快捷   & \texttt{remesh\_to\_length(mesh, L)}                      & 指定目标长度 + 5 次迭代 \\
+  统计   & \texttt{RemeshStats}                                      & 返回迭代次数 / 分裂数 / 折叠数 / 翻转数 / 目标长度 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{RemeshStats}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{字段} & \textbf{类型} & \textbf{含义} \\
+  \midrule
+  \texttt{iterations}    & \texttt{usize} & 总迭代次数 \\
+  \texttt{splits}        & \texttt{usize} & 分裂的边数 \\
+  \texttt{collapses}     & \texttt{usize} & 折叠的边数 \\
+  \texttt{flips}         & \texttt{usize} & 翻转的边数 \\
+  \texttt{target\_length}& \texttt{f64}   & 实际使用目标长度 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{核心算法：4 步迭代}
+
+每轮迭代依次执行：
+
+\subsection{步骤 1：分裂长边 \texttt{split\_long\_edges}}
+
+阈值 $L_{\max} = \frac{4}{3} L$。遍历所有规范半边（twin 对中 ID 较小者），
+若 \texttt{edge\_length}$(h) > L_{\max}$，调用 \texttt{split\_edge}（在中点插入顶点）。
+
+\subsection{步骤 2：折叠短边 \texttt{collapse\_short\_edges}}
+
+阈值 $L_{\min} = \frac{4}{5} L$。候选需满足：
+\[
+  L_{\min} > \ell(h) > 10^{-10}.
+\]
+折叠目标位置 = 边中点（无 twin 的边界边折叠到 \texttt{tip} 当前位置），
+调用 \texttt{collapse\_edge\_at}（保留 QEM 接口的可定制位置）。
+
+\subsection{步骤 3：翻转均衡度数 \texttt{flip\_for\_valence}}
+
+对每个内部边，相邻两三角形四顶点 $a, b, c, d$，目标度数：
+\[
+  t_v = \begin{cases} 6 & v \text{ 内部} \\ 4 & v \text{ 边界} \end{cases}
+\]
+翻转前后度数偏差和：
+\begin{align}
+  \text{before} &= |val_a - t_a| + |val_b - t_b| + |val_c - t_c| + |val_d - t_d| \\
+  \text{after}  &= |val_a - 1 - t_a| + |val_b - 1 - t_b| + |val_c + 1 - t_c| + |val_d + 1 - t_d|
+\end{align}
+\textbf{仅当 \texttt{after < before}（严格改善）时翻转}，避免循环。
+
+\subsection{步骤 4：切向拉普拉斯平滑 \texttt{smooth\_vertices}}
+
+跳过边界顶点。对内部顶点 $v$：
+\begin{align}
+  \vec{avg} &= \frac{1}{|N(v)|} \sum_{u \in N(v)} \vec{p}_u \\
+  \vec{n}   &= \texttt{vertex\_normal}(v) \quad (\text{None 时回退 } (0,1,0)) \\
+  \vec{t}   &= (\vec{avg} - \vec{p}_v) - \vec{n}\, \bigl((\vec{avg} - \vec{p}_v) \cdot \vec{n}\bigr) \\
+  \vec{p}_v &\leftarrow \vec{p}_v + \lambda \vec{t},\quad \lambda = 0.5
+\end{align}
+$\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏离。
+
+\subsection{整体流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.4cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.55cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.55cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {输入：\texttt{mesh}, \texttt{target}, \texttt{iter}};
+  \node[dec, below=of s] (d0) {\texttt{target} = \texttt{None}？};
+  \node[proc, right=2cm of d0, fill=blue!8] (auto) {计算中位数边长作为 \texttt{target}};
+  \node[proc, below=of d0, fill=blue!8] (p1) {\textbf{步骤 1}：分裂 $\ell > \frac{4}{3}L$ 的边};
+  \node[proc, below=of p1, fill=blue!8] (p2) {\textbf{步骤 2}：折叠 $\frac{4}{5}L > \ell > 10^{-10}$ 的边到中点};
+  \node[proc, below=of p2, fill=blue!8] (p3) {\textbf{步骤 3}：内部边翻转使 $\sum|val - t|$ 严格减小};
+  \node[proc, below=of p3, fill=blue!8] (p4) {\textbf{步骤 4}：切向拉普拉斯平滑（$\lambda = 0.5$，跳过边界）};
+  \node[dec, below=of p4] (d1) {已迭代 \texttt{iter} 次？};
+  \node[startend, right=2cm of d1, fill=green!12] (e) {返回 \texttt{RemeshStats}};
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -- node[above, font=\scriptsize] {是} (auto);
+  \draw[op] (auto) |- (p1);
+  \draw[op] (d0) -- node[right, font=\scriptsize] {否} (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (e);
+  \draw[op, dashed] (d1) -- ++(0,-0.6) -| node[below, near start, font=\scriptsize] {否} (p1.west);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{目标长度自动估计}
+
+\texttt{compute\_target\_length}（\texttt{target = None} 时调用）：
+收集所有半边长度，排序后取 $[n/4, 3n/4]$ 区间均值为\textbf{截尾均值}（trimmed mean），
+抑制退化边 / 边界短边对均值的拉低。
+
+\section{阈值与常数}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{常数} & \textbf{值} & \textbf{用途} \\
+  \midrule
+  $L_{\max}$ & $\frac{4}{3} L$ & 分裂阈值 \\
+  $L_{\min}$ & $\frac{4}{5} L$ & 折叠阈值 \\
+  $\lambda$  & $0.5$           & 切向平滑松弛因子 \\
+  退化阈值    & $10^{-10}$      & 折叠时边长下限（防零长边） \\
+  目标度数（内） & $6$          & 三角网格规则内部度数 \\
+  目标度数（边） & $4$          & 三角网格规则边界度数 \\
+  截尾均值区间 & $[n/4, 3n/4]$ & \texttt{compute\_target\_length} \\
+  法向回退    & $(0, 1, 0)$     & \texttt{vertex\_normal} 返回 \texttt{None} 时 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{复杂度}
+
+设 $V, E, F$ 为顶点 / 半边 / 面数，$I$ 为迭代次数，$\bar{d}$ 为平均度数（三角网格约 6）。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{函数} & \textbf{时间复杂度} \\
+  \midrule
+  \texttt{compute\_target\_length} & $O(E \log E)$（排序） \\
+  \texttt{split\_long\_edges}      & $O(E)$ \\
+  \texttt{collapse\_short\_edges}  & $O(E)$ \\
+  \texttt{flip\_valence}           & $O(E \cdot \bar{d}) \approx O(E)$（每边 4 次 \texttt{VertexRing::count}） \\
+  \texttt{smooth\_vertices}        & $O(V \cdot \bar{d}) \approx O(V)$ \\
+  \texttt{isotropic\_remesh}       & $O(I \cdot (E + V))$ \\
+  \texttt{quick\_remesh}           & $O(3 \cdot (E + V))$ \\
+  \texttt{remesh\_to\_length}      & $O(5 \cdot (E + V))$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{compute\_target\_length\_icosphere} & 自动目标长度 $> 0$ 且 $< 2.0$（单位球） \\
+  \texttt{remesh\_icosphere\_preserves\_topology} & \texttt{quick\_remesh} 后 \texttt{validate\_mesh} 通过，$F \in [0.5F_0, 2F_0]$ \\
+  \texttt{remesh\_preserves\_closedness}      & 重网格化后 icosphere 仍闭合 \\
+  \texttt{target\_valence\_interior\_is\_6}   & icosphere 所有内部顶点目标度数 $= 6$ \\
+  \texttt{remesh\_to\_specific\_length}       & \texttt{remesh\_to\_length(0.5)} 后校验通过 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 \textbf{5 个}单元测试，全库共 \textbf{371 个}。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何用中位数边长而非均值？} 中位数对退化边 / 异常长边鲁棒，
+        截尾均值进一步抑制极端值，给出符合直觉的「代表性边长」。
+  \item \textbf{为何翻转条件是严格改善？} 等价情况翻转会陷入循环
+        （A $\to$ B $\to$ A $\to$ ...），严格 \texttt{after < before} 保证单调下降。
+  \item \textbf{为何切向平滑而非各向同性平滑？} 各向同性平滑会让顶点沿法向漂移，
+        导致网格「收缩」。切向投影 $\vec{t} = \vec{d} - (\vec{d} \cdot \vec{n})\vec{n}$
+        保持顶点在原曲面附近，几何形状保持更好。
+  \item \textbf{为何跳过边界顶点？} 边界曲线是网格的「骨架」，移动会改变网格边界，
+        破坏与原始数据的对应关系。开放网格重网格化应保持边界不变。
+  \item \textbf{为何 \texttt{reproject} 参数当前是 no-op？} 真正的再投影需要参考
+        原始曲面（如 BVH + 最近点查询），实现复杂。当前切向平滑已能保持形状，
+        再投影留作未来扩展占位。
+  \item \textbf{为何规范半边用 ID 比较？} Twin 对 $(h, t)$ 中只处理一个，
+        $\min(h, t)$ 是确定的、无需额外状态。依赖 SlotMap 的 ID 唯一性不变量。
+\end{itemize}
+
+\end{document}

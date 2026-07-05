@@ -1,0 +1,40 @@
+[package]
+name = "halfedge"
+version = "0.1.0"
+edition = "2024"
+authors = ["nil-is-lin <nil.is.lin@gmail.com>"]
+description = "A half-edge mesh data structure library for Rust: traversal, topology operations, geometry, subdivision, decimation, parameterization, geodesics, deformation, boolean operations, and more."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nil-is-lin/halfedge"
+homepage = "https://github.com/nil-is-lin/halfedge"
+documentation = "https://docs.rs/halfedge"
+readme = "README.md"
+keywords = ["half-edge", "mesh", "geometry", "3d", "graphics"]
+categories = ["data-structures", "graphics", "mathematics"]
+exclude = [
+    "/docs",
+    "/examples",
+    "/benches",
+    "/target",
+    "/.github",
+]
+
+[dependencies]
+slotmap = "1.0"
+sprs = "0.11"
+rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "traversal"
+harness = false
+
+[[bench]]
+name = "topology_ops"
+harness = false
+
+[[bench]]
+name = "subdiv"
+harness = false

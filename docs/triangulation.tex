@@ -1,0 +1,294 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 多边形三角化模块设计文档} \\ \large \texttt{src/triangulation.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{triangulation.rs} 提供 2D/3D 多边形三角化算法，返回三角面顶点索引
+\texttt{Vec<[usize; 3]>}。不依赖 \texttt{MeshStorage}，是纯几何工具，
+供 \texttt{io.rs}（n-gon 解析）与未来可能的高级构建器复用。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{算法} & \textbf{API} & \textbf{适用范围} \\
+  \midrule
+  \multirow{2}{*}{扇形三角化}
+    & \texttt{fan\_triangulation(\&[[f64;2]])}    & 2D 凸多边形（CCW） \\
+    & \texttt{fan\_triangulation\_3d(\&[[f64;3]])} & 3D 共面凸多边形 \\
+  \midrule
+  \multirow{2}{*}{耳剪裁}
+    & \texttt{ear\_clipping(\&[[f64;2]])}         & 2D 简单多边形（凹允许） \\
+    & \texttt{ear\_clipping\_3d(\&[[f64;3]])}     & 3D 共面简单多边形 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{扇形三角化}
+
+\subsection{算法}
+
+对 $n$ 顶点多边形 $v_0, v_1, \dots, v_{n-1}$，从 $v_0$ 出发扇形展开：
+\[
+  T_i = (v_0,\ v_{i-1},\ v_i),\quad i = 2, 3, \dots, n-1.
+\]
+共生成 $n - 2$ 个三角形。索引形式：$[0, i-1, i]$。
+
+\subsection{前置条件}
+
+\begin{itemize}
+  \item \textbf{凸}多边形（凹多边形会生成位于外部中的三角形）；
+  \item CCW 朝向；
+  \item 3D 版本要求所有顶点\textbf{共面}（不验证，调用方负责）。
+\end{itemize}
+
+\subsection{退化处理}
+
+$n < 3$ 返回空 \texttt{Vec}；$n = 3$ 自然返回单三角形 $[0, 1, 2]$。
+
+\subsection{复杂度}
+
+$O(n)$，单次线性扫描，\texttt{Vec::with\_capacity(n - 2)} 预分配。
+
+\section{耳剪裁三角化}
+
+\subsection{基本概念}
+
+\textbf{耳（ear）}：多边形的一个顶点 $v_i$，其相邻两顶点 $v_{i-1}, v_{i+1}$
+形成的三角形 $(v_{i-1}, v_i, v_{i+1})$ 完全位于多边形内部，且不包含其他顶点。
+
+\textbf{定理（Meisters 二耳定理）}：任何 $n \ge 4$ 顶点的简单多边形至少有 2 个不重叠的耳。
+故可迭代摘除耳直到只剩三角形。
+
+\subsection{算法}
+
+\begin{enumerate}
+  \item 若输入 CW，反向为 CCW；
+  \item 维护 \texttt{indices = [0, 1, ..., n-1]}；
+  \item 当 \texttt{indices.len() > 3}：
+    \begin{enumerate}
+      \item 对每个 $i$，邻居 $prev = i-1$，$next = i+1$：
+      \item \textbf{凸性测试}：$\text{cross} = (b - a) \times (c - a)$，
+            $\text{cross} \le 0$（反射或共线）跳过；
+      \item \textbf{包含测试}：检查所有其他顶点 $j \notin \{prev, i, next\}$
+            是否在三角形 $(a, b, c)$ 内（面积分解法）；
+      \item 若通过两测试，输出 $[\text{indices}[prev], \text{indices}[i], \text{indices}[next]]$，
+            从 \texttt{indices} 移除 $i$，\texttt{break} 重启扫描；
+    \end{enumerate}
+  \item 若一轮未找到耳（\texttt{!found\_ear}），\texttt{break} 防止死循环；
+  \item 若剩余 3 顶点，输出最后一个三角形。
+\end{enumerate}
+
+\subsection{安全兜底}
+
+\texttt{iter\_count > indices.len()$^2$} 时强制 \texttt{break}，
+对自相交多边形防止死循环。返回已收集的三角形（部分结果）。
+
+\subsection{3D 投影}
+
+\texttt{ear\_clipping\_3d}：
+\begin{enumerate}
+  \item Newell 方法计算多边形法向 $\vec{n}$：
+    \begin{align}
+      n_x &= \sum_i (y_i - y_{i+1})(z_i + z_{i+1}) \\
+      n_y &= \sum_i (z_i - z_{i+1})(x_i + x_{i+1}) \\
+      n_z &= \sum_i (x_i - x_{i+1})(y_i + y_{i+1})
+    \end{align}
+  \item 选择 $|n_k|$ 最大的轴 $k$ 投影到另外两轴：
+    \begin{itemize}
+      \item $k = 0$（drop $x$）$\to$ 用 $(y, z)$
+      \item $k = 1$（drop $y$）$\to$ 用 $(x, z)$
+      \item $k = 2$（drop $z$）$\to$ 用 $(x, y)$
+    \end{itemize}
+  \item 调用 2D \texttt{ear\_clipping}，返回的索引直接对应原 3D 顶点。
+\end{enumerate}
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.4cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.55cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.55cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {输入：多边形顶点};
+  \node[dec, below=of s] (d0) {CCW？};
+  \node[proc, right=2cm of d0, fill=blue!8] (rev) {反向顶点序};
+  \node[proc, below=of d0, fill=blue!8] (init) {\texttt{indices = [0,1,...,n-1]}；\texttt{tris = []}};
+  \node[dec, below=of init] (d1) {\texttt{indices.len() > 3}？};
+  \node[proc, below=of d1, fill=yellow!15] (scan) {扫描每个 $i$：凸性 + 包含测试};
+  \node[dec, below=of scan] (d2) {找到耳？};
+  \node[proc, left=2cm of d2, fill=green!12] (cut) {输出三角形，移除 $i$};
+  \node[proc, right=2cm of d2, fill=red!10] (cap) {安全兜底：\texttt{iter > len$^2$}？};
+  \node[proc, below=of d2, fill=blue!8] (last) {剩余 3 顶点输出最后三角形};
+  \node[startend, below=of last, fill=green!12] (e) {返回 \texttt{Vec<[usize;3]>}};
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -- node[above, font=\scriptsize] {否} (rev);
+  \draw[op] (rev) |- (init);
+  \draw[op] (d0) -- node[right, font=\scriptsize] {是} (init);
+  \draw[op] (init) -- (d1);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {是} (scan);
+  \draw[op] (scan) -- (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (cut);
+  \draw[op] (cut) |- (d1);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {否} (cap);
+  \draw[op] (cap) |- (last);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (last);
+  \draw[op] (last) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{辅助函数（私有）}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{函数} & \textbf{语义} \\
+  \midrule
+  \texttt{v2\_sub(a, b)}              & 二维向量减法 \\
+  \texttt{v2\_cross(a, b)}            & 二维标量叉积 $a_x b_y - a_y b_x$ \\
+  \texttt{signed\_area(a, b, c)}      & 三角形有符号面积（CCW 为正） \\
+  \texttt{point\_in\_triangle(p, a, b, c)} & 面积分解法判定点在三角形内 \\
+  \texttt{is\_ccw(poly)}              & Shoelace 公式判定多边形朝向 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{点在三角形内：面积分解}
+
+点 $p$ 在三角形 $(a, b, c)$ 内当且仅当三个子三角形面积之和等于原三角形面积：
+\[
+  |A(p, b, c)| + |A(a, p, c)| + |A(a, b, p)| \approx |A(a, b, c)|.
+\]
+容差 $10^{-12} \cdot \max(|A|, 10^{-12})$ 防止退化三角形除零。
+
+\section{退化与错误处理}
+
+\textbf{所有函数无 \texttt{Result}、无 panic}。退化输入静默返回部分结果：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{输入} & \textbf{返回} \\
+  \midrule
+  $n < 3$（任意函数） & 空 \texttt{Vec} \\
+  $n = 3$（耳剪裁）   & \texttt{vec![[0, 1, 2]]} \\
+  CW 输入（耳剪裁）   & 静默反向后三角化 \\
+  自相交多边形         & 部分三角形列表（提前 \texttt{break}） \\
+  迭代超限             & 部分三角形 + 最后三角形（若剩余 3 顶点） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+调用方需自行验证输入几何以获得正确结果。
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{函数} & \textbf{时间复杂度} \\
+  \midrule
+  \texttt{fan\_triangulation}     & $O(n)$ \\
+  \texttt{fan\_triangulation\_3d} & $O(n)$ \\
+  \texttt{ear\_clipping}          & $O(n^2)$（每耳摘除扫描 $O(m)$ 剩余顶点） \\
+  \texttt{ear\_clipping\_3d}      & $O(n)$（投影） + $O(n^2)$（耳剪裁） $= O(n^2)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{fan\_triangulation\_quad}     & 单位正方形（CCW）$\to$ 2 三角形 $[0,1,2], [0,2,3]$ \\
+  \texttt{fan\_triangulation\_empty}    & 空输入 / 单顶点 $\to$ 0 三角形 \\
+  \texttt{ear\_clipping\_convex\_quad}  & 凸四边形耳剪裁 $\to$ 2 三角形 \\
+  \texttt{ear\_clipping\_concave\_l\_shape} & L 形凹六边形 $\to$ 4 三角形（$n-2 = 4$） \\
+  \texttt{ear\_clipping\_3d\_square}    & $z = 0$ 平面正方形 3D 耳剪裁 $\to$ 2 三角形 \\
+  \texttt{ear\_clipping\_triangle}      & 3 顶点多边形 $\to$ 1 三角形 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 \textbf{6 个}单元测试，全库共 \textbf{371 个}。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何保留扇形三角化？} 凸多边形场景下 $O(n)$ 远优于耳剪裁 $O(n^2)$，
+        且实现简单。OBJ n-gon 解析默认凸性假设时可使用。
+  \item \textbf{为何耳剪裁用 $O(n^2)$ 而非 $O(n \log n)$ 改进版？} 经典实现足够清晰，
+        对典型 n-gon（$n \le 8$）性能差异可忽略。改进版需维护单调剖分与桥边检测，
+        实现复杂度大幅上升。
+  \item \textbf{为何不返回 \texttt{Result}？} 三角化对任意输入都有「最大努力」结果，
+        即使自相交也能返回部分三角形。让调用方决定是否接受部分结果。
+  \item \textbf{为何 3D 投影选最大法向分量轴？} 投影到该轴对应的「最平行」平面，
+        面积失真最小，避免退化（如投影到与多边形垂直的平面会让所有点共线）。
+\end{itemize}
+
+\end{document}

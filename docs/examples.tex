@@ -1,0 +1,429 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 示例集设计文档} \\ \large \texttt{examples/}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{示例总览}
+
+\texttt{examples/} 目录下提供 14 个独立可运行的示例，按功能划分，每个示例聚焦一个模块的核心用法。
+所有示例通过 \texttt{cargo run --example <name>} 运行，无需额外依赖。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{3.4cm}p{2.0cm}p{5.2cm}p{5.4cm}@{}}
+  \toprule
+  \textbf{示例} & \textbf{模块} & \textbf{功能} & \textbf{运行命令} \\
+  \midrule
+  \texttt{storage\_basic}            & \texttt{storage}    & 顶点/半边/面 CRUD 与句柄有效性 & \texttt{cargo run --example storage\_basic} \\
+  \texttt{build\_mesh}               & \texttt{io}         & 从顶点+面索引构建完整网格     & \texttt{cargo run --example build\_mesh} \\
+  \texttt{obj\_io}                   & \texttt{io}         & OBJ 文本/文件读写往返         & \texttt{cargo run --example obj\_io} \\
+  \texttt{traversal}                 & \texttt{traversal}  & 5 迭代器 + 2 边界判定函数     & \texttt{cargo run --example traversal} \\
+  \texttt{topology\_ops}             & \texttt{topology\_ops} & split/flip/collapse 三大操作 & \texttt{cargo run --example topology\_ops} \\
+  \texttt{extrude\_face}             & \texttt{topology\_ops} & 单/批量三角面挤出形成棱柱    & \texttt{cargo run --example extrude\_face} \\
+  \texttt{geometry\_query}           & \texttt{geometry}   & 边长/面积/法向/最小内角/顶点法向 & \texttt{cargo run --example geometry\_query} \\
+  \texttt{laplacian\_smooth}         & \texttt{geometry}   & 拉普拉斯平滑（顶点级+整网级） & \texttt{cargo run --example laplacian\_smooth} \\
+  \texttt{point\_triangle\_distance} & \texttt{geometry}   & 点到三角形 7-Voronoi 区域距离 & \texttt{cargo run --example point\_triangle\_distance} \\
+  \texttt{loop\_subdivision}         & \texttt{subdiv}     & Loop 细分规模/度数/Euler 验证 & \texttt{cargo run --example loop\_subdivision} \\
+  \texttt{property}                  & \texttt{property}   & OpenMesh 风格属性系统全演示   & \texttt{cargo run --example property} \\
+  \texttt{validate}                  & \texttt{validate}   & 拓扑自检：干净通过 + 破坏检测 & \texttt{cargo run --example validate} \\
+  \texttt{export\_wgpu}              & \texttt{export}     & 导出 wgpu 顶点/索引缓冲       & \texttt{cargo run --example export\_wgpu} \\
+  \texttt{icosphere}                 & \texttt{test\_util} & icosphere 生成与性质验证     & \texttt{cargo run --example icosphere} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{示例依赖关系}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.7cm and 1.0cm,
+  base/.style={draw, rounded corners=2pt, minimum width=2.8cm, minimum height=0.7cm, align=center, font=\footnotesize},
+  foundation/.style={base, fill=blue!10},
+  builder/.style={base, fill=green!12},
+  consumer/.style={base, fill=yellow!18},
+  op/.style={-Stealth, thick, draw=gray!60!black}
+]
+  % 基础层
+  \node[foundation] (storage) {\texttt{storage\_basic}};
+  \node[foundation, right=of storage] (traversal) {\texttt{traversal}};
+
+  % 构建层
+  \node[builder, below=of storage] (build) {\texttt{build\_mesh}};
+  \node[builder, right=of build] (obj) {\texttt{obj\_io}};
+  \node[builder, right=of obj] (ico) {\texttt{icosphere}};
+
+  % 消费层第一行
+  \node[consumer, below=of build] (topo) {\texttt{topology\_ops}};
+  \node[consumer, right=of topo] (extrude) {\texttt{extrude\_face}};
+  \node[consumer, right=of extrude] (geo) {\texttt{geometry\_query}};
+  \node[consumer, right=of geo] (lap) {\texttt{laplacian\_smooth}};
+
+  % 消费层第二行
+  \node[consumer, below=of lap] (ptd) {\texttt{point\_triangle\_distance}};
+  \node[consumer, left=of ptd] (loop) {\texttt{loop\_subdivision}};
+  \node[consumer, left=of loop] (prop) {\texttt{property}};
+  \node[consumer, left=of prop] (val) {\texttt{validate}};
+  \node[consumer, left=of val] (exp) {\texttt{export\_wgpu}};
+
+  % 依赖箭头
+  \draw[op] (storage) -- (build);
+  \draw[op] (build) -- (topo);
+  \draw[op] (build) -- (extrude);
+  \draw[op] (build) -- (val);
+  \draw[op] (build) -- (exp);
+  \draw[op] (build) -- (prop);
+  \draw[op] (obj) -- (build);
+  \draw[op] (ico) -- (geo);
+  \draw[op] (ico) -- (lap);
+  \draw[op] (ico) -- (loop);
+  \draw[op] (ico) -- (exp);
+  \draw[op] (traversal) -- (geo);
+  \draw[op] (traversal) -- (prop);
+
+  % 图例
+  \node[font=\footnotesize, below=0.5cm of exp, align=left] (legend)
+    {{\color{blue!60!black}$\blacksquare$} 基础层 \quad
+     {\color{green!50!black}$\blacksquare$} 构建层 \quad
+     {\color{yellow!60!black}$\blacksquare$} 消费层};
+\end{tikzpicture}
+}
+\end{center}
+
+\section{各示例说明}
+
+\subsection{storage\_basic：底层存储 CRUD}
+
+演示 \texttt{MeshStorage} 的增删改查与 slotmap 的 ABA 安全保证。
+关键点：
+\begin{itemize}
+  \item 创建 3 顶点 + 3 半边 + 1 面，手动设置 \texttt{next/prev/face} 环；
+  \item 删除顶点后句柄立即失效，\texttt{contains\_vertex} 返回 \texttt{false}；
+  \item 槽位复用后旧句柄不复活（版本号机制）。
+\end{itemize}
+
+\subsection{build\_mesh：从顶点面索引构建网格}
+
+演示 \texttt{build\_mesh\_from\_vertices\_faces}，自动构建 twin/next/prev/边界环。
+关键点：
+\begin{itemize}
+  \item 输入 4 顶点 + 2 三角形（共享 1 边），输出 10 半边（2 内部 + 8 边界）；
+  \item 用 \texttt{validate\_topology} 验证构建结果；
+  \item 用 \texttt{is\_boundary\_edge} 区分内部边与边界边。
+\end{itemize}
+
+\subsection{obj\_io：OBJ 读写}
+
+演示 \texttt{parse\_obj} / \texttt{format\_obj} / \texttt{save\_obj} / \texttt{load\_obj}。
+关键点：
+\begin{itemize}
+  \item 解析四面体 OBJ 文本，要求面绕向一致；
+  \item 序列化回 OBJ 文本，文件 IO 往返一致；
+  \item 支持 \texttt{v/vt/vn} 格式与负索引。
+\end{itemize}
+
+\subsection{traversal：邻域遍历}
+
+演示 5 个迭代器 + 2 个边界判定函数。
+关键点：
+\begin{itemize}
+  \item \texttt{VertexRing}：顶点的 outgoing 半边环（CCW 顺序）；
+  \item \texttt{VertexAdjacentVerts} / \texttt{VertexAdjacentFaces}：邻居顶点 / 邻接面；
+  \item \texttt{FaceHalfEdges} / \texttt{FaceVertices}：面边界环；
+  \item 迭代期不持有借用，可自由 \texttt{\&mut mesh}。
+\end{itemize}
+
+\subsection{topology\_ops：三大拓扑操作}
+
+演示 \texttt{split\_edge} / \texttt{flip\_edge} / \texttt{collapse\_edge}。
+关键点：
+\begin{itemize}
+  \item split：顶点 $+1$，面 $+2$（内部边）或 $+1$（边界边）；
+  \item flip：顶点/面/半边数不变，仅重连 4 条半边；
+  \item collapse：顶点 $-1$，面 $-2$，半边 $-6$；
+  \item 翻转边界边返回 \texttt{FlipOnBoundaryEdge} 错误。
+\end{itemize}
+
+\subsection{extrude\_face：三角面挤出}
+
+演示 \texttt{extrude\_face} / \texttt{extrude\_faces} 将三角面沿给定方向
+\texttt{offset} 挤出形成闭合三棱柱。
+关键点：
+\begin{itemize}
+  \item 单面挤出：新增 3 顶点 + 7 面（1 反向顶面 + 6 侧面三角形），Euler $=2$；
+  \item 不同 \texttt{offset} 方向（沿法向、斜向、反向）都能正确闭合；
+  \item 零向量 \texttt{offset} 返回 \texttt{DegenerateTriangle}；
+  \item 与三角形共面的 \texttt{offset}（侧面面积 $< 10^{-12}$）同样报退化；
+  \item 批量挤出 \texttt{extrude\_faces} 对不相交三角形集合一次性挤出；
+  \item 挤出后所有面边界环长度均为 3，\texttt{validate\_topology} 通过。
+\end{itemize}
+
+\subsection{geometry\_query：几何查询}
+
+演示 5 个查询函数：边长、面积、法向、最小内角、顶点法向。
+关键点：
+\begin{itemize}
+  \item icosphere(0) 所有面为等边三角形，最小内角 $= 60°$；
+  \item 总面积 $\approx 4\pi$（单位球面面积）；
+  \item 顶点法向与顶点位置平行（球面性质）。
+\end{itemize}
+
+\subsection{laplacian\_smooth：拉普拉斯平滑}
+
+演示 \texttt{laplacian\_smooth\_vertex} 与 \texttt{laplacian\_smooth\_mesh}。
+关键点：
+\begin{itemize}
+  \item 单顶点：新位置 = 邻居位置算术平均；
+  \item 整网：$\lambda=0.5$，5 次迭代，重心偏移 $< 10^{-15}$（保留重心）；
+  \item 平滑使球面收缩（顶点偏离单位球面）；
+  \item $\lambda=0$ 时网格不变。
+\end{itemize}
+
+\subsection{point\_triangle\_distance：点到三角形距离}
+
+演示 Ericson 7-Voronoi 区域算法。
+关键点：
+\begin{itemize}
+  \item 面域：投影在三角形内部，距离 = 垂直高度；
+  \item 顶点域 $V_A/V_B/V_C$：距离到对应顶点；
+  \item 边域 $E_{AB}/E_{AC}/E_{BC}$：距离到边投影；
+  \item 退化三角形（共线）退化为三顶点最近距离。
+\end{itemize}
+
+\subsection{loop\_subdivision：Loop 细分}
+
+演示 \texttt{subdiv::loop\_subdivide} 在 icosphere 上的光滑细分效果。
+关键点：
+\begin{itemize}
+  \item 单次细分规模：$V' = V + E$，$F' = 4F$（icosphere(1) $42 \to 162$ 顶点，$80 \to 320$ 面）；
+  \item 连续多次细分保持 \texttt{check\_topology} 通过；
+  \item 度数分布：原始 12 顶点保持度数 $=5$，新增边中点度数 $=6$（正则性质）；
+  \item Euler 示性数 $V - E + F = 2$ 在每次细分后保持；
+  \item Loop 细分是逼近型细分，单位球面偏差随细分次数减小；
+  \item \texttt{validate\_topology} 完整校验无错误。
+\end{itemize}
+
+\subsection{property：OpenMesh 风格属性系统}
+
+演示 \texttt{property::MeshProperties} 与 \texttt{PropertyHandle<T>} 的核心用法。
+关键点：
+\begin{itemize}
+  \item 注册 \texttt{f64} 顶点权重属性，\texttt{set/get\_vertex\_prop} 读写；
+  \item 类型擦除：同一容器并存 \texttt{f64 / i32 / String / bool} 多种属性；
+  \item 加权拉普拉斯平滑：北极顶点权重 $5.0$，其余 $1.0$，验证等权与加权位移；
+  \item 半边属性：缓存所有半边边长，统计 \texttt{min/max/avg}；
+  \item 面属性：缓存面法向，与面心方向一致；
+  \item \texttt{remove\_vertex\_with\_props} 删除顶点时同步清理属性；
+  \item newtype 模式：同底层 \texttt{f64} 通过 \texttt{Weight}/\texttt{Temperature}
+        注册两个互不冲突的属性。
+\end{itemize}
+
+\subsection{validate：拓扑自检}
+
+演示 \texttt{validate\_topology} 的完整校验。
+关键点：
+\begin{itemize}
+  \item 干净 icosphere(1) 通过校验（0 错误）；
+  \item 人为破坏 twin 互指 $\to$ 检测 \texttt{TwinMismatch} + \texttt{SelfLoopHalfEdge}；
+  \item 悬空顶点引用 $\to$ \texttt{HalfEdgeDanglingVertex}；
+  \item 共线三角形 $\to$ \texttt{DegenerateFace}；
+  \item 入口 origin 不匹配 $\to$ \texttt{VertexHalfEdgeInconsistent}。
+\end{itemize}
+
+\subsection{export\_wgpu：wgpu 缓冲导出}
+
+演示 \texttt{mesh\_to\_vertex\_index\_buffers}。
+关键点：
+\begin{itemize}
+  \item 输出 \texttt{Vec<[f32; 3]>} 顶点 + \texttt{Vec<u32>} 索引；
+  \item icosphere(1)：42 顶点（504 字节）+ 240 索引（960 字节）；
+  \item 索引范围合法（max index $<$ vertex count）；
+  \item CCW 朝向：法向·重心 $> 0$（朝外）。
+\end{itemize}
+
+\subsection{icosphere：球体生成与性质验证}
+
+演示 \texttt{build\_icosphere} 在不同细分级别的网格性质。
+关键点：
+\begin{itemize}
+  \item 规模公式：$V_n = 10 \cdot 4^n + 2$，$F_n = 20 \cdot 4^n$，$E_n = 30 \cdot 4^n$；
+  \item 所有顶点在单位球面上（偏差 $< 10^{-15}$）；
+  \item 所有面法向朝外；
+  \item icosahedron(0) 的 12 个顶点度数均为 5；
+  \item Euler 公式 $V - E + F = 2$ 成立。
+\end{itemize}
+
+\section{运行方式}
+
+\subsection{运行单个示例}
+
+\begin{lstlisting}
+cargo run --example storage_basic
+cargo run --example icosphere
+\end{lstlisting}
+
+\subsection{编译所有示例（不运行）}
+
+\begin{lstlisting}
+cargo build --examples
+\end{lstlisting}
+
+\subsection{列出所有可用示例}
+
+\begin{lstlisting}
+cargo run --example  # 按 Tab 自动补全
+\end{lstlisting}
+
+\section{示例设计原则}
+
+\begin{enumerate}
+  \item \textbf{自包含}：每个示例独立可运行，不依赖其他示例；
+  \item \textbf{聚焦单一功能}：每个示例只演示一个模块的核心 API；
+  \item \textbf{可观测输出}：所有示例用 \texttt{println!} 打印关键数据，便于直观验证；
+  \item \textbf{使用真实网格}：大多数示例以 \texttt{build\_icosphere} 作为测试网格，
+        保证拓扑合法、几何有意义；
+  \item \textbf{包含错误处理}：\texttt{topology\_ops} 与 \texttt{validate} 示例
+        演示了错误路径（翻转边界边、检测破坏）。
+\end{enumerate}
+
+\section{典型输出示例}
+
+\subsection{icosphere 输出片段}
+
+\begin{lstlisting}
+=== icosphere 生成器示例 ===
+
+[细分级别与网格规模]
+     n       顶点        面         半边       公式验证
+     0       12       20         60          OK
+     1       42       80        240          OK
+     2      162      320        960          OK
+     3      642     1280       3840          OK
+     4     2562     5120      15360          OK
+
+[性质 1: 单位球面] icosphere(2) 顶点距单位球面最大偏差 = 2.22e-16
+[性质 5: Euler] n=0: V-E+F = 12-30+20 = 2（应为 2）
+\end{lstlisting}
+
+\subsection{topology\_ops 输出片段}
+
+\begin{lstlisting}
+[split_edge] 在中点插入新顶点 VertexId(13v1)
+  顶点 12 → 13
+  面 20 → 22
+  validate_mesh: Ok(())
+  check_topology: OK
+
+[collapse_edge] 折叠边，合并为新顶点 VertexId(13v1)
+  顶点 12 → 11
+  面 20 → 18
+  半边 60 → 54
+
+错误处理：翻转边界边 → Some("禁止翻转边界边 HalfEdgeId(1v1)")
+\end{lstlisting}
+
+\subsection{loop\_subdivision 输出片段}
+
+\begin{lstlisting}
+[1] 单次 Loop 细分规模变化
+  细分前 icosphere(1): V=   42 F=   80 E=  120 HE=  240
+  细分后              : V=  162 F=  320 E=  480 HE=  960
+  规模验证：V'=V+E (42+120=162)，F'=4F (4*80=320)
+  拓扑校验：OK
+
+[4] Euler 示性数 V - E + F 保持不变
+  细分 0x: V-E+F = 12-30+20 = 2（应为 2）
+  细分 1x: V-E+F = 42-120+80 = 2（应为 2）
+  细分 2x: V-E+F = 162-480+320 = 2（应为 2）
+  细分 3x: V-E+F = 642-1920+1280 = 2（应为 2）
+\end{lstlisting}
+
+\subsection{extrude\_face 输出片段}
+
+\begin{lstlisting}
+[1] 单个三角形挤出
+  挤出前: V=  3 F=  1 E=  3 HE=  6
+  挤出后: V=  6 F=  8 E= 12 HE= 24
+  新增面数 = 7（应为 7：1 顶面 + 6 侧面）
+  拓扑校验：OK
+  Euler 示性数 V-E+F = 2（闭合三棱柱应为 2）
+
+[3] 边界情况：零向量 / 退化 offset
+  零向量 offset：DegenerateTriangle（预期行为）
+  x 轴 offset：DegenerateTriangle（预期行为：侧面退化）
+\end{lstlisting}
+
+\subsection{property 输出片段}
+
+\begin{lstlisting}
+====== 1. 基础：注册并读写顶点属性 ======
+已注册顶点属性 f64，已设置 42 个顶点的权重
+vertex_prop_type_count = 1
+
+====== 2. 类型擦除：同一容器并存多种类型 ======
+已追加 i32 / String / bool 三种顶点属性
+vertex_prop_type_count = 4
+
+====== 4. 半边属性：缓存边长 ======
+已为 240 条半边缓存长度，halfedge_prop_type_count = 1
+边长统计：min=0.6071, max=0.7174, avg=0.6760 (共 240 条半边)
+
+====== 6. 删除元素时同步清理属性 ======
+删除前：
+  vVertexId(1v1) exists=true, weight=Some(1.0)
+删除后：
+  vVertexId(1v1) exists=false, weight=None
+\end{lstlisting}
+
+\end{document}

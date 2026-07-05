@@ -1,0 +1,387 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 网格变形模块设计文档} \\ \large \texttt{src/deformation.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{deformation.rs} 在 \texttt{geometry.rs} / \texttt{linalg.rs} /
+\texttt{traversal.rs} 之上实现两类经典的\textbf{网格变形}（Mesh Deformation）算法，
+参考 Sorkine 等人的工作：
+
+\begin{itemize}
+  \item \textbf{Laplacian 变形}（Laplacian Surface Editing, Sorkine et al. 2004）
+        —— 通过保留顶点的拉普拉斯坐标（局部细节）同时约束 handle 顶点，
+        求解稀疏线性系统得到变形后的位置；
+  \item \textbf{ARAP 变形}（As-Rigid-As-Possible, Sorkine \& Alexa 2007）
+        —— Local-Global 迭代，局部步骤对每个顶点 cell 计算最佳旋转（极分解），
+        全局步骤固定旋转求解 Poisson 系统更新位置。
+\end{itemize}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{2.2cm}p{4.8cm}p{7.4cm}@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  约束类型
+    & \texttt{DeformationConstraint}
+    & 将 \texttt{vertex} 移动到 \texttt{target\_position} 的约束描述 \\
+  \midrule
+  Laplacian
+    & \texttt{laplacian\_deformation(mesh, constraints)}
+    & 保留拉普拉斯坐标 $\delta_i$ 的同时满足 handle 约束；
+      分别对 $x,y,z$ 三轴求解 \\
+  \midrule
+  ARAP
+    & \texttt{arap\_deformation(mesh, constraints, iterations)}
+    & Local-Global 迭代；先以 Laplacian 解为初值，
+      每轮重估局部旋转 $R_i$（极分解）再全局求解；
+      大变形下细节保持更好 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{Laplacian 变形}
+
+\subsection{拉普拉斯坐标}
+
+对顶点 $i$，设邻接集合 $N(i)$，余切权重 $w_{ij}$（每条无向边在两端各计一次，
+代码中 \texttt{neighbors} 存储 $w_{ij}/2$），则\textbf{离散拉普拉斯坐标}为
+\[
+  \delta_i = \bigl(\sum_{j \in N(i)} w_{ij}\bigr)\, p_i - \sum_{j \in N(i)} w_{ij}\, p_j.
+\]
+$\delta_i$ 编码了顶点 $i$ 相对于邻域的\textbf{局部细节}（法向、曲率方向）。
+变形目标是在满足 handle 约束的同时，尽量保留 $\delta_i$。
+
+\subsection{线性系统构造}
+
+记 $p'_i$ 为变形后位置。对自由顶点 $i$：
+\[
+  \sum_j L_{ij}\, p'_j = \delta_i,
+\]
+其中 $L$ 为余切拉普拉斯矩阵。对约束顶点 $i$（约束目标 $c_i$）：
+\[
+  p'_i = c_i.
+\]
+分别对 $x, y, z$ 三个分量独立求解。
+
+\subsection{权重与对称写入}
+
+\texttt{build\_neighbors\_and\_weights} 为每个顶点收集邻居索引和余切权重，
+权重\textbf{减半}（$w \leftarrow w_{\text{orig}}/2$），因为每条无向边在
+两端的 \texttt{VertexRing} 中各被遍历一次。
+
+\texttt{SparseSystem::add(i, j, val)} 对称写入 $(i,j)$ 与 $(j,i)$，故：
+
+\begin{itemize}
+  \item 非对角总贡献：$-w$（$i$ 端）$-w$（$j$ 端）$= -2w = -w_{\text{orig}}$ $\checkmark$
+  \item 对角只从 $i$ 端写入一次，故需写 $2 \sum (w/2) = \sum w_{\text{orig}}$ $\checkmark$
+\end{itemize}
+
+\subsection{Dirichlet 约束处理}
+
+对自由顶点 $i$ 的邻居 $j$：
+\begin{itemize}
+  \item 若 $j$ 为\textbf{自由}顶点：写入矩阵 $L_{ij} = -w$（对称写入后总贡献 $-w_{\text{orig}}$）；
+  \item 若 $j$ 为\textbf{约束}顶点：矩阵中跳过 $(i, j)$，将 $-L_{ij}\, c_j = w_{\text{orig}}\, c_j = 2w\, c_j$ 移到 RHS。
+\end{itemize}
+
+矩阵对角 $L_{ii} = \sum_{\text{all } j} w_{\text{orig}}$（包括约束邻居）。
+最终系统为 SPD，调用 \texttt{conjugate\_gradient} 求解，
+迭代上限 $200n$，相对残差 $10^{-6}$，对角正则化 $10^{-8}$。
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.75cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.8cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：\texttt{mesh}, \texttt{constraints}};
+  \node[proc, below=of s, fill=blue!8] (p1)
+    {构建顶点索引、原始位置 $p_i$、邻居与减半余切权重 $w = w_{\text{orig}}/2$};
+  \node[proc, below=of p1, fill=green!12] (p2)
+    {计算原始拉普拉斯坐标 $\delta_i = (\sum w)\, p_i - \sum w\, p_j$};
+  \node[proc, below=of p2, fill=yellow!18] (p3)
+    {构造线性系统：约束行 $=$ 单位行；自由行对角 $= 2\sum w$，
+     自由邻居 $L_{ij}=-w$，约束邻居移到 RHS（$+2w\, c_j$）};
+  \node[proc, below=of p3, fill=orange!12] (p4)
+    {\texttt{regularize\_diagonal}（$10^{-8}$）+ \texttt{conjugate\_gradient}（$200n$, $10^{-6}$）};
+  \node[proc, below=of p4, fill=red!10] (p5)
+    {分别求解 $x, y, z$ 三轴，合并为 $[f64;3]$ 位置};
+  \node[startend, below=of p5] (e) {返回 \texttt{Some}($p'$)};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{ARAP 变形}
+
+\subsection{ARAP 能量}
+
+As-Rigid-As-Possible 变形最小化\textbf{局部刚性偏差}：
+\[
+  E_{\text{ARAP}} = \sum_i \sum_{j \in N(i)} w_{ij}\,
+    \bigl\| (p'_i - p'_j) - R_i\,(p_i - p_j) \bigr\|^2,
+\]
+其中 $R_i$ 是顶点 $i$ 的 cell（$i$ 及其邻居）的最佳旋转。
+$E = 0$ 当每个 cell 都经历纯刚体变换。
+
+\subsection{Local-Global 迭代}
+
+\textbf{局部步骤}（固定 $p'$，优化 $R$）：对每个顶点 $i$，
+构造协方差矩阵
+\[
+  S_i = \sum_{j \in N(i)} w_{ij}\, (p_i - p_j)\,(p'_i - p'_j)^T,
+\]
+对 $S_i$ 做\textbf{极分解} $S_i = R_i\, H_i$（$R_i$ 正交，$H_i$ 对称半正定），
+得到最佳旋转 $R_i$。
+
+\textbf{全局步骤}（固定 $R$，优化 $p'$）：对 $E_{\text{ARAP}}$ 关于 $p'_i$ 求导并令零，
+得 Poisson 系统
+\[
+  \sum_j w_{ij}\,(p'_i - p'_j) = \frac{1}{2}\sum_j w_{ij}\,(R_i + R_j)\,(p_i - p_j),
+\]
+左端即余切拉普拉斯 $L$（与 Laplacian 变形共用），右端由当前旋转 $R$ 计算。
+
+\subsection{极分解（Higham 1986）}
+
+对 $3\times3$ 矩阵 $S$，最接近 $S$ 的旋转 $R$（使 $\|S - R\|_F$ 最小且 $R$ 正交）
+由 Newton 迭代求得：
+\[
+  R_{k+1} = \frac{1}{2}\bigl(R_k + R_k^{-T}\bigr), \qquad R_0 = S.
+\]
+代码实现 \texttt{polar\_rotation}，最多 20 次迭代，收敛阈值 $\|R_{k+1} - R_k\|_F < 10^{-18}$。
+若 $\det(R) < 0$（反射），翻转最后一行修正。
+
+\subsection{RHS 构造与约束处理}
+
+全局步骤的 RHS 为
+\[
+  \text{rhs}_i = \frac{1}{2}\sum_j w_{\text{orig}}\,(R_i + R_j)\,(p_i - p_j).
+\]
+由于 \texttt{neighbors} 中 $w = w_{\text{orig}}/2$，上式等价于
+\[
+  \text{rhs}_i = \sum_j w\,(R_i + R_j)\,(p_i - p_j).
+\]
+
+对约束邻居 $j$，矩阵中跳过 $(i, j)$，将 $-L_{ij}\, c_j = w_{\text{orig}}\, c_j = 2w\, c_j$ 移到 RHS。
+
+\subsection{迭代流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.8cm, minimum height=0.7cm, font=\small, fill=gray!12},
+  iter/.style={draw, dashed, rounded corners=4pt, inner sep=4pt, fill=gray!6}
+]
+  \node[startend] (s) {开始：\texttt{mesh}, \texttt{constraints}, \texttt{iterations}};
+  \node[proc, below=of s, fill=blue!8] (p1)
+    {构建顶点索引、原始位置 $p^0$、邻居与减半余切权重};
+  \node[proc, below=of p1, fill=green!12] (p2)
+    {初始化 $p' \leftarrow$ \texttt{laplacian\_deformation}（提供合理初值）};
+  \node[proc, below=of p2, fill=yellow!18] (p3)
+    {预构建全局矩阵 $L$（与 $R$ 无关），约束行 $=$ 单位行};
+  \node[iter, below=of p3] (loop)
+    {\textbf{Local-Global 迭代}（共 \texttt{iterations} 次）};
+  \node[proc, below=of loop, fill=cyan!12] (l1)
+    {局部：$S_i = \sum_j w\, e_{ij}\, {e'}_{ij}^T$，极分解得 $R_i$};
+  \node[proc, below=of l1, fill=orange!12] (l2)
+    {全局：$\text{rhs}_i = \sum_j w\,(R_i+R_j)\,e_{ij}$，约束邻居 $+2w\,c_j$};
+  \node[proc, below=of l2, fill=red!10] (l3)
+    {CG 求解 $L\,p' = \text{rhs}$（$x,y,z$ 三轴），强制约束顶点为目标};
+  \node[startend, below=of l3] (e) {返回 \texttt{Some}($p'$)};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (loop);
+  \draw[op] (loop) -- (l1);
+  \draw[op] (l1) -- (l2);
+  \draw[op] (l2) -- (l3);
+  \draw[op, dashed] (l3.east) .. controls +(1.5,0) and +(1.5,0) .. node[right, font=\scriptsize] {下一轮} (l1.east);
+  \draw[op] (l3) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{$3\times3$ 矩阵工具}
+
+\texttt{deformation.rs} 内部实现了一套 $3\times3$ 矩阵运算（\texttt{Mat3 = [[f64;3];3]}）：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llp{8.2cm}@{}}
+  \toprule
+  \textbf{函数} & \textbf{签名} & \textbf{说明} \\
+  \midrule
+  \texttt{mat3\_transpose} & \texttt{Mat3 $\to$ Mat3} & 转置 \\
+  \texttt{mat3\_vec}        & \texttt{(Mat3, Vec3) $\to$ Vec3} & 矩阵 $\times$ 向量 \\
+  \texttt{mat3\_det}        & \texttt{Mat3 $\to$ f64} & 行列式 \\
+  \texttt{mat3\_adjoint}    & \texttt{Mat3 $\to$ Mat3} & 伴随矩阵（用于求逆） \\
+  \texttt{mat3\_inverse}    & \texttt{Mat3 $\to$ Option<Mat3>} & 行列式 $< 10^{-14}$ 返回 \texttt{None} \\
+  \texttt{polar\_rotation}  & \texttt{Mat3 $\to$ Mat3} & Higham Newton 迭代求最佳旋转 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{4.5cm}p{5.5cm}@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{laplacian\_deformation}
+    & 空网格（$V = 0$） & 返回 \texttt{None} \\
+  \texttt{laplacian\_deformation}
+    & 无约束 & 返回原始位置（\texttt{Some}($p$)） \\
+  \texttt{laplacian\_deformation}
+    & 对角 $\sum w = 0$ & 钳为 $10^{-10}$ \\
+  \texttt{laplacian\_deformation}
+    & CG 未收敛 & 返回 \texttt{None}（\texttt{?} 传播） \\
+  \midrule
+  \texttt{arap\_deformation}
+    & 空网格或无约束 & 返回 \texttt{None} \\
+  \texttt{arap\_deformation}
+    & 初始化 Laplacian 失败 & 返回 \texttt{None} \\
+  \texttt{arap\_deformation}
+    & \texttt{iterations} $= 0$ & 至少执行 1 次迭代 \\
+  \midrule
+  \texttt{polar\_rotation}
+    & 矩阵奇异（行列式 $\approx 0$） & 停止迭代，返回当前 $R$ \\
+  \texttt{polar\_rotation}
+    & $\det(R) < 0$（反射） & 翻转最后一行修正为旋转 \\
+  \texttt{compute\_cell\_rotations}
+    & $\|S\| < 10^{-14}$ & 退化 cell 使用单位旋转 $I$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{使用示例}
+
+\begin{lstlisting}
+use halfedge::deformation::{laplacian_deformation, arap_deformation, DeformationConstraint};
+use halfedge::storage::{MeshStorage, Vertex};
+use halfedge::topology_ops::add_triangle;
+
+// 构造 3x3 平面网格
+let mut mesh = MeshStorage::new();
+let mut vs = Vec::new();
+for y in 0..3 {
+    for x in 0..3 {
+        vs.push(mesh.add_vertex(Vertex::new([x as f64, y as f64, 0.0])));
+    }
+}
+// 添加三角形（略）...
+
+let constraints = vec![
+    DeformationConstraint { vertex: vs[0], target_position: [0.0, 0.0, 0.0] },
+    DeformationConstraint { vertex: vs[8], target_position: [2.0, 2.0, 1.0] },
+];
+
+// Laplacian：快速、保局部细节
+let deformed = laplacian_deformation(&mesh, &constraints).unwrap();
+
+// ARAP：大变形下细节保持更好（5-10 次迭代）
+let deformed_arap = arap_deformation(&mesh, &constraints, 5).unwrap();
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{6.5cm}p{8.2cm}@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{test\_laplacian\_deformation\_no\_constraint\_returns\_original}
+    & 无约束时返回的位置等于原始位置（容差 $10^{-3}$） \\
+  \texttt{test\_laplacian\_deformation\_single\_handle}
+    & 单 handle 抬起 $z=1$；handle 在目标位置；至少一个邻居有 $z$ 位移 \\
+  \texttt{test\_laplacian\_deformation\_two\_handles}
+    & 双 handle（固定 $v_0$、抬起 $v_8$）；两 handle 均在目标位置 \\
+  \texttt{test\_arap\_deformation\_basic}
+    & 4 角点约束（3 角点固定、1 角点抬起 $z=1$）；中心顶点 $z > 0$ \\
+  \texttt{test\_arap\_deformation\_empty\_returns\_none}
+    & 空网格返回 \texttt{None} \\
+  \texttt{test\_arap\_deformation\_no\_constraints\_returns\_none}
+    & 无约束返回 \texttt{None} \\
+  \texttt{test\_polar\_rotation\_identity}
+    & 单位矩阵的极分解 $= I$ \\
+  \texttt{test\_polar\_rotation\_90deg\_around\_z}
+    & 绕 $z$ 轴 $90^\circ$ 旋转矩阵的极分解等于自身 \\
+  \texttt{test\_polar\_rotation\_stretch\_matrix}
+    & 含拉伸的矩阵极分解为纯旋转（行列式 $= 1$、正交） \\
+  \texttt{test\_laplacian\_deformation\_icosphere}
+    & icosphere 上 Laplacian 变形：handle $z$ 接近目标；非 handle 顶点有位移 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/deformation.rs} 共 \textbf{10 个}单元测试，全库共 \textbf{394 个}。
+
+\end{document}

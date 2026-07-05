@@ -1,0 +1,297 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 拓扑自检模块设计文档} \\ \large \texttt{src/validate.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{validate.rs} 提供 \texttt{validate\_topology}：对 \texttt{MeshStorage} 执行
+\textbf{完整}的流形三角曲面不变量校验，输出所有违例的列表（而非首个错误）。
+
+\subsection{与 \texttt{topology\_ops::validate\_mesh} 的区别}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{特性} & \texttt{validate\_mesh} & \texttt{validate\_topology} \\
+  \midrule
+  定位     & 拓扑操作前后快速断言 & 完整网格自检 \\
+  错误返回 & 首个错误（\texttt{Result}） & 全部错误（\texttt{Vec}） \\
+  校验项   & twin / next-prev / 面边界环长度 & 8 项（见下） \\
+  退化面   & 不检查 & 检查面积 $< 10^{-12}$ \\
+  流形约束 & 不检查 & 检查边与顶点 \\
+  入口字段 & 不检查 & 检查 \texttt{Vertex/Face.halfedge} 一致性 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{校验项总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{\#} & \textbf{校验项} & \textbf{不变量} \\
+  \midrule
+  1 & 句柄有效性       & 所有 \texttt{vertex/face/twin/next/prev} 引用指向存活元素 \\
+  2 & twin 双向匹配    & $A.\mathrm{twin} = B \Rightarrow B.\mathrm{twin} = A$ \\
+  3 & next/prev 一致   & $A.\mathrm{next} = B \Leftrightarrow B.\mathrm{prev} = A$ \\
+  4 & 面边界环长度     & 每个 \texttt{next} 链闭合，长度 $= 3$ \\
+  5 & 入口字段一致     & \texttt{Vertex.halfedge} 的 origin 是该顶点；\texttt{Face.halfedge} 的 face 是该面 \\
+  6 & 退化面           & 三角面积 $\ge 10^{-12}$ \\
+  7 & 流形边           & 每条无向边至多被 2 个面共享 \\
+  8 & 流形顶点         & outgoing 环或闭合（内部），或开链恰 2 个边界端点（边界） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{错误类型}
+
+\texttt{ValidationError} 枚举共 14 个变体：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发条件} \\
+  \midrule
+  \texttt{HalfEdgeDanglingVertex} & 半边.\texttt{vertex} 指向已删除顶点 \\
+  \texttt{HalfEdgeDanglingFace}   & 半边.\texttt{face} 指向已删除面 \\
+  \texttt{HalfEdgeDanglingTwin}   & 半边.\texttt{twin} 指向已删除半边 \\
+  \texttt{HalfEdgeDanglingNext}   & 半边.\texttt{next} 指向已删除半边 \\
+  \texttt{HalfEdgeDanglingPrev}   & 半边.\texttt{prev} 指向已删除半边 \\
+  \texttt{TwinMismatch}           & $A.\mathrm{twin}=B$ 但 $B.\mathrm{twin}\ne A$ \\
+  \texttt{SelfLoopHalfEdge}       & $A.\mathrm{vertex} = A.\mathrm{twin}.\mathrm{vertex}$ \\
+  \texttt{NextPrevMismatch}       & $A.\mathrm{next}=B$ 但 $B.\mathrm{prev}\ne A$ \\
+  \texttt{FaceNotTriangular}      & 面边界环长度 $\ne 3$ \\
+  \texttt{VertexHalfEdgeInconsistent} & 顶点入口失效或 origin 不匹配 \\
+  \texttt{FaceHalfEdgeInconsistent}   & 面入口失效或 face 不匹配 \\
+  \texttt{DegenerateFace}         & 面积 $< 10^{-12}$ \\
+  \texttt{NonManifoldEdge}        & 同一无向边被 $> 2$ 个面共享 \\
+  \texttt{NonManifoldVertex}      & outgoing 环边界端点数 $\notin \{0, 2\}$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{主校验流程}
+
+\texttt{validate\_topology(mesh)} 依次调用 8 个子校验函数，所有错误汇入
+\texttt{Vec<ValidationError>}。便捷包装 \texttt{check\_topology} 返回
+\texttt{Result<(), Vec>}。
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8]  (p1) {1. validate\_halfedge\_references：检查 vertex / face / twin / next / prev 存活};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. validate\_twin\_relations：twin 互指 + 无自环};
+  \node[proc, below=of p2, fill=blue!8] (p3) {3. validate\_next\_prev：next / prev 反向一致};
+  \node[proc, below=of p3, fill=blue!8] (p4) {4. validate\_face\_boundaries：面 next 链闭合，长度 $= 3$};
+  \node[proc, below=of p4, fill=blue!8] (p5) {5. validate\_entry\_fields：Vertex / Face 入口字段一致};
+  \node[proc, below=of p5, fill=blue!8] (p6) {6. validate\_degenerate\_faces：三角面积 $\ge 10^{-12}$};
+  \node[proc, below=of p6, fill=blue!8] (p7) {7. validate\_manifold\_edges：无向边至多 2 面};
+  \node[proc, below=of p7, fill=blue!8] (p8) {8. validate\_manifold\_vertices：outgoing 环边界端点数};
+  \node[proc, below=of p8, fill=green!12] (pe) {返回 \texttt{Vec<ValidationError>}（空表示通过）};
+  \node[startend, below=of pe] (e) {结束};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (p7);
+  \draw[op] (p7) -- (p8);
+  \draw[op] (p8) -- (pe);
+  \draw[op] (pe) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\textbf{复杂度}：$O(V + E + F)$，每个元素遍历常数次。
+
+\section{关键算法}
+
+\subsection{流形边检查}
+
+对每个面 $f$，遍历其边界顶点序列 $v_0 v_1 \dots v_{k-1} v_0$（$k=3$），
+对每条无向边 $\{v_i, v_{i+1}\}$（端点排序作键）累加面计数：
+\[
+  \text{count}[\{a, b\}] \mathrel{+}= 1.
+\]
+最后扫描所有键，$\text{count} > 2$ 即为非流形边。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=6mm, inner sep=0pt, font=\footnotesize},
+  he/.style={-, thick, draw=gray!60!black}
+]
+  % 中心边 a-b
+  \node[vert] (a) at (0,0) {$a$};
+  \node[vert] (b) at (2,0) {$b$};
+  % 三个面共用此边（非流形）
+  \node[vert] (c1) at (1,1.5) {$c_1$};
+  \node[vert] (c2) at (1,-1.5) {$c_2$};
+  \node[vert] (c3) at (3,0) {$c_3$};
+  \draw[he] (a) -- (b);
+  \draw[he] (a) -- (c1);
+  \draw[he] (b) -- (c1);
+  \draw[he] (a) -- (c2);
+  \draw[he] (b) -- (c2);
+  \draw[he] (a) -- (c3);
+  \draw[he] (b) -- (c3);
+  \node[below=1.8cm of a, xshift=1cm, font=\small, align=center, draw=red!60!black, fill=red!8]
+    {无向边 $\{a, b\}$ 被 3 个面共享 $\Rightarrow$ \texttt{NonManifoldEdge}};
+\end{tikzpicture}
+\end{center}
+
+\subsection{流形顶点检查}
+
+对顶点 $v$，用 \texttt{VertexRing} 收集其所有 outgoing 半边。
+对每条 outgoing 半边 $h$，判定是否为「边界半边」：
+\[
+  \text{isBoundary}(h) = \bigl(h.\mathrm{face} = \texttt{None}\bigr)
+                     \vee \bigl(h.\mathrm{twin}.\mathrm{face} = \texttt{None}\bigr).
+\]
+统计 \texttt{boundary\_count}：
+\begin{itemize}
+  \item $= 0$：内部顶点，outgoing 环闭合 $\Rightarrow$ 合法；
+  \item $= 2$：边界顶点，outgoing 环为开链，两端为边界半边 $\Rightarrow$ 合法；
+  \item 其他：非流形（多条边界扇区或孤立边界）。
+\end{itemize}
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=6mm, inner sep=0pt, font=\footnotesize},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  bdhe/.style={-Stealth, thick, draw=red!70!black, dashed}
+]
+  % 左：内部顶点 boundary_count=0
+  \node[vert] (v1) at (0,0) {$v$};
+  \node[vert] (w1) at (90:1.6) {$w_1$};
+  \node[vert] (w2) at (210:1.6) {$w_2$};
+  \node[vert] (w3) at (330:1.6) {$w_3$};
+  \draw[he] (v1) -- (w1);
+  \draw[he] (v1) -- (w2);
+  \draw[he] (v1) -- (w3);
+  \draw[he] (w1) -- (w2);
+  \draw[he] (w2) -- (w3);
+  \draw[he] (w3) -- (w1);
+  \node[below=2.4cm of v1, font=\small, align=center] {内部顶点\\$\text{bdry}=0$ ✓};
+
+  % 右：边界顶点 boundary_count=2
+  \node[vert] (v2) at (5,0) {$v$};
+  \node[vert] (x1) at (5,1.6) {$x_1$};
+  \node[vert] (x2) at (3.5,-0.8) {$x_2$};
+  \node[vert] (x3) at (6.5,-0.8) {$x_3$};
+  \draw[he] (v2) -- (x1);
+  \draw[he] (v2) -- (x2);
+  \draw[he] (v2) -- (x3);
+  \draw[he] (x2) -- (x1);
+  \draw[he] (x1) -- (x3);
+  \draw[bdhe] (x2) -- (v2);
+  \draw[bdhe] (x3) -- (v2);
+  \node[below=2.4cm of v2, font=\small, align=center] {边界顶点\\$\text{bdry}=2$ ✓};
+\end{tikzpicture}
+\end{center}
+
+\subsection{入口字段一致性}
+
+\textbf{顶点入口}：$v.\mathrm{halfedge}$ 必须指向一条半边 $h$ 满足
+$h.\mathrm{twin}.\mathrm{vertex} = v$（即 $h$ 的 origin 是 $v$）。
+
+\textbf{面入口}：$f.\mathrm{halfedge}$ 必须指向一条半边 $h$ 满足
+$h.\mathrm{face} = f$。
+
+这两项检查能捕获 \texttt{split\_edge} / \texttt{flip\_edge} 等拓扑操作中
+「忘记更新入口字段」的常见 bug。
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item \texttt{validate\_halfedge\_references}：若 \texttt{twin/next/prev} 为
+        \texttt{None}，跳过该项检查（\texttt{None} 不视为悬空）；
+  \item \texttt{validate\_face\_boundaries}：设 \texttt{max\_iter} =
+        \texttt{halfedge\_count + 1}，防止 next 链成环时无限循环；
+  \item \texttt{validate\_degenerate\_faces}：若面边界环非 3 顶点，跳过
+        （已由 \texttt{validate\_face\_boundaries} 报告）。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{clean\_triangle\_passes\_validation}       & 干净三角形 0 错误 \\
+  \texttt{clean\_closed\_fan\_passes\_validation}    & 闭合扇形 0 错误（内部顶点） \\
+  \texttt{detects\_twin\_mismatch}                   & 检测 twin 不互指 \\
+  \texttt{detects\_dangling\_vertex\_reference}      & 检测悬空顶点引用 \\
+  \texttt{detects\_degenerate\_face}                 & 检测共线三角形 \\
+  \texttt{detects\_non\_triangular\_face}            & 检测四边形面 \\
+  \texttt{detects\_vertex\_halfedge\_inconsistency}  & 检测入口 origin 不匹配 \\
+  \texttt{topology\_ops\_preserve\_validity}         & split 后仍通过校验 \\
+  \texttt{flip\_preserves\_full\_validity}           & flip 后仍通过校验 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

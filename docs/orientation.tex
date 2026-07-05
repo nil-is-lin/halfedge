@@ -1,0 +1,303 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 面朝向一致性与可定向性模块设计文档} \\ \large \texttt{src/orientation.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{orientation.rs} 提供面朝向一致性检测与修复能力，回答以下三个问题：
+
+\begin{enumerate}
+  \item 网格中所有相邻面是否朝向一致（\texttt{are\_normals\_consistent}）？
+  \item 网格是否可定向（\texttt{is\_orientable}）？
+  \item 如何修复不一致的朝向（\texttt{fix\_orientations}）？
+\end{enumerate}
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  检测 & \texttt{are\_normals\_consistent(mesh)} & 是否所有相邻面朝向一致 \\
+  检测 & \texttt{is\_orientable(mesh)}           & 是否可定向（无 Möbius 矛盾） \\
+  修复 & \texttt{fix\_orientations(\&mut mesh)}   & 翻转不一致的面，返回翻转数 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{背景：朝向一致与可定向}
+
+\subsection{朝向一致（consistently oriented）}
+
+设半边 $h$ 与其 twin $h^\star$ 分别属于面 $f_1, f_2$：
+\[
+  h: A \to B,\ \mathrm{face}(h) = f_1; \qquad
+  h^\star: B \to A,\ \mathrm{face}(h^\star) = f_2.
+\]
+\textbf{朝向一致}要求 $h$ 与 $h^\star$ \textbf{方向相反}，即
+$\mathrm{vertex}(h) \ne \mathrm{vertex}(h^\star)$。
+
+若两者方向相同（$\mathrm{vertex}(h) = \mathrm{vertex}(h^\star)$），
+则两面朝向「同向」，构成局部不一致。
+
+\subsection{可定向（orientable）}
+
+\textbf{可定向}是更弱的性质：网格能否为每个面分配一个朝向，使所有相邻面
+朝向一致。不可定向网格（如 Möbius 带、Klein 瓶）存在矛盾分配，
+无法通过翻转修复。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{性质} & \textbf{检查对象} & \textbf{失败原因} \\
+  \midrule
+  一致  & 当前 \texttt{mesh} 状态       & 存在同向 twin 对 \\
+  可定向 & BFS 遍历中的方向分配          & 存在矛盾（Möbius 结构） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{are\_normals\_consistent 算法}
+
+遍历所有半边，检查 twin 对的方向：
+
+\begin{lstlisting}
+pub fn are_normals_consistent(mesh: &MeshStorage) -> bool {
+    for he in mesh.halfedge_ids() {
+        let h = match mesh.get_halfedge(he) { Some(h) => h, None => continue };
+        let twin = match h.twin { Some(t) => t, None => continue };
+        let twin_data = match mesh.get_halfedge(twin) { Some(t) => t, None => continue };
+        // he.vertex == twin.vertex 表示同向 -> 不一致
+        if h.vertex == twin_data.vertex {
+            return false;
+        }
+    }
+    true
+}
+\end{lstlisting}
+
+\textbf{复杂度}：$O(E)$（遍历所有半边），$O(1)$ 额外空间。
+\textbf{提前终止}：发现第一处同向即返回 \texttt{false}。
+
+\section{is\_orientable 算法}
+
+\subsection{思路}
+
+对每个面连通分量做 BFS，从基准面开始传播朝向约束。若某条 twin 边两端
+方向相同，则不可定向。
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：遍历所有面};
+  \node[dec, below=of s] (d1) {面 $f$ 已访问？};
+  \node[proc, right=1.6cm of d1, fill=blue!8] (skip) {跳过};
+  \node[proc, below=of d1, fill=blue!8] (p1) {$f \to$ 队列，标记访问};
+  \node[dec, below=of p1] (d2) {队列非空？};
+  \node[proc, below=of d2, fill=yellow!15] (p2) {出队 $f$；遍历 $f$ 的所有半边 $h$};
+  \node[dec, below=of p2] (d3) {twin $h^\star$ 有邻接面 $f'$？};
+  \node[dec, below=of d3] (d4) {$h.\mathrm{vertex} = h^\star.\mathrm{vertex}$？};
+  \node[proc, right=1.6cm of d4, fill=red!15] (bad) {返回 \texttt{false}（不可定向）};
+  \node[proc, below=of d4, fill=green!12] (ok) {标记 $f'$ 访问；入队 $f'$};
+  \node[startend, right=1.6cm of d2, fill=green!12] (e) {返回 \texttt{true}};
+  \draw[op] (s) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (skip);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (p1);
+  \draw[op] (p1) -- (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {否} (e);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {是} (p2);
+  \draw[op] (p2) -- (d3);
+  \draw[op] (d3) -- node[right, font=\scriptsize] {是} (d4);
+  \draw[op] (d4) -- node[above, font=\scriptsize] {是} (bad);
+  \draw[op] (d4) -- node[right, font=\scriptsize] {否} (ok);
+  \draw[op, dashed] (ok.west) -| ($(p2.west)+(-0.6,0)$) -- (p2.west);
+  \draw[op, dashed] (skip.north) |- (e.north);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{与 are\_normals\_consistent 的区别}
+
+\texttt{are\_normals\_consistent} 是\textbf{当前状态}检测，仅判断是否存在
+同向 twin 对；\texttt{is\_orientable} 是\textbf{可分配性}检测，
+即使当前状态不一致，也可能通过翻转某些面来达到一致（即可定向但当前不一致）。
+
+\section{fix\_orientations 算法}
+
+\subsection{整体流程}
+
+对每个连通分量，BFS 遍历，遇到与基准方向不一致的邻接面就翻转：
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8] (p1) {对每个未访问的 \texttt{seed}：\texttt{visited $\gets \{$seed$\}$}；\texttt{queue $\gets$ [seed]}};
+  \node[dec, below=of p1] (d1) {队列非空？};
+  \node[proc, below=of d1, fill=yellow!15] (p2) {$f \gets$ queue.pop\_front()；遍历 $f$ 的所有半边 $h$};
+  \node[dec, below=of p2] (d2) {邻接面 $f'$ 未访问且 $h.\mathrm{vertex} = h^\star.\mathrm{vertex}$？};
+  \node[proc, right=1.6cm of d2, fill=red!12] (yes) {翻转 $f'$；\texttt{flipped $+{=}1$}};
+  \node[proc, below=of d2, fill=green!12] (no) {标记 $f'$ 访问；入队 $f'$};
+  \node[startend, right=1.6cm of d1, fill=green!12] (e) {返回 \texttt{flipped}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {是} (p2);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {否} (e);
+  \draw[op] (p2) -- (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (yes);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {否} (no);
+  \draw[op, dashed] (yes.east) -- ++(0.4,0) |- (no.east);
+  \draw[op, dashed] (no.west) -| ($(p2.west)+(-0.6,0)$) -- (p2.west);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{flip\_face\_orientation：翻转单个三角面}
+
+对三角面 $[v_0, v_1, v_2]$，半边环 $h_0 \to h_1 \to h_2$，每条半边指向
+对应顶点。翻转操作：
+
+\begin{enumerate}
+  \item \textbf{交换 vertex}：$h_0.\mathrm{vertex} \gets v_2$，
+        $h_1.\mathrm{vertex} \gets v_0$，
+        $h_2.\mathrm{vertex} \gets v_1$（每条半边指向原 next 的起点）；
+  \item \textbf{交换 next/prev}：$h_i.\mathrm{next} \leftrightarrow h_i.\mathrm{prev}$。
+\end{enumerate}
+
+效果：环顺序由 $v_0 \to v_1 \to v_2$ 变为 $v_2 \to v_1 \to v_0$（CCW $\leftrightarrow$ CW）。
+
+\subsection{限制}
+
+\begin{itemize}
+  \item 仅支持\textbf{三角面}（$k = 3$），\texttt{flip\_face\_orientation}
+        内部对 $k \ne 3$ 仅交换 next/prev 但不调整 vertex，可能产生错误结果；
+        本项目所有网格为三角网格，故无问题；
+  \item 不可定向网格无法通过翻转达到一致，\texttt{fix\_orientations} 不报错，
+        但剩余矛盾仍存在。调用方应在调用前用 \texttt{is\_orientable} 检查。
+\end{itemize}
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{API} & \textbf{时间复杂度} & \textbf{空间复杂度} \\
+  \midrule
+  \texttt{are\_normals\_consistent} & $O(E)$ & $O(1)$ \\
+  \texttt{is\_orientable}           & $O(V + F)$ & $O(F)$（visited + 队列） \\
+  \texttt{fix\_orientations}        & $O(V + F)$ & $O(F)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item \texttt{are\_normals\_consistent}：\texttt{get\_halfedge} 返回 \texttt{None}
+        时跳过该半边，不 panic；
+  \item \texttt{is\_orientable}：边界半边（\texttt{twin.face = None}）跳过，
+        不视为矛盾；
+  \item \texttt{fix\_orientations}：对 \texttt{face\_ids().collect::<Vec<\_>>()}
+        先收集所有面 ID，避免借用冲突。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{icosphere\_has\_consistent\_normals}    & icosphere(1) 一致且可定向 \\
+  \texttt{fix\_orientations\_noop\_on\_icosphere} & 一致网格翻转数 $= 0$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 2 个单元测试，覆盖「干净网格」正常路径；
+项目整体 \texttt{cargo test} 共 371 个用例。
+\textbf{待补充}：不一致网格翻转修复测试、不可定向网格检测测试（Möbius 构造）。
+
+\section{设计权衡}
+
+\begin{itemize}
+  \item \textbf{BFS 而非 DFS}：避免栈溢出，对超大连通分量更稳定；
+  \item \textbf{仅支持三角面翻转}：本项目所有网格为三角网格，简化实现；
+        若未来需要支持多边形，需扩展 \texttt{flip\_face\_orientation}；
+  \item \textbf{fix\_orientations 不返回错误}：不可定向网格无法修复，
+        但本函数仍尝试修复可修复的部分，返回翻转数；
+        调用方可通过后续 \texttt{are\_normals\_consistent} 检查是否完全修复；
+  \item \textbf{visited 用 HashSet}：\texttt{FaceId} 实现 \texttt{Hash}，
+        查询 $O(1)$。
+\end{itemize}
+
+\end{document}

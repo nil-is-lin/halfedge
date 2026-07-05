@@ -1,0 +1,390 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: QEM 网格简化模块设计文档} \\ \large \texttt{src/decimate.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{decimate.rs} 在 \texttt{topology\_ops}（\texttt{collapse\_edge\_at}）与
+\texttt{geometry}（\texttt{face\_normal}）之上叠加\textbf{基于 Quadric Error Metrics
+的网格简化}能力。参考 Garland \& Heckbert 1997 "Surface Simplification Using
+Quadric Error Metrics"。
+
+\subsection{核心 API}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{8.5cm}@{}}
+  \toprule
+  \textbf{API} & \textbf{语义} \\
+  \midrule
+  \texttt{decimate\_qem(\&mut mesh, target\_faces)} & QEM 简化到目标面数，返回实际移除面数 \\
+  \texttt{decimate\_to\_vertices(\&mut} \\
+  \texttt{\quad mesh, target\_verts)} & 简化到目标顶点数（闭合流形 $F = 2V - 4$） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{依赖关系}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{依赖模块} & \textbf{用途} \\
+  \midrule
+  \texttt{storage} & \texttt{MeshStorage} 容器 \\
+  \texttt{geometry} & \texttt{face\_normal}（面法向 → 平面方程） \\
+  \texttt{topology\_ops} & \texttt{collapse\_edge\_at}（指定位置折叠） \\
+  \texttt{traversal} & \texttt{is\_boundary\_edge}、\texttt{FaceHalfEdges}、\texttt{VertexRing} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{Quadric 二次误差矩阵}
+
+\subsection{数据结构}
+
+4×4 对称矩阵，利用对称性存储 10 个独立分量：
+
+\begin{lstlisting}
+#[derive(Clone, Debug)]
+struct Quadric {
+    // [a^2, ab, ac, ad, b^2, bc, bd, c^2, cd, d^2]
+    // 对应矩阵:
+    //   [ q00 q01 q02 q03 ]
+    //   [ q01 q11 q12 q13 ]
+    //   [ q02 q12 q22 q23 ]
+    //   [ q03 q13 q23 q33 ]
+    data: [f64; 10],
+}
+\end{lstlisting}
+
+\subsection{基本二次误差矩阵}
+
+对平面方程 $ax + by + cz + d = 0$（$(a,b,c)$ 为\textbf{单位}法向），基本二次误差矩阵：
+\[
+  K_p = \mathbf{p} \cdot \mathbf{p}^T, \quad \mathbf{p} = [a, b, c, d]
+\]
+顶点 $\mathbf{v} = [x, y, z, 1]$ 到该平面的距离平方：
+\[
+  \Delta(\mathbf{v}) = \mathbf{v}^T K_p \mathbf{v} = (ax + by + cz + d)^2
+\]
+
+\subsection{顶点 Quadric 累加}
+
+顶点 $v$ 的 Quadric 为其所有邻接面平面 $K_p$ 之和：
+\[
+  Q_v = \sum_{f \in N(v)} K_{p_f}
+\]
+评估顶点 $v$ 的二次误差：
+\[
+  \Delta(v) = \mathbf{v}^T Q_v \mathbf{v}
+  = \sum_{f \in N(v)} (a_f x + b_f y + c_f z + d_f)^2
+\]
+即该顶点到所有邻接面平面距离平方之和。
+
+\subsection{evaluate 实现}
+
+\begin{lstlisting}
+fn evaluate(&self, pos: [f64; 3]) -> f64 {
+    let [x, y, z] = pos;
+    let q = &self.data;
+    q[0]*x*x + 2.0*q[1]*x*y + 2.0*q[2]*x*z + 2.0*q[3]*x
+    + q[4]*y*y + 2.0*q[5]*y*z + 2.0*q[6]*y
+    + q[7]*z*z + 2.0*q[8]*z
+    + q[9]
+}
+\end{lstlisting}
+
+\section{最优折叠位置求解}
+
+\subsection{目标}
+
+折叠边 $(v_0, v_1)$ 后，合并 Quadric $Q = Q_{v_0} + Q_{v_1}$。
+最优新顶点位置：
+\[
+  \mathbf{p}^* = \arg\min_{\mathbf{v}} \mathbf{v}^T Q \mathbf{v}
+\]
+
+\subsection{3×3 线性方程组}
+
+令 $\partial(\mathbf{v}^T Q \mathbf{v}) / \partial x =
+\partial / \partial y = \partial / \partial z = 0$，得：
+\[
+  \begin{bmatrix}
+    q_{00} & q_{01} & q_{02} \\
+    q_{01} & q_{11} & q_{12} \\
+    q_{02} & q_{12} & q_{22}
+  \end{bmatrix}
+  \begin{bmatrix} x \\ y \\ z \end{bmatrix}
+  =
+  -\begin{bmatrix} q_{03} \\ q_{13} \\ q_{23} \end{bmatrix}
+\]
+
+用 Cramer 法则求解。行列式 $|\det| < 10^{-12}$ 时矩阵奇异，返回 \texttt{None}。
+
+\subsection{候选位置回退}
+
+QEM 矩阵奇异时（如共面区域），最优位置不确定。本实现评估 4 个候选位置的
+代价，取最小者：
+\begin{enumerate}
+  \item $\mathbf{p}^*$（若 Cramer 法则有解）；
+  \item $\mathbf{v}_0$（原始端点 A）；
+  \item $\mathbf{v}_1$（原始端点 B）；
+  \item $\frac{\mathbf{v}_0 + \mathbf{v}_1}{2}$（中点）。
+\end{enumerate}
+
+这与 Garland-Heckbert 原文的建议一致，保证退化情况也能给出合理位置。
+
+\section{算法流程}
+
+\subsection{流程图}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.55cm and 0.6cm,
+  box/.style={draw, rounded corners=2pt, minimum width=4.5cm, minimum height=0.7cm, align=center, font=\footnotesize},
+  arrow/.style={-Stealth, thick, draw=blue!60!black},
+  decision/.style={draw, diamond, aspect=2, minimum width=3.2cm, minimum height=0.8cm, align=center, font=\footnotesize}
+]
+  \node[box, fill=blue!10] (init) {初始化：遍历面，为顶点累加 $K_p$};
+  \node[box, fill=green!15, below=of init] (build) {建堆：每条非边界边计算 $(cost, \mathbf{p}^*)$};
+  \node[decision, fill=yellow!20, below=of build] (check) {面数 $>$ target 且堆非空？};
+  \node[box, fill=orange!20, below=0.8cm of check] (pop) {弹出最小代价边 $(cost, he)$};
+  \node[decision, fill=yellow!20, below=of pop] (valid) {he 有效且代价未过期？};
+  \node[box, fill=red!15, below=0.8cm of valid] (collapse) {\texttt{collapse\_edge\_at} 折叠};
+  \node[box, fill=green!15, below=of collapse] (update) {更新 $Q_K = Q_A + Q_B$；重算 $K$ 邻边代价};
+  \node[box, fill=blue!10, right=2cm of check] (done) {返回 \texttt{faces\_removed}};
+
+  \draw[arrow] (init) -- (build);
+  \draw[arrow] (build) -- (check);
+  \draw[arrow] (check) -- node[above, font=\scriptsize] {是} (pop);
+  \draw[arrow] (check) -- node[above, font=\scriptsize] {否} (done);
+  \draw[arrow] (pop) -- (valid);
+  \draw[arrow] (valid) -- node[right, font=\scriptsize] {是} (collapse);
+  \draw[arrow] (valid.west) -- ++(-1.5,0) |- (check.west) node[pos=0.25, left, font=\scriptsize] {否};
+  \draw[arrow] (collapse) -- (update);
+  \draw[arrow] (update.east) -- ++(1.5,0) |- (check.east);
+\end{tikzpicture}
+\end{center}
+
+\subsection{算法步骤详解}
+
+\paragraph{步骤 1：初始化顶点 Quadric}
+遍历所有三角面 $f$，计算平面方程 $(a_f, b_f, c_f, d_f)$（$a,b,c$ 为单位法向，
+$d = -\mathbf{n} \cdot \mathbf{v}_0$）。为面的每个顶点累加 $K_{p_f}$。
+
+\paragraph{步骤 2：构建边代价堆}
+遍历所有半边，跳过边界边。对每条边 $(v_0, v_1)$：
+\begin{itemize}
+  \item $Q = Q_{v_0} + Q_{v_1}$；
+  \item $\mathbf{p}^* = \arg\min \mathbf{v}^T Q \mathbf{v}$（Cramer 法则，奇异时回退）；
+  \item $cost = \min_{\mathbf{p} \in \{\mathbf{p}^*, \mathbf{v}_0, \mathbf{v}_1, \text{mid}\}} \mathbf{p}^T Q \mathbf{p}$；
+  \item 压入最小堆 $(Reverse(cost), he)$。
+\end{itemize}
+
+\paragraph{步骤 3：贪心折叠循环}
+\begin{enumerate}
+  \item 弹出最小代价边 $(cost, he)$；
+  \item \textbf{惰性删除检测}：若 $he$ 已删除或 $cost$ 与 \texttt{cost\_map} 中存储的不符，跳过；
+  \item 检查是否已变为边界边，若是跳过；
+  \item 收集 6 条待删除半边 $[he, twin, n_1, p_1, n_2, p_2]$；
+  \item 调用 \texttt{collapse\_edge\_at(mesh, he, $\mathbf{p}^*$)}；
+  \item 更新 $Q_K = Q_A + Q_B$；
+  \item 清理被删除半边的 \texttt{cost\_map} 条目；
+  \item 对 $K$ 的每条邻接边重算 $(cost, \mathbf{p}^*)$，压入堆并更新 \texttt{cost\_map}。
+\end{enumerate}
+
+\section{惰性删除策略}
+
+\subsection{问题}
+
+折叠一条边后，与 $A$、$B$ 相邻的其他边的 Quadric 已改变（因 $Q_K \neq Q_A$），
+堆中这些边的旧代价已过期。直接从堆中删除任意元素是 $O(n)$ 的。
+
+\subsection{方案}
+
+采用\textbf{惰性删除}（lazy deletion）：
+\begin{itemize}
+  \item 维护 \texttt{HashMap<HalfEdgeId, (f64, [f64;3])>} 记录每个半边的\textbf{最新}代价和位置；
+  \item 弹出堆顶 $(heap\_cost, he)$ 后，比较 $heap\_cost$ 与 \texttt{cost\_map[he]} 的值；
+  \item 差值 $> 10^{-9}$ 则为过期条目，跳过；
+  \item 折叠后重新计算 $K$ 的邻边代价，更新 \texttt{cost\_map} 并压入新条目。
+\end{itemize}
+
+过期条目占用的内存会在后续弹出时自动释放。每个条目最多被压入堆 $O(valence)$ 次，
+总堆操作 $O(E \cdot \bar{v} \cdot \log E)$。
+
+\section{边界处理}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{情况} & \textbf{处理} \\
+  \midrule
+  边界边 & 不加入堆，不参与折叠（保持边界拓扑） \\
+  QEM 矩阵奇异（共面区域） & 回退到 4 候选位置中最小代价者 \\
+  折叠失败（链接条件、退化） & 跳过该边，继续弹出下一条 \\
+  \texttt{target\_faces} $\ge$ 当前面数 & 直接返回 \texttt{Ok(0)}，不操作 \\
+  堆空且面数仍 $>$ target & 返回已移除面数（可能未达 target） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{复杂度分析}
+
+设原始网格有 $V$ 顶点、$E$ 边、$F$ 面，目标移除 $k$ 条边（$k \le E$）。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{步骤} & \textbf{时间} & \textbf{空间} \\
+  \midrule
+  初始化顶点 Quadric & $O(F)$ & $O(V)$ \\
+  建堆（每条边一次） & $O(E \log E)$ & $O(E)$ \\
+  单次折叠（含邻边重算） & $O(\bar{v} \log E)$ & $O(\bar{v})$ \\
+  $k$ 次折叠总计 & $O(k \bar{v} \log E)$ & $O(E)$ \\
+  \midrule
+  \textbf{总计} & $O((F + k\bar{v}) \log E)$ & $O(V + E)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+其中 $\bar{v}$ 为平均顶点 valence（通常 6）。对于简化到 50\%，$k \approx E/4$，
+总计 $O(E \log E)$。
+
+\section{与 collapse\_edge\_at 的协作}
+
+\texttt{decimate.rs} 不直接操作半边拓扑，而是通过
+\texttt{collapse\_edge\_at} 委托给 \texttt{topology\_ops} 模块。调用形式为
+\texttt{collapse\_edge\_at(mesh, he, $\mathbf{p}^*$)}，其中 $\mathbf{p}^*$ 为 QEM
+求出的最优折叠位置。该函数：
+\begin{itemize}
+  \item 校验链接条件（防止非流形）；
+  \item 创建新顶点 $K$ 位置为 $\mathbf{p}^*$（QEM 最优位置，而非中点）；
+  \item 缝合 twin、更新 vertex、删除 6 条半边 + 2 面 + 2 顶点；
+  \item 返回 $K$ 的 \texttt{VertexId}。
+\end{itemize}
+
+\section{退化健壮性}
+
+\begin{itemize}
+  \item \textbf{除零}：Cramer 法则检查 $|\det| < 10^{-12}$ 返回 \texttt{None}；
+  \item \textbf{NaN 代价}：\texttt{edge\_cost\_and\_position} 中将 NaN 转为 $+\infty$；
+  \item \textbf{无效 ID}：所有 \texttt{mesh.get\_*} 返回 \texttt{None} 时跳过；
+  \item \textbf{空网格}：\texttt{face\_count() == 0} 时 \texttt{target $\ge$ 0} 直接返回；
+  \item \textbf{CostKey Ord}：\texttt{partial\_cmp().unwrap\_or(Equal)} 处理 NaN 比较不 panic。
+\end{itemize}
+
+\section{测试覆盖}
+
+{\footnotesize
+\renewcommand{\arraystretch}{1.18}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{7.2cm}p{7.8cm}@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证内容} \\
+  \midrule
+  \endhead
+  \multicolumn{2}{l}{\textit{Quadric 单元测试}} \\
+  \texttt{quadric\_zero\_evaluates\_to\_zero} & 零矩阵任意点误差 $= 0$ \\
+  \texttt{quadric\_from\_plane\_zero\_at\_plane\_point} & 平面上的点误差 $= 0$，平面外 $=$ 距离² \\
+  \texttt{quadric\_add\_is\_commutative} & $Q_1 + Q_2 = Q_2 + Q_1$ \\
+  {\tiny\texttt{quadric\_find\_optimal\_position\_singular\_returns\_none}} & 秩 1 矩阵返回 \texttt{None} \\
+  \texttt{quadric\_find\_optimal\_position\_two\_planes} & 两正交平面仍奇异（z 自由） \\
+  \texttt{quadric\_find\_optimal\_position\_three\_planes} & 三正交平面最优 $=$ 原点 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{decimate\_qem 集成测试}} \\
+  \texttt{decimate\_icosphere2\_to\_80\_faces} & icosphere(2) $F{=}320 \to \le 80$，校验通过 \\
+  \texttt{decimate\_icosphere2\_to\_tetrahedron} & 简化到 $\le 8$ 面，仍为有效闭合网格 \\
+  \texttt{decimate\_flat\_plane\_all\_zero\_cost} & 平面所有代价 $= 0$，正确折叠对角线 \\
+  \texttt{decimate\_boundary\_edges\_not\_collapsed} & 单三角形全边界边，移除 $= 0$ \\
+  \texttt{decimate\_target\_geq\_current\_is\_noop} & target $\ge$ 当前面数时不操作 \\
+  \texttt{decimate\_icosphere1\_half\_simplification} & icosphere(1) $F{=}80 \to \le 40$，校验通过 \\
+  \texttt{decimate\_preserves\_closed\_topology} & 闭合网格 Euler 示性数 $= 2$ 保持 \\
+  \texttt{decimate\_to\_vertices\_icosphere2} & 目标 42 顶点 $\to \le 80$ 面 \\
+  \texttt{decimate\_multiple\_iterations\_stay\_valid} & 连续 3 次简化均通过完整校验 \\
+  \bottomrule
+\end{longtable}
+}
+
+共 15 个单元测试，全部通过。全库 \texttt{cargo test} 共 371 个用例，0 失败。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何用 Cramer 法则而非 Gaussian 消元？}
+        3×3 系统的 Cramer 法则只需 1 个行列式 + 3 个余子式，代码简洁且无内存分配。
+        对更高维系统应改用 LU 分解。
+  \item \textbf{为何评估 4 个候选位置而非仅 $\mathbf{p}^*$？}
+        共面区域的 $Q$ 矩阵奇异（秩 $< 3$），$\mathbf{p}^*$ 无解。回退到端点/中点
+        保证退化情况也有合理位置。Garland-Heckbert 原文也建议此策略。
+  \item \textbf{为何用惰性删除而非 Fibonacci 堆？}
+        \texttt{BinaryHeap} 是标准库自带的最小堆实现（配合 \texttt{Reverse}），
+        惰性删除避免 $O(n)$ 的堆内查找。总堆操作 $O(k\bar{v}\log E)$ 在实践中
+        足够快（icosphere(3) 简化 50\% $< 1$ 秒）。
+  \item \textbf{为何不实现边界约束 Quadric？}
+        原文建议为边界边添加约束平面（两个垂直于边界的平面）以保持锐边。
+        本实现简单地跳过边界边，已能满足「边界不退化」的需求。
+        边界约束可作为后续增强。
+  \item \textbf{为何 \texttt{decimate\_to\_vertices} 用 $F = 2V - 4$？}
+        闭合三角网格满足 Euler 公式 $V - E + F = 2$ 且 $E = 3F/2$，
+        故 $V = F/2 + 2$，即 $F = 2(V-2) = 2V - 4$。对带边界网格此公式不精确，
+        但作为目标估计已足够。
+\end{itemize}
+
+\end{document}

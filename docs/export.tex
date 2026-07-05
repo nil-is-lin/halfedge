@@ -1,0 +1,226 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: wgpu 几何导出模块设计文档} \\ \large \texttt{src/export.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{export.rs} 提供单一函数 \texttt{mesh\_to\_vertex\_index\_buffers}：
+将半边网格导出为 \texttt{Vec<[f32; 3]>} 顶点缓冲与 \texttt{Vec<u32>} 索引缓冲，
+可直接传入 \texttt{wgpu} 创建 \texttt{Buffer}。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{API} & \texttt{mesh\_to\_vertex\_index\_buffers(\&MeshStorage) -> (Vec<[f32; 3]>, Vec<u32>)} \\
+  \midrule
+  顶点缓冲 & 每个顶点 3 个 \texttt{f32}（位置 x/y/z） \\
+  索引缓冲 & 每个三角面 3 个 \texttt{u32}（CCW 朝向） \\
+  索引类型 & \texttt{u32}（wgpu 默认 \texttt{IndexFormat::Uint32}） \\
+  顶点编号 & 按 \texttt{vertex\_ids()} 顺序 0-based 重新编号 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{设计目标}
+
+\subsection{为何需要单独的导出模块？}
+
+半边网格适合拓扑查询与编辑，但 \texttt{wgpu} 渲染需要扁平的顶点+索引缓冲：
+\begin{itemize}
+  \item 顶点缓冲：连续内存，每个顶点固定字节数（此处 12 字节 = 3 × f32）；
+  \item 索引缓冲：用顶点索引引用三角形，避免重复存储共享顶点。
+\end{itemize}
+
+\texttt{export.rs} 负责「半边网格 $\to$ 扁平缓冲」的转换，是渲染管线的入口。
+
+\subsection{为何不用 \texttt{Vec<f32>} 而用 \texttt{Vec<[f32; 3]>}？}
+
+\texttt{[f32; 3]} 在内存中与 3 个连续 \texttt{f32} 完全等价（12 字节，4 字节对齐），
+但语义更清晰：每个元素代表一个顶点位置。调用方可直接 \texttt{as\_ptr()} 转
+\texttt{*const f32} 传给 \texttt{wgpu::Buffer}，也可方便地 \texttt{extend} 法向、
+UV 等属性。
+
+\section{导出算法}
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：\&MeshStorage};
+  \node[proc, below=of s, fill=blue!8] (p1) {阶段 1：遍历 \texttt{vertex\_ids()}，构建 \texttt{HashMap<VertexId, u32>} 与 \texttt{Vec<[f32; 3]>}};
+  \node[proc, below=of p1, fill=blue!8] (p2) {阶段 2：遍历 \texttt{face\_ids()}，每面取 3 个 tip 顶点，查映射输出 \texttt{u32} 索引};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {跳过：非三角面 / 顶点缺失};
+  \node[proc, below=of p3, fill=green!12] (p4) {返回 \texttt{(vertices, indices)}};
+  \node[startend, below=of p4] (e) {结束};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{阶段 1：顶点收集与索引映射}
+
+\begin{itemize}
+  \item 遍历 \texttt{mesh.vertex\_ids()}（slotmap 顺序）；
+  \item 对每个 \texttt{VertexId}，取其位置 \texttt{[f64; 3]}，截断为 \texttt{[f32; 3]}；
+  \item 用 \texttt{HashMap<VertexId, u32>} 记录「VertexId $\to$ 0-based 索引」映射；
+  \item 顶点缺失（已删除）跳过。
+\end{itemize}
+
+\subsection{阶段 2：索引生成}
+
+\begin{itemize}
+  \item 遍历 \texttt{mesh.face\_ids()}；
+  \item 对每个面，用 \texttt{FaceHalfEdges} 迭代器取边界环半边；
+  \item 取每条半边的 \texttt{vertex}（tip），查 \texttt{HashMap} 得 0-based 索引；
+  \item 边界环长度 $\ne 3$ 跳过（非三角面）；
+  \item 索引按 CCW 顺序输出（与原面 \texttt{next} 链一致）。
+\end{itemize}
+
+\section{精度与兼容性}
+
+\subsection{f64 $\to$ f32 截断}
+
+半边网格内部用 \texttt{f64} 存储顶点位置（精度高，适合几何计算）；
+导出时截断为 \texttt{f32}（GPU 原生支持，性能优）。
+
+\textbf{精度损失}：\texttt{f64} 有约 15--17 位有效数字，\texttt{f32} 约 6--9 位。
+对大多数渲染场景（屏幕分辨率、视锥范围）足够；若需要高精度渲染
+（如 CAD 模型远距离观察），可扩展为 \texttt{Vec<[f32; 6]>}（双精度拆分）或
+使用 \texttt{wgpu::VertexAttribute} 的 \texttt{Float64} 格式。
+
+\subsection{wgpu 集成示例}
+
+\begin{lstlisting}
+use wgpu::util::DeviceExt;
+
+let (vertices, indices) = mesh_to_vertex_index_buffers(&mesh);
+
+let vertex_buffer = device.create_buffer_init(
+    &wgpu::util::BufferInitDescriptor {
+        label: Some("Vertex Buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    },
+);
+
+let index_buffer = device.create_buffer_init(
+    &wgpu::util::BufferInitDescriptor {
+        label: Some("Index Buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    },
+);
+
+// 渲染时：
+// render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+// render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+// render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+\end{lstlisting}
+
+\section{复杂度}
+
+$O(V + F)$：每个顶点与每个面常数时间。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{阶段} & \textbf{时间} & \textbf{空间} \\
+  \midrule
+  顶点收集 & $O(V)$ & $O(V)$（\texttt{Vec} + \texttt{HashMap}） \\
+  索引生成 & $O(F)$ & $O(F)$（\texttt{Vec<u32>}） \\
+  总计     & $O(V + F)$ & $O(V + F)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item 顶点缺失（\texttt{get\_vertex} 返回 \texttt{None}）：跳过，不输出；
+  \item 面边界环长度 $\ne 3$：跳过该面，不输出索引；
+  \item 半边 \texttt{vertex} 在 \texttt{HashMap} 中找不到（理论不应发生，
+        因阶段 1 已收集所有顶点）：\texttt{filter\_map} 静默跳过。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{export\_basic\_quad}             & 4 顶点 6 索引，位置正确 \\
+  \texttt{export\_tetrahedron}             & 4 顶点 12 索引（4 面） \\
+  \texttt{export\_preserves\_ccw\_winding} & 导出索引 CCW 朝向，法向 $+z$ \\
+  \texttt{export\_empty\_mesh}             & 空网格输出空缓冲 \\
+  \texttt{export\_roundtrip\_validation}   & 导出 $\to$ 重建 $\to$ 通过校验 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

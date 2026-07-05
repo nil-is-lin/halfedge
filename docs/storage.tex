@@ -1,0 +1,344 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 底层存储模块设计文档} \\ \large \texttt{src/storage.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{定位与边界}
+
+\texttt{MeshStorage} 是整个半边网格库的\textbf{底座}，只承担两类职责：
+\begin{enumerate}
+  \item 三类元素（顶点 / 半边 / 面）的\textbf{存储与生命周期管理}；
+  \item 句柄\textbf{有效性判定}与安全访问。
+\end{enumerate}
+
+它\textbf{不}负责维护任何拓扑一致性约束——\texttt{twin}、\texttt{next}、\texttt{prev}、
+\texttt{face} 等关系的正确性由上层构建器保证。这样切分使得底座极其稳定、可独立测试，
+后续可以叠加不同策略的构建器而不影响存储层。
+
+\section{数据结构}
+
+\subsection{三类元素}
+
+\begin{lstlisting}
+pub struct Vertex {
+    pub position: [f64; 3],
+    pub halfedge: Option<HalfEdgeId>, // 从该顶点出发的任一 outgoing 半边
+}
+
+pub struct HalfEdge {
+    pub vertex: VertexId,              // 半边指向的目的顶点 (tip)
+    pub twin:  Option<HalfEdgeId>,
+    pub next:  Option<HalfEdgeId>,
+    pub prev:  Option<HalfEdgeId>,
+    pub face:  Option<FaceId>,
+}
+
+pub struct Face {
+    pub halfedge: Option<HalfEdgeId>,  // 边界环入口
+}
+\end{lstlisting}
+
+三类元素均提供 \texttt{new()} 构造函数。\texttt{Vertex} 与 \texttt{Face}
+额外实现 \texttt{Default} trait：
+\begin{itemize}
+  \item \texttt{Vertex::default()} $\equiv$ \texttt{Vertex::new([0.0; 3])}（原点 + 无半边）；
+  \item \texttt{Face::default()} $\equiv$ \texttt{Face::new()}（无半边）。
+\end{itemize}
+这使得二者可在需要 \texttt{Default} bound 的泛型上下文中使用
+（如 \texttt{SlotMap::insert\_with}、容器预分配初始化等）。
+\texttt{HalfEdge} 因必须指定 \texttt{vertex} 字段而无 \texttt{Default}。
+
+\subsection{半边四向邻接示意}
+
+半边 $h$ 通过四个指针把网格「编织」起来，下图展示一个三角面内的连接关系：
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=7mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=red!70!black},
+  he lab/.style={font=\footnotesize, sloped, above},
+  face/.style={regular polygon, regular polygon sides=3, draw=gray!60, fill=gray!8, minimum size=3.6cm, rotate=0}
+]
+  \node[face] (F) at (0,0) {};
+  \node[vert] (v0) at (F.corner 1) {$v_0$};
+  \node[vert] (v1) at (F.corner 2) {$v_1$};
+  \node[vert] (v2) at (F.corner 3) {$v_2$};
+
+  \draw[he] (v0) -- node[he lab] {$h_0$} (v1);
+  \draw[he] (v1) -- node[he lab] {$h_1$} (v2);
+  \draw[he] (v2) -- node[he lab] {$h_2$} (v0);
+
+  \node[font=\small, text=gray!50!black] at (0,-0.05) {$F$};
+
+  \node[below=2.2cm of v1, font=\footnotesize, align=center] (legend)
+    {$h_i.\mathrm{next}$: $h_0{\to}h_1{\to}h_2{\to}h_0$\quad
+     $h_i.\mathrm{prev}$: 反向环\quad
+     $h_i.\mathrm{face}=F$\quad
+     $h_i.\mathrm{vertex}=\text{tip}$};
+\end{tikzpicture}
+\end{center}
+
+对应的形式化关系（同面边界环）：
+\[
+\forall i:\quad h_i.\mathrm{face}=F,\quad
+h_i.\mathrm{next}=h_{(i+1)\bmod 3},\quad
+h_i.\mathrm{prev}=h_{(i-1)\bmod 3},\quad
+h_i.\mathrm{vertex}=v_{(i+1)\bmod 3}.
+\]
+
+\texttt{twin} 跨面连接：若两条半边共享两端点但方向相反，则互为 twin。
+边界半边的 \texttt{twin} 与 \texttt{face} 通常为 \texttt{None}。
+
+\subsection{容器}
+
+\begin{lstlisting}
+pub struct MeshStorage {
+    vertices:  SlotMap<VertexId,   Vertex>,
+    halfedges: SlotMap<HalfEdgeId, HalfEdge>,
+    faces:     SlotMap<FaceId,     Face>,
+}
+\end{lstlisting}
+
+三类元素分别放在独立的 \texttt{SlotMap} 中，互不干扰。三组 \texttt{Id} 在编译期
+已被 \texttt{new\_key\_type!} 区分（详见 \texttt{ids.tex}），即使误把
+\texttt{HalfEdgeId} 传给 \texttt{get\_vertex} 也会编译失败。
+
+\section{核心 API 流程}
+
+\subsection{新增}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.7cm,
+  stage/.style={draw, rounded corners=2pt, minimum width=3.2cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick}
+]
+  \node[stage, fill=green!12] (s1) {调用 \texttt{add\_vertex(v)}};
+  \node[stage, fill=yellow!20, right=of s1] (s2) {查找空闲槽位 $i$};
+  \node[stage, fill=yellow!20, right=of s2] (s3) {写入数据\\版本号 $v_i$};
+  \node[stage, fill=blue!12, right=of s3] (s4) {返回 $(i, v_i)$};
+  \draw[op] (s1) -- (s2);
+  \draw[op] (s2) -- (s3);
+  \draw[op] (s3) -- (s4);
+\end{tikzpicture}
+\end{center}
+
+返回值即为外部使用的强类型 ID。三条 \texttt{add\_*} 接口复杂度均为 $O(1)$ 摊还。
+
+\subsection{删除（自动失效）}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  stage/.style={draw, rounded corners=2pt, minimum width=3.6cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  dec/.style={diamond, draw, aspect=2, fill=orange!15, inner sep=1pt, font=\small, align=center}
+]
+  \node[stage, fill=green!12] (a) {调用 \texttt{remove\_vertex(id)}};
+  \node[dec, below=of a] (b) {句柄有效？};
+  \node[stage, fill=red!15, below left=of b, xshift=-1.0cm] (c) {清空槽位 $i$\\$v_i\mathrel{+}{=}1$};
+  \node[stage, fill=gray!10, below right=of b, xshift=1.0cm] (d) {返回 \texttt{None}};
+  \node[stage, fill=blue!12, below=of c] (e) {返回 \texttt{Some(旧值)}};
+
+  \draw[op] (a) -- (b);
+  \draw[op] (b) -- node[left, font=\footnotesize] {是} (c);
+  \draw[op] (b) -- node[right, font=\footnotesize] {否} (d);
+  \draw[op] (c) -- (e);
+\end{tikzpicture}
+\end{center}
+
+\textbf{关键点：}版本号 $+1$ 是「自动标记失效」的核心。原句柄 $(i, v_i{-}1)$ 在后续
+\texttt{get} 中因版本不匹配返回 \texttt{None}；即使槽位 $i$ 被 \texttt{add} 复用，
+新元素的版本是 $v_i$（或更高），旧句柄仍然无效，从而\textbf{杜绝 ABA 问题}。
+
+\subsection{访问（安全 \texttt{get}/\texttt{get\_mut}）}
+
+所有访问方法返回 \texttt{Option}：
+\begin{align*}
+\texttt{get\_vertex(id)}      &: \texttt{VertexId} \to \texttt{Option<\&Vertex>} \\
+\texttt{get\_vertex\_mut(id)} &: \texttt{VertexId} \to \texttt{Option<\&mut Vertex>}
+\end{align*}
+
+调用方\textbf{绝不会因为传入了已删除的 ID 而 panic}，只会得到 \texttt{None}。
+配合 \texttt{contains\_*} 系列，可在不确定时先做有效性预检。
+
+\section{API 一览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{方法} & \textbf{返回值} \\
+  \midrule
+  构造 & \texttt{new()} & \texttt{MeshStorage} \\
+  \midrule
+  \multirow{3}{*}{增}
+    & \texttt{add\_vertex(v)}    & \texttt{VertexId}   \\
+    & \texttt{add\_halfedge(h)}  & \texttt{HalfEdgeId} \\
+    & \texttt{add\_face(f)}      & \texttt{FaceId}     \\
+  \midrule
+  \multirow{3}{*}{删}
+    & \texttt{remove\_vertex(id)}    & \texttt{Option<Vertex>}   \\
+    & \texttt{remove\_halfedge(id)}  & \texttt{Option<HalfEdge>}  \\
+    & \texttt{remove\_face(id)}      & \texttt{Option<Face>}      \\
+  \midrule
+  \multirow{3}{*}{查（不可变）}
+    & \texttt{get\_vertex(id)}       & \texttt{Option<\&Vertex>}    \\
+    & \texttt{get\_halfedge(id)}     & \texttt{Option<\&HalfEdge>}  \\
+    & \texttt{get\_face(id)}         & \texttt{Option<\&Face>}      \\
+  \midrule
+  \multirow{3}{*}{查（可变）}
+    & \texttt{get\_vertex\_mut(id)}  & \texttt{Option<\&mut Vertex>}   \\
+    & \texttt{get\_halfedge\_mut(id)}& \texttt{Option<\&mut HalfEdge>} \\
+    & \texttt{get\_face\_mut(id)}    & \texttt{Option<\&mut Face>}     \\
+  \midrule
+  \multirow{3}{*}{有效性}
+    & \texttt{contains\_vertex(id)}    & \texttt{bool} \\
+    & \texttt{contains\_halfedge(id)}  & \texttt{bool} \\
+    & \texttt{contains\_face(id)}      & \texttt{bool} \\
+  \midrule
+  \multirow{3}{*}{统计}
+    & \texttt{vertex\_count()}   & \texttt{usize} \\
+    & \texttt{halfedge\_count()} & \texttt{usize} \\
+    & \texttt{face\_count()}     & \texttt{usize} \\
+  \midrule
+  \multirow{2}{*}{容量管理}
+    & \texttt{clear()}    & \texttt{()} \\
+    & \texttt{reserve(v\_cap, he\_cap, f\_cap)} & \texttt{()} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{容量管理方法}
+
+\begin{itemize}
+  \item \texttt{clear(\&mut self)}：清空所有顶点、半边、面。等效于
+        \texttt{*self = MeshStorage::new()}。\texttt{SlotMap::clear()} 是 $O(n)$
+        时间但会释放内部内存，适合频繁重建网格的场景。
+  \item \texttt{reserve(\&mut self, vertex\_cap, halfedge\_cap, face\_cap)}：
+        为三类 \texttt{SlotMap} 预分配容量，减少批量构建时的 rehash / 重分配次数。
+        三参数均为下限提示，实际分配可能更多。\texttt{io::build\_mesh\_*}
+        构建器在入口处自动调用此方法。
+\end{itemize}
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{操作} & \textbf{复杂度} \\
+  \midrule
+  \texttt{add\_*}        & $O(1)$ 摊还（可能扩容） \\
+  \texttt{remove\_*}     & $O(1)$ \\
+  \texttt{get\_*} / \texttt{get\_*\_mut} & $O(1)$ \\
+  \texttt{contains\_*}   & $O(1)$ \\
+  \texttt{*\_count()}    & $O(1)$ \\
+  \texttt{clear()}       & $O(n)$（释放内存） \\
+  \texttt{reserve(...)}  & $O(n)$（可能重分配） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{单元测试覆盖}
+
+\texttt{src/storage.rs} 末尾的 \texttt{\#[cfg(test)] mod tests} 共 20 个测试，
+按需求点对应如下：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{覆盖点} \\
+  \midrule
+  \texttt{add\_and\_get\_vertex}     & 新增 + \texttt{get} + \texttt{contains} + 计数 \\
+  \texttt{add\_and\_get\_halfedge}   & 半边新增 + 关联顶点 outgoing \\
+  \texttt{add\_and\_get\_face}       & 面新增 \\
+  \texttt{remove\_vertex\_invalidates\_id}    & 删除后 ID 失效 + 重复删除返回 \texttt{None} \\
+  \texttt{remove\_halfedge\_invalidates\_id}  & 半边删除失效 \\
+  \texttt{remove\_face\_invalidates\_id}      & 面删除失效 \\
+  \texttt{slot\_reuse\_does\_not\_resurrect\_old\_id} & ABA 安全：槽位复用不复活旧句柄 \\
+  \texttt{get\_mut\_allows\_in\_place\_update} & 可变访问就地修改拓扑字段 \\
+  \texttt{accessing\_invalid\_id\_never\_panics} & 已删除 ID 访问绝不 panic \\
+  \texttt{clear\_empties\_all\_three\_slotmaps} & \texttt{clear} 清空三类元素 + 迭代器为空 \\
+  \texttt{clear\_equivalent\_to\_new} & \texttt{clear} 后与 \texttt{new()} 等价 \\
+  \texttt{clear\_allows\_reuse\_after} & \texttt{clear} 后仍可继续添加元素 \\
+  \texttt{reserve\_does\_not\_change\_counts} & \texttt{reserve} 仅预分配，不改变计数 \\
+  \texttt{reserve\_zero\_is\_noop}    & \texttt{reserve(0,0,0)} 不 panic \\
+  \texttt{is\_empty\_on\_new\_mesh}   & 新建网格 \texttt{is\_empty()} 返回 true \\
+  \texttt{is\_empty\_after\_clear}    & \texttt{clear} 后 \texttt{is\_empty()} 返回 true \\
+  \texttt{vertices\_iter\_yields\_all\_data} & \texttt{vertices()} 迭代所有顶点数据 \\
+  \texttt{vertices\_mut\_allows\_modification} & \texttt{vertices\_mut()} 允许就地修改 \\
+  \texttt{halfedges\_faces\_iters\_match\_id\_counts} & 半边/面迭代数与 ID 数一致 \\
+  \texttt{empty\_iterators\_yield\_nothing} & 空网格所有数据迭代器不产出 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+加上 \texttt{ids.rs} 的 2 个测试，\texttt{cargo test} 当前共 371 个用例，全部通过。
+
+\section{后续扩展}
+
+存储层刻意保持极简，后续模块基于此构建了完整能力：
+\begin{itemize}
+  \item \textbf{拓扑操作}（\texttt{topology\_ops.rs}）：实现 \texttt{split\_edge}、
+        \texttt{flip\_edge}、\texttt{collapse\_edge}、\texttt{extrude\_face}、
+        \texttt{add\_triangle} 等高级操作，负责维护 \texttt{twin/next/prev} 一致性；
+  \item \textbf{遍历器}（\texttt{traversal.rs}）：基于 \texttt{next/prev} 环遍历面边界，
+        基于 \texttt{twin} 跨面遍历邻接面，提供 eager/lazy 两类迭代器与无向边迭代器；
+  \item \textbf{序列化}（\texttt{io.rs}）：\texttt{OBJ/PLY} 加载与保存，支持 n-gon；
+  \item \textbf{并行}：\texttt{SlotMap} 内部槽位互相独立，方便后续做并行构建。
+\end{itemize}
+
+\end{document}

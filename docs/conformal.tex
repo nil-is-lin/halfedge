@@ -1,0 +1,359 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 共形映射模块设计文档} \\ \large \texttt{src/conformal.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{conformal.rs} 在 \texttt{geometry.rs} 的余切拉普拉斯与曲率算子之上，
+叠加\textbf{共形映射}（Conformal Mapping）能力。共形映射保持角度
+（局部相似变换），在纹理映射、曲面配准、形状分析中有广泛应用。
+本模块提供 4 个公共函数，覆盖调和映射、Möbius 变换与离散 Yamabe 方程三类算子：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{1}{*}{调和映射}
+    & \texttt{harmonic\_map(mesh, correspondences)} & Dirichlet 能量最小映射，返回每顶点 3D 位置 \\
+  \midrule
+  \multirow{2}{*}{Möbius 变换}
+    & \texttt{apply\_mobius\_transform(uv, a, b, c, d)} & 复数分式线性变换 $f(z)=\frac{az+b}{cz+d}$ 逐点施加 \\
+    & \texttt{mobius\_to\_center(target)}              & 返回将圆盘中心移到 \texttt{target} 的 Blaschke 系数 \\
+  \midrule
+  \multirow{1}{*}{共形比例因子}
+    & \texttt{compute\_vertex\_scale\_factors(mesh, K')} & 解 $\Delta u = K - K'$，返回对数比例因子 $u_i$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \texttt{harmonic\_map} 与 \texttt{compute\_vertex\_scale\_factors} 返回
+        \texttt{Option<T>}：无对应点 / 求解失败时返回 \texttt{None}，而非 panic；
+  \item \texttt{apply\_mobius\_transform} 与 \texttt{mobius\_to\_center} 是纯函数，
+        对任意输入均有定义（除零时复数除法回退为 $0$）；
+  \item 复数算术以 \texttt{[f64; 2]} 表示 $z = x + iy$，运算细节见 \S 3。
+\end{itemize}
+
+\section{调和映射：Dirichlet 能量最小化}
+
+\subsection{连续变分问题}
+
+设源曲面 $\mathcal{M}$，目标曲面上的稀疏对应
+$\mathcal{C} = \{(v_k, \vec{g}_k)\}$，求解映射 $f : \mathcal{M} \to \mathbb{R}^3$
+使得 Dirichlet 能量最小：
+\[
+  E(f) = \frac{1}{2} \int_{\mathcal{M}} \|\nabla f\|^2 \, dA,
+  \qquad
+  f(v_k) = \vec{g}_k \;\; \text{（约束）}.
+\]
+
+\subsection{离散化}
+
+在三角网格上，Dirichlet 能量离散为顶点位置差的加权和：
+\[
+  E = \sum_{(i,j) \in \mathcal{E}} w_{ij} \, \|f_i - f_j\|^2,
+  \qquad
+  w_{ij} = \frac{1}{2}\bigl(\cot\alpha_{ij} + \cot\beta_{ij}\bigr),
+\]
+其中 $\alpha_{ij}, \beta_{ij}$ 是边 $ij$ 两侧对角，$w_{ij}$ 即
+\texttt{geometry::cotan\_edge\_weight} 的 $1/2$ 倍。
+
+\subsection{Euler-Lagrange 方程}
+
+对自由顶点 $i$，最小化 $E$ 给出余切拉普拉斯方程：
+\[
+  \sum_{j \in N(i)} w_{ij} (f_i - f_j) = 0
+  \quad\Longleftrightarrow\quad
+  (L f)_i = 0,
+\]
+对应顶点 $i$ 处约束 $f_i = \vec{g}_i$。整体形式为
+\[
+  L \, f = b, \qquad
+  b_i = \begin{cases} \vec{g}_i & i \in \mathcal{C} \\ 0 & \text{otherwise} \end{cases}
+\]
+固定行替换为单位行，对角正则化 $\varepsilon = 10^{-8}$ 保证数值稳定。
+
+\subsection{稀疏线性系统求解}
+
+矩阵 $L$ 由 \texttt{build\_full\_cotan\_laplacian} 构造为
+\texttt{SparseSystem}，三坐标 $(x, y, z)$ 独立求解：
+\[
+  L \, f_x = b_x, \quad L \, f_y = b_y, \quad L \, f_z = b_z.
+\]
+使用共轭梯度法 \texttt{conjugate\_gradient}，容差 $10^{-6}$，
+最大迭代 $100 n$。任一分量求解失败则整体返回 \texttt{None}。
+
+\section{Möbius 变换：复数分式线性变换}
+
+\subsection{一般公式}
+
+Möbius 变换是复平面上的分式线性映射：
+\[
+  f(z) = \frac{a z + b}{c z + d}, \qquad ad - bc \neq 0.
+\]
+在单位圆盘 $\mathbb{D} = \{z : |z| < 1\}$ 上，Möbius 变换构成
+$\mathbb{D} \to \mathbb{D}$ 的共形自同构群。
+
+\subsection{单位圆盘自同构：Blaschke 因子}
+
+将圆心 $0$ 映到 $a$（$|a| < 1$）的标准 Blaschke 因子为
+\[
+  f(z) = \frac{z - a}{1 - \overline{a}\, z},
+\]
+对应 Möbius 系数
+\[
+  a_{\text{mob}} = 1, \quad
+  b_{\text{mob}} = -a, \quad
+  c_{\text{mob}} = -\overline{a}, \quad
+  d_{\text{mob}} = 1.
+\]
+关键性质：$f(0) = -a$，$f(a) = 0$，$|f(z)| = 1$ 当 $|z| = 1$。
+\texttt{mobius\_to\_center(target)} 取 $a = \texttt{target}$ 返回上述系数。
+
+\subsection{复数算术细节}
+
+以 $z = x + iy$ 表示复数（\texttt{[f64; 2]} 即 $[x, y]$）。
+复数乘除公式：
+\begin{align}
+  (a + bi)(c + di) &= (ac - bd) + (ad + bc)\, i, \\
+  \frac{a + bi}{c + di} &= \frac{(ac + bd) + (bc - ad)\, i}{c^2 + d^2}.
+\end{align}
+实现细节：
+\begin{itemize}
+  \item \texttt{complex\_mul(a, b)} 返回 $[a_0 b_0 - a_1 b_1,\; a_0 b_1 + a_1 b_0]$；
+  \item \texttt{complex\_mul\_add(a, b, c)} 计算 $a \cdot b + c$；
+  \item \texttt{complex\_div(a, b)} 计算 $a / b$，当分母 $c^2 + d^2 < 10^{-14}$
+        时返回 $[0, 0]$（除零守卫）。
+\end{itemize}
+
+\subsection{应用：圆盘参数化中心调整}
+
+给定圆盘参数化 UV 数组，施加 \texttt{mobius\_to\_center} 后再
+\texttt{apply\_mobius\_transform}，可将原参数化的中心 $0$ 移到任意
+$|a| < 1$ 目标点，同时保持边界仍在单位圆上——这是共形参数化边界重分布的
+标准工具。
+
+\section{共形比例因子：离散 Yamabe 方程}
+
+\subsection{方程}
+
+离散 Yamabe 方程将当前高斯曲率 $K$ 调整到目标 $K'$：
+\[
+  \Delta u = K - K',
+\]
+其中 $\Delta$ 是余切拉普拉斯，$u_i$ 是顶点 $i$ 的对数共形比例因子。
+度规变换 $\ell'_{ij} = \ell_{ij} \cdot e^{(u_i + u_j)/2}$ 给出共形新度量。
+
+\subsection{零空间消除}
+
+余切拉普拉斯有常数零空间（$\Delta \mathbf{1} = 0$），方程不唯一。
+实现采用\textbf{pin 顶点 0}策略：
+\begin{itemize}
+  \item 矩阵第 0 行替换为单位行 $e_0^\top$（\texttt{sys.add\_diag(0, 1.0)}）；
+  \item 其余行保留原拉普拉斯系数；
+  \item RHS 第 0 行设为 $0$（$u_0 = 0$），其余行 $b_i = K'_i - K_i$。
+\end{itemize}
+对角正则化系数 $\varepsilon = 0.1$ 进一步保证 CG 收敛。
+
+\subsection{求解与返回}
+
+\texttt{conjugate\_gradient} 容差 $10^{-4}$，最大迭代 $500 n$。
+$u_i$ 用于 Circle Pattern / 离散 Ricci 流的后续步骤：
+$e^{u_i}$ 即顶点 $i$ 处的共形缩放因子。
+
+\section{算法流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=6.2cm, minimum height=0.65cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.2, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.0cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.4cm, minimum height=0.6cm, font=\small, fill=gray!12},
+  term/.style={draw, rounded corners=2pt, fill=green!12, minimum width=4.0cm, minimum height=0.6cm, font=\small, align=center}
+]
+  % ---- 左列：harmonic_map ----
+  \node[startend] (s1) {开始 \texttt{harmonic\_map}};
+  \node[dec, below=of s1] (d1) {$n=0$ 或对应为空？};
+  \node[term, right=0.6cm of d1] (t1) {返回 \texttt{None}};
+  \node[proc, below=of d1, fill=blue!8] (p1) {构建 \texttt{v\_idx} 与 \texttt{pinned\_set}};
+  \node[proc, below=of p1, fill=blue!8] (p2) {构造余切拉普拉斯 $L$，正则化 $\varepsilon{=}10^{-8}$};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {RHS：固定行 $=\vec{g}_k$，自由行 $=0$};
+  \node[proc, below=of p3, fill=yellow!15] (p4) {对 $(x,y,z)$ 三分量独立 CG 求解};
+  \node[dec, below=of p4] (d2) {三分量均收敛？};
+  \node[term, right=0.6cm of d2] (t2) {返回 \texttt{None}};
+  \node[term, below=of d2, fill=green!18] (e1) {返回 \texttt{Vec<[f64;3]>}};
+
+  \draw[op] (s1) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (t1);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {否} (t2);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {是} (e1);
+
+  % ---- 右列：compute_vertex_scale_factors ----
+  \node[startend, right=2.2cm of s1] (s2) {开始 \texttt{scale\_factors}};
+  \node[dec, below=of s2] (d3) {$n=0$ 或长度不符？};
+  \node[term, right=0.6cm of d3] (t3) {返回 \texttt{None}};
+  \node[proc, below=of d3, fill=blue!8] (q1) {构造余切拉普拉斯 $L$};
+  \node[proc, below=of q1, fill=blue!8] (q2) {pin 顶点 0：第 0 行 $=e_0^\top$，正则化 $\varepsilon{=}0.1$};
+  \node[proc, below=of q2, fill=yellow!15] (q3) {计算当前 $K_i$（\texttt{gaussian\_curvature}）};
+  \node[proc, below=of q3, fill=yellow!15] (q4) {RHS：$b_0{=}0$，$b_i{=}K'_i - K_i$};
+  \node[proc, below=of q4, fill=yellow!15] (q5) {CG 求解 $u$（容差 $10^{-4}$，$500n$ 步）};
+  \node[dec, below=of q5] (d4) {收敛？};
+  \node[term, right=0.6cm of d4] (t4) {返回 \texttt{None}};
+  \node[term, below=of d4, fill=green!18] (e2) {返回 \texttt{Vec<f64>}};
+
+  \draw[op] (s2) -- (d3);
+  \draw[op] (d3) -- node[above, font=\scriptsize] {是} (t3);
+  \draw[op] (d3) -- node[right, font=\scriptsize] {否} (q1);
+  \draw[op] (q1) -- (q2);
+  \draw[op] (q2) -- (q3);
+  \draw[op] (q3) -- (q4);
+  \draw[op] (q4) -- (q5);
+  \draw[op] (q5) -- (d4);
+  \draw[op] (d4) -- node[above, font=\scriptsize] {否} (t4);
+  \draw[op] (d4) -- node[right, font=\scriptsize] {是} (e2);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{退化守卫}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{harmonic\_map}                & 无对应点（\texttt{correspondences} 为空） & 返回 \texttt{None} \\
+  \texttt{harmonic\_map}                & CG 任一分量未收敛                          & 返回 \texttt{None} \\
+  \texttt{harmonic\_map}                & 空网格（$n=0$）                            & 返回 \texttt{None} \\
+  \texttt{apply\_mobius\_transform}     & 分母 $c^2+d^2 < 10^{-14}$（$cz+d\approx 0$） & 该点返回 $[0,0]$ \\
+  \texttt{mobius\_to\_center}           & $|a| \ge 1$（\texttt{target} 越出单位圆）   & 系数仍生成，但映射不稳定 \\
+  \texttt{compute\_vertex\_scale\_factors} & \texttt{target\_curvature} 长度 $\neq n$ & 返回 \texttt{None} \\
+  \texttt{compute\_vertex\_scale\_factors} & 空网格（$n=0$）                         & 返回 \texttt{None} \\
+  \texttt{compute\_vertex\_scale\_factors} & CG 未收敛                              & 返回 \texttt{None} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{使用示例}
+
+\begin{lstlisting}
+use halfedge::conformal::{
+    harmonic_map, apply_mobius_transform, mobius_to_center,
+    compute_vertex_scale_factors,
+};
+use halfedge::test_util::build_icosphere;
+
+// 1) 调和映射：将 icosphere 的若干顶点固定到目标位置
+let mesh = build_icosphere(2);
+let vids: Vec<_> = mesh.vertex_ids().collect();
+let correspondences = vec![
+    (vids[0], [0.0, 0.0, 1.0]),
+    (vids[1], [1.0, 0.0, 0.0]),
+];
+if let Some(mapped) = harmonic_map(&mesh, &correspondences) {
+    assert_eq!(mapped.len(), mesh.vertex_count());
+}
+
+// 2) Mobius 恒等变换：f(z) = (1*z + 0) / (0*z + 1)
+let uv = vec![[0.5, 0.3], [-0.2, 0.8]];
+let id_uv = apply_mobius_transform(
+    &uv, [1.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 0.0],
+);
+assert!((id_uv[0][0] - 0.5).abs() < 1e-12);
+
+// 3) 将单位圆盘中心移到 (0.5, 0.3)
+let (a, b, c, d) = mobius_to_center([0.5, 0.3]);
+let moved = apply_mobius_transform(&[[0.0, 0.0]], a, b, c, d);
+// f(0) = -target
+assert!((moved[0][0] + 0.5).abs() < 1e-12);
+
+// 4) 共形比例因子：球面目标曲率为 0
+let n = mesh.vertex_count();
+let target_k = vec![0.0; n];
+if let Some(u) = compute_vertex_scale_factors(&mesh, &target_k) {
+    assert_eq!(u.len(), n);
+    assert!(u.iter().all(|x| x.is_finite()));
+}
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{test\_mobius\_identity}             & 恒等系数 $(1,0,0,1)$ 不改变输入 UV \\
+  \texttt{test\_mobius\_translation}          & $f(z)=z+1$ 平移变换正确 \\
+  \texttt{test\_mobius\_to\_center\_maps\_origin} & Blaschke 因子满足 $f(0)=-\texttt{target}$ \\
+  \texttt{test\_scale\_factors\_sphere}       & 球面零目标曲率下 $u_i$ 全有限且长度正确 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/conformal.rs} 共 \textbf{4 个}单元测试，全库共 \textbf{371 个}。
+
+\end{document}

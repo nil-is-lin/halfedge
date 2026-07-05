@@ -1,0 +1,303 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 连通分量分析模块设计文档} \\ \large \texttt{src/connectivity.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{connectivity.rs} 在 \texttt{storage.rs} 与 \texttt{traversal.rs} 之上
+提供\textbf{连通分量}检测与\textbf{网格拆分/合并}能力，回答以下两类问题：
+
+\begin{itemize}
+  \item \textbf{面连通分量}：哪些面通过共享边互相可达？用于分离网格中互不相连的
+        「片」（如 OBJ 文件中的多个独立物体被一次性载入）。
+  \item \textbf{顶点连通分量}：哪些顶点通过半边邻接互相可达？用于检测孤立顶点、
+        顶点级连通性分析。
+  \item \textbf{网格拆分/合并}：将多分量网格拆成独立 \texttt{MeshStorage}，
+        或将多个网格合并为一个。
+\end{itemize}
+
+\subsection{API 总览}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{3}{*}{面分量}
+    & \texttt{connected\_components(mesh)}        & 返回 \texttt{Vec<Vec<FaceId>>}，所有面分量 \\
+    & \texttt{component\_of\_face(mesh, seed)}    & 返回包含 \texttt{seed} 的面分量，\texttt{Option} \\
+    & \texttt{component\_count(mesh)}             & 仅返回面分量数量（不分配分量列表） \\
+  \midrule
+  顶点分量
+    & \texttt{vertex\_connected\_components(mesh)} & 返回 \texttt{Vec<Vec<VertexId>>}，所有顶点分量 \\
+  \midrule
+  \multirow{2}{*}{分量提取}
+    & \texttt{extract\_component(mesh, seed)}     & 提取 \texttt{seed} 所在分量为独立 \texttt{MeshStorage} \\
+    & \texttt{extract\_faces(mesh, \&[f])}        & 提取指定面集合为独立 \texttt{MeshStorage} \\
+  \midrule
+  拆分
+    & \texttt{split\_into\_components(mesh)}      & 按面连通分量拆分为多个独立 \texttt{MeshStorage} \\
+  \midrule
+  合并
+    & \texttt{merge\_meshes(a, b)}                & 将两个网格合并为一个（拓扑独立，仅共享存储） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{连通定义}
+
+\subsection{面连通}
+
+两个面 $f_1, f_2$ \textbf{直接连通}当且仅当它们共享一条边（即共享两个顶点）：
+\[
+  f_1 \sim f_2 \;\Longleftrightarrow\; |V(f_1) \cap V(f_2)| \ge 2.
+\]
+\textbf{面连通分量}是 $\sim$ 的传递闭包生成的等价类。注意：
+仅共享一个顶点不算连通（两个面必须共享一条边才被认为是同一分量）。
+
+\subsection{顶点连通}
+
+两个顶点 $u, v$ \textbf{直接连通}当且仅当它们是一条半边的两端点：
+\[
+  u \sim v \;\Longleftrightarrow\; \exists\, h \in H,\ \text{src}(h)=u \wedge \text{dst}(h)=v.
+\]
+顶点连通分量同样由 $\sim$ 的传递闭包生成。
+
+\section{算法：广度优先搜索（BFS）}
+
+\subsection{component\_of\_face 流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {\texttt{seed}};
+  \node[proc, below=of s, fill=blue!8] (p1) {\texttt{visited $\gets \{$seed$\}$}；\texttt{queue $\gets$ [seed]}；\texttt{result $\gets$ []}};
+  \node[dec, below=of p1] (d1) {队列非空？};
+  \node[proc, below=of d1, fill=yellow!15] (p2) {$f \gets$ queue.pop\_front()；\texttt{result.push(f)}};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {遍历 $f$ 的三顶点 $v$，对每个 $v$ 遍历 \texttt{VertexAdjacentFaces}};
+  \node[dec, below=of p3] (d2) {邻接面 $f'$ 未访问？};
+  \node[proc, right=1.6cm of d2, fill=green!12] (yes) {\texttt{visited.insert($f'$)}；\texttt{queue.push\_back($f'$)}};
+  \node[proc, below=of d2, fill=blue!8] (no) {继续下一邻接面};
+  \node[startend, right=1.6cm of d1, fill=green!12] (e) {返回 \texttt{result}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {是} (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (d2);
+  \draw[op] (d2) -- node[above, font=\scriptsize] {是} (yes);
+  \draw[op] (d2) -- node[right, font=\scriptsize] {否} (no);
+  \draw[op, dashed] (yes.east) -- ++(0.4,0) |- (p3.east);
+  \draw[op, dashed] (no.east) -- ++(0.4,0) |- (p3.east);
+  \draw[op, dashed] (p3.west) -| ($(d1.west)+(-0.6,0)$) -- (d1.west);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {否} (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{connected\_components 与 component\_count}
+
+\texttt{connected\_components} 对每个未访问的 \texttt{seed} 调用
+\texttt{component\_of\_face}，合并所有分量。\texttt{component\_count} 是其
+简化版本，仅返回 \texttt{.len()}。
+
+\subsection{vertex\_connected\_components}
+
+顶点版本使用 \texttt{VertexAdjacentVerts} 迭代器（基于顶点 outgoing 半边环）
+替代 \texttt{VertexAdjacentFaces}，BFS 结构完全一致。
+
+\section{网格拆分与合并}
+
+\subsection{extract\_faces：子网格提取}
+
+\texttt{extract\_faces(mesh, faces)} 将指定面集合提取为独立 \texttt{MeshStorage}，
+保留内部拓扑；与外部相邻的边在新网格中成为\textbf{边界边}。
+
+\paragraph{算法}
+\begin{enumerate}
+  \item 收集 \texttt{faces} 中所有半边（\texttt{he\_set}）与顶点（\texttt{vert\_set}）；
+  \item 在新 \texttt{MeshStorage} 中按 \texttt{vert\_set} 创建顶点，建立 \texttt{v\_map}；
+  \item 按 \texttt{he\_set} 创建半边（\texttt{vertex} 字段经 \texttt{v\_map} 映射），建立 \texttt{he\_map}；
+  \item 复制半边 \texttt{twin/next/prev} 字段，仅当引用的半边也在 \texttt{he\_map} 中时映射，
+        否则置为 \texttt{None}（外部 twin 切断 → 边界边）；
+  \item 创建面，映射 \texttt{halfedge} 字段与半边 \texttt{face} 字段；
+  \item 修复顶点 \texttt{outgoing} 半边入口（若原 outgoing 不在分量中，置 \texttt{None}）。
+\end{enumerate}
+
+\texttt{extract\_component(mesh, seed)} 是 \texttt{component\_of\_face + extract\_faces}
+的简写。
+
+\subsection{split\_into\_components：多分量拆分}
+
+\[
+  \texttt{split\_into\_components}(\text{mesh}) = \bigl[\,\texttt{extract\_faces}(\text{mesh}, c_i)\,\bigr]_{i=1}^{k}
+\]
+其中 $c_1, \dots, c_k$ 是 \texttt{connected\_components} 的返回值。每个分量通过
+\texttt{validate\_mesh} 校验。
+
+\subsection{merge\_meshes：网格合并}
+
+\texttt{merge\_meshes(a, b)} 创建新 \texttt{MeshStorage}，依次将 \texttt{a} 与
+\texttt{b} 的所有元素复制进去，建立各自的 ID 映射。两网格拓扑\textbf{保持独立}：
+合并后 \texttt{a} 与 \texttt{b} 之间不建立新的 twin 连接，仅共享同一个 \texttt{MeshStorage}
+容器。常用于场景组装、批量导出。
+
+\paragraph{内部辅助}
+\texttt{copy\_mesh\_into(src, dst, v\_map, he\_map, f\_map)} 是被 \texttt{merge\_meshes}
+与未来可能的 transform 类操作复用的核心函数，按「先创建 ID 映射，再补全字段」两阶段完成。
+
+\subsection{拆分/合并流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.6cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {输入：\texttt{mesh} + 面集合 / 第二网格};
+  \node[proc, below=of s, fill=blue!8] (p1) {收集顶点 / 半边 / 面 ID 集合；预分配 \texttt{MeshStorage}};
+  \node[proc, below=of p1, fill=blue!8] (p2) {阶段 1：创建新 ID，建立 \texttt{v\_map / he\_map / f\_map}};
+  \node[proc, below=of p2, fill=blue!8] (p3) {阶段 2：补全 \texttt{twin/next/prev/face/halfedge}（仅映射集合内 ID）};
+  \node[proc, below=of p3, fill=blue!8] (p4) {修复顶点 outgoing（若原值不在集合中则置 \texttt{None}）};
+  \node[proc, below=of p4, fill=green!12] (e) {返回新 \texttt{MeshStorage}（\texttt{validate\_mesh} 通过）};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{API} & \textbf{时间复杂度} & \textbf{空间复杂度} \\
+  \midrule
+  \texttt{connected\_components}        & $O(V + F)$ & $O(F)$（visited + 队列 + 结果） \\
+  \texttt{component\_of\_face}          & $O(V_f + F_c)$ & $O(F_c)$（$F_c$ = 分量大小） \\
+  \texttt{component\_count}             & $O(V + F)$ & $O(F)$ \\
+  \texttt{vertex\_connected\_components} & $O(V + E)$ & $O(V)$ \\
+  \texttt{extract\_faces}               & $O(|F_c|)$ & $O(|V_c| + |E_c| + |F_c|)$（新网格 + 三张映射表） \\
+  \texttt{extract\_component}           & $O(V_f + |F_c|)$ & 同 \texttt{extract\_faces} \\
+  \texttt{split\_into\_components}      & $O(V + F)$ & $O(V + E + F)$（所有分量独立存储） \\
+  \texttt{merge\_meshes}                & $O(V_a + E_a + F_a + V_b + E_b + F_b)$ & 同左（合并后总规模） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+其中 $V_f$ 表示 BFS 访问到的所有顶点数。每个面访问 3 顶点，
+\texttt{VertexAdjacentFaces} 内部为 $O(1)$ 查询，故整体线性。
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item \texttt{component\_of\_face} 对无效 \texttt{seed} 返回 \texttt{None}，
+        不 panic；
+  \item 空网格的 \texttt{connected\_components} 返回空 \texttt{Vec}；
+  \item \texttt{HashSet<FaceId>} 防止重复访问，BFS 必终止。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{连通分量}} \\
+  \texttt{single\_triangle\_one\_component}     & icosphere(0) 20 面全部连通，分量数 $= 1$ \\
+  \texttt{two\_disconnected\_triangles}         & 两个不相交三角形，分量数 $= 2$ \\
+  \texttt{component\_of\_face\_invalid}         & 无效 \texttt{FaceId} 返回 \texttt{None} \\
+  \texttt{empty\_mesh\_no\_components}          & 空网格面/顶点分量均为 0 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{拆分 / 提取 / 合并}} \\
+  \texttt{split\_two\_disconnected\_triangles}  & 双三角形拆分为 2 个独立网格，各 1 面 3 顶点 \\
+  \texttt{extract\_component\_basic}            & 提取单分量后 \texttt{validate\_mesh} 通过 \\
+  \texttt{merge\_two\_icospheres}               & 两 icosphere 合并：$F = 40$，$V = 24$ \\
+  \texttt{merge\_preserves\_boundaries}         & 合并后两三角形各自 3 条边界边保留 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 \textbf{8 个}单元测试，覆盖连通检测、拆分、提取、合并四类场景；
+项目整体 \texttt{cargo test} 共 \textbf{371 个}用例。
+
+\section{设计权衡}
+
+\begin{itemize}
+  \item \textbf{BFS vs DFS}：BFS 在 \texttt{VecDeque} 上实现，避免 DFS 的递归
+        栈溢出风险，对超大连通分量更稳定；
+  \item \textbf{component\_count 仍调用 connected\_components}：实现上未单独
+        优化，因为复杂度已线性，且 \texttt{.len()} 调用零额外开销。
+        如未来需要频繁调用，可改为不收集分量的版本；
+  \item \textbf{面连通定义}：本项目采用「共享一条边」的严格定义（两个顶点），
+        与 \texttt{traversal::VertexAdjacentFaces} 的语义一致；
+        若需「共享一个顶点」的弱定义，需要单独实现。
+\end{itemize}
+
+\end{document}

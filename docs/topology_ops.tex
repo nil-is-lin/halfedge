@@ -1,0 +1,1158 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 核心拓扑操作模块设计文档} \\ \large \texttt{src/topology\_ops.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{topology\_ops.rs} 在 \texttt{storage.rs}（存储）与 \texttt{traversal.rs}（遍历）
+之上叠加\textbf{写操作}能力，提供边/面级拓扑操作、面挤出与增量构建，每个操作内置合法性校验，
+保证操作后网格仍为流形三角曲面。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{操作} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  边分裂 & \texttt{split\_edge(mesh, he)} & 在边中点插入新顶点，1 边 → 2 边 \\
+  边翻转 & \texttt{flip\_edge(mesh, he)}   & 替换四边形对角线 \\
+  边折叠 & \texttt{collapse\_edge(mesh, he)} & 合并两端顶点（中点），删除 2 面 \\
+        & \texttt{collapse\_edge\_at(mesh, he, pos)} & 合并两端顶点（指定位置），删除 2 面 \\
+  面挤出 & \texttt{extrude\_face(mesh, f, offset)} & 三角面沿方向挤出形成棱柱体 \\
+  批量挤出 & \texttt{extrude\_faces(mesh, \&[f], offset)} & 多个面同时挤出 \\
+  区域挤出 & \texttt{extrude\_region(mesh, \&[f], offset)} & 多个相邻面区域挤出，含内部/边界顶点分类 \\
+  面分裂 & \texttt{split\_face(mesh, f)} & 面内插入重心顶点，1 三角 → 3 三角（poke） \\
+  增量构建 & \texttt{add\_triangle(mesh, v0, v1, v2)} & 向网格追加一个三角形，自动缝 twin \\
+  \midrule
+  校验   & \texttt{validate\_mesh(mesh)} & 检查流形三角曲面不变量 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{拓扑约定回顾}
+
+\begin{itemize}
+  \item \texttt{HalfEdge.vertex} 是 tip（目的顶点），origin = \texttt{twin.vertex}；
+  \item 同面 \texttt{next/prev} 形成 CCW 闭合环；
+  \item \texttt{twin} 互指，构成无向边；
+  \item 边界半边 \texttt{face = None}。
+\end{itemize}
+
+设 $h$ 是一条半边，$A = h.\mathrm{twin}.\mathrm{vertex}$（origin），$B = h.\mathrm{vertex}$（tip），
+则 $h$ 表示有向边 $A \to B$。
+
+\section{错误类型}
+
+所有操作返回 \texttt{Result<T, TopologyError>}，失败时不修改网格（原子性）。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发场景} \\
+  \midrule
+  \texttt{InvalidHalfEdge(he)}       & 句柄无效或已删除 \\
+  \texttt{FlipOnBoundaryEdge(he)}    & 试图翻转边界边 \\
+  \texttt{CollapseOnBoundaryEdge(he)} & 试图折叠边界边 \\
+  \texttt{NoTwin(he)}                & 半边没有 twin \\
+  \texttt{NoFace(he)}                & 两侧均无面 \\
+  \texttt{DegenerateTriangle}        & $C = D$、offset 零向量或侧面退化 \\
+  \texttt{LinkConditionViolated\{a, b\}} & 公共邻居 $\neq \{C, D\}$ \\
+  \texttt{Inconsistent(msg)}         & twin 不互指、next/prev 断裂、面含内部边等 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{validate\_mesh：流形不变量校验}
+
+\texttt{validate\_mesh(mesh)} 遍历所有半边与面，检查以下不变量：
+
+\begin{enumerate}
+  \item \textbf{twin 互指}：$h.\mathrm{twin} = t \Rightarrow t.\mathrm{twin} = h$；
+  \item \textbf{无自环}：$h.\mathrm{twin}.\mathrm{vertex} \neq h.\mathrm{vertex}$；
+  \item \textbf{next/prev 一致}：$h.\mathrm{next} = n \Rightarrow n.\mathrm{prev} = h$；
+  \item \textbf{三角面}：每个面的边界环长度 $= 3$。
+\end{enumerate}
+
+\section{split\_edge：边分裂}
+
+\subsection{算法描述}
+
+设 $h = \mathrm{he}$（若 $h.\mathrm{face} = \mathrm{None}$ 但 $\mathrm{twin}.\mathrm{face} = \mathrm{Some}$，
+自动改为操作 twin），$A = \mathrm{twin}.\mathrm{vertex}$，$B = h.\mathrm{vertex}$。
+$F_1 = h.\mathrm{face} = (A \to B \to C \to A)$，其中 $n_1 = h.\mathrm{next}$（$B \to C$），
+$p_1 = h.\mathrm{prev}$（$C \to A$）。
+
+\textbf{目标}：在 $A$、$B$ 之间插入中点 $M$，将 1 条边分裂为 2 条。
+
+\subsubsection{内部边（两侧均有面）}
+
+$F_2 = \mathrm{twin}.\mathrm{face} = (B \to A \to D \to B)$，
+$n_2 = \mathrm{twin}.\mathrm{next}$（$A \to D$），$p_2 = \mathrm{twin}.\mathrm{prev}$（$D \to B$）。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=7mm, inner sep=0pt, font=\small},
+  newvert/.style={circle, draw=red!70!black, fill=red!10, minimum size=7mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  newhe/.style={-Stealth, thick, draw=red!70!black},
+  lab/.style={font=\footnotesize, sloped, above}
+]
+  % 左图：分裂前
+  \node[vert] (a1) at (0,0) {$A$};
+  \node[vert] (b1) at (2,0) {$B$};
+  \node[vert] (c1) at (3,1.5) {$C$};
+  \node[vert] (d1) at (1,-1.5) {$D$};
+  \draw[he] (a1) -- node[lab] {$h$} (b1);
+  \draw[he] (b1) -- (c1);
+  \draw[he] (c1) -- (a1);
+  \draw[he] (b1) -- (d1);
+  \draw[he] (d1) -- (a1);
+  \node[below=1.5cm of a1, xshift=1cm, font=\small] {分裂前：2 面，1 边 $A$-$B$};
+
+  % 右图：分裂后
+  \node[newvert] (m2) at (5.5,0) {$M$};
+  \node[vert] (a2) at (4.5,0) {$A$};
+  \node[vert] (b2) at (6.5,0) {$B$};
+  \node[vert] (c2) at (7.5,1.5) {$C$};
+  \node[vert] (d2) at (5.5,-1.5) {$D$};
+  \draw[newhe] (a2) -- (m2);
+  \draw[newhe] (m2) -- (b2);
+  \draw[newhe] (m2) -- (c2);
+  \draw[newhe] (m2) -- (d2);
+  \draw[he] (b2) -- (c2);
+  \draw[he] (c2) -- (a2);
+  \draw[he] (b2) -- (d2);
+  \draw[he] (d2) -- (a2);
+  \node[below=1.5cm of a2, xshift=1.5cm, font=\small] {分裂后：4 面，4 边（$A$-$M$, $M$-$B$, $M$-$C$, $M$-$D$）};
+\end{tikzpicture}
+\end{center}
+
+操作步骤：
+\begin{enumerate}
+  \item 创建中点 $M$，位置 $= \frac{A + B}{2}$；
+  \item 新建 8 条半边：$a \to m$, $m \to a$, $m \to b$, $b \to m$, $m \to c$, $c \to m$, $m \to d$, $d \to m$；
+  \item $F_1$ 重用为 $(A \to M \to C \to A)$，新建 $F_{new1} = (M \to B \to C \to M)$；
+  \item $F_2$ 重用为 $(B \to M \to D \to B)$，新建 $F_{new2} = (M \to A \to D \to M)$；
+  \item 复用 $n_1, p_1, n_2, p_2$，仅修改其 \texttt{next/prev/face}；
+  \item 删除 $h$, $\mathrm{twin}$。
+\end{enumerate}
+
+\subsubsection{边界边（仅一侧有面）}
+
+$\mathrm{twin}.\mathrm{face} = \mathrm{None}$。新建 6 条半边（无 $m \to d, d \to m$），
+$\mathrm{twin}$（$B \to A$ 边界）分裂为 $b \to m$（$B \to M$ 边界）+ $m \to a$（$M \to A$ 边界），
+不创建 $F_{new2}$。
+
+\subsection{数量变化}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lccc@{}}
+  \toprule
+  \textbf{情形} & $\Delta V$ & $\Delta F$ & $\Delta E_{\mathrm{he}}$（半边数） \\
+  \midrule
+  内部边 & $+1$ & $+2$ & $+6$（删 2 加 8） \\
+  边界边 & $+1$ & $+1$ & $+4$（删 2 加 6） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{flip\_edge：内部边翻转}
+
+\subsection{算法描述}
+
+设 $h = \mathrm{he}$，$A = \mathrm{twin}.\mathrm{vertex}$，$B = h.\mathrm{vertex}$。
+$F_1 = h.\mathrm{face} = (A \to B \to C \to A)$，
+$F_2 = \mathrm{twin}.\mathrm{face} = (B \to A \to D \to B)$。
+四边形 $A$-$B$-$C$-$D$ 的对角线 $A$-$B$ 翻转为 $C$-$D$。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=7mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=red!70!black},
+  oldhe/.style={-Stealth, thick, draw=gray!50!black, dashed},
+  lab/.style={font=\footnotesize, sloped, above}
+]
+  % 左图：翻转前
+  \node[vert] (a1) at (0,0) {$A$};
+  \node[vert] (b1) at (2,0) {$B$};
+  \node[vert] (c1) at (2,2) {$C$};
+  \node[vert] (d1) at (0,2) {$D$};
+  \draw[he] (a1) -- node[lab] {$h$} (b1);
+  \draw[oldhe] (b1) -- (c1);
+  \draw[oldhe] (c1) -- (a1);
+  \draw[oldhe] (b1) -- (d1);
+  \draw[oldhe] (d1) -- (a1);
+  \node[below=0.3cm of a1, xshift=1cm, font=\small] {翻转前：对角线 $A$-$B$};
+
+  % 右图：翻转后
+  \node[vert] (a2) at (5,0) {$A$};
+  \node[vert] (b2) at (7,0) {$B$};
+  \node[vert] (c2) at (7,2) {$C$};
+  \node[vert] (d2) at (5,2) {$D$};
+  \draw[he] (c2) -- node[lab] {$h'$} (d2);
+  \draw[oldhe] (a2) -- (c2);
+  \draw[oldhe] (b2) -- (c2);
+  \draw[oldhe] (b2) -- (d2);
+  \draw[oldhe] (d2) -- (a2);
+  \node[below=0.3cm of a2, xshift=1cm, font=\small] {翻转后：对角线 $C$-$D$};
+\end{tikzpicture}
+\end{center}
+
+翻转后 $h$ 从 $A \to B$ 变为 $D \to C$（$\mathrm{vertex} = C$），
+$\mathrm{twin}$ 从 $B \to A$ 变为 $C \to D$（$\mathrm{vertex} = D$）。
+
+\begin{align}
+  F_1' &= (D \to C \to A \to D) = h \to p_1 \to n_2 \to h \\
+  F_2' &= (C \to D \to B \to C) = \mathrm{twin} \to p_2 \to n_1 \to \mathrm{twin}
+\end{align}
+
+\subsection{重连规则}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llll@{}}
+  \toprule
+  \textbf{半边} & \textbf{原 next / prev} & \textbf{新 next} & \textbf{新 prev} \\
+  \midrule
+  $h$       & $n_1$ / $p_1$ & $p_1$ & $n_2$ \\
+  $\mathrm{twin}$ & $n_2$ / $p_2$ & $p_2$ & $n_1$ \\
+  $p_1$     & $h$ / $n_1$   & $n_2$ & $h$ \\
+  $n_2$     & $p_2$ / $\mathrm{twin}$ & $h$ & $p_1$ \\
+  $p_2$     & $\mathrm{twin}$ / $n_2$ & $n_1$ & $\mathrm{twin}$ \\
+  $n_1$     & $p_1$ / $h$   & $\mathrm{twin}$ & $p_2$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+面归属变更：$n_2.\mathrm{face}$ 从 $F_2$ 改为 $F_1$，$n_1.\mathrm{face}$ 从 $F_1$ 改为 $F_2$。
+
+\subsection{校验}
+
+\begin{itemize}
+  \item $h.\mathrm{face}$ 与 $\mathrm{twin}.\mathrm{face}$ 均须为 $\mathrm{Some}$（内部边）；
+  \item $C \neq D$（防退化）。
+\end{itemize}
+
+数量不变：$\Delta V = \Delta F = \Delta E_{\mathrm{he}} = 0$。
+
+\section{collapse\_edge：边折叠}
+
+\subsection{算法描述}
+
+设 $h = \mathrm{he}$，$A = \mathrm{twin}.\mathrm{vertex}$，$B = h.\mathrm{vertex}$。
+$F_1 = h.\mathrm{face} = (A \to B \to C \to A)$，
+$F_2 = \mathrm{twin}.\mathrm{face} = (B \to A \to D \to B)$。
+合并 $A$、$B$ 为新顶点 $K$，删除 $F_1$、$F_2$。
+
+\paragraph{新顶点位置}
+\texttt{collapse\_edge} 固定使用 $A$、$B$ 中点作为 $K$ 的位置：
+\[
+  \mathbf{p}_K = \frac{\mathbf{p}_A + \mathbf{p}_B}{2}.
+\]
+\texttt{collapse\_edge\_at(mesh, he, pos)} 则使用调用者指定的 $\mathbf{p}_K = \mathrm{pos}$，
+用于 QEM 减面等需要最优折叠位置的场景。两者共享同一核心实现
+\texttt{collapse\_edge\_impl}，仅 \texttt{target\_pos} 参数不同（\texttt{None} $\to$ 中点），
+拓扑修改逻辑完全一致。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=7mm, inner sep=0pt, font=\small},
+  newvert/.style={circle, draw=red!70!black, fill=red!10, minimum size=7mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  delhe/.style={-Stealth, thick, draw=red!50!black, dashed},
+  lab/.style={font=\footnotesize, sloped, above}
+]
+  % 左图：折叠前
+  \node[vert] (a1) at (0,0) {$A$};
+  \node[vert] (b1) at (2,0) {$B$};
+  \node[vert] (c1) at (3,1.5) {$C$};
+  \node[vert] (d1) at (1,-1.5) {$D$};
+  \draw[delhe] (a1) -- node[lab] {$h$} (b1);
+  \draw[delhe] (b1) -- (c1);
+  \draw[delhe] (c1) -- (a1);
+  \draw[delhe] (b1) -- (d1);
+  \draw[delhe] (d1) -- (a1);
+  \node[below=1.5cm of a1, xshift=1cm, font=\small] {折叠前：2 面，边 $A$-$B$};
+
+  % 右图：折叠后
+  \node[newvert] (k2) at (5.5,0) {$K$};
+  \node[vert] (c2) at (7,1.5) {$C$};
+  \node[vert] (d2) at (5,-1.5) {$D$};
+  \draw[he] (k2) -- (c2);
+  \draw[he] (c2) -- (k2);
+  \draw[he] (k2) -- (d2);
+  \draw[he] (d2) -- (k2);
+  \node[below=1.5cm of k2, xshift=0.5cm, font=\small] {折叠后：0 面，$K$-$C$ 与 $K$-$D$ 缝合};
+\end{tikzpicture}
+\end{center}
+
+\subsection{链接条件}
+
+\textbf{定理}：在流形三角网格中折叠边 $A$-$B$ 不产生非流形，当且仅当
+\[
+  \boxed{\ \mathrm{link}(A) \cap \mathrm{link}(B) = \mathrm{link}(AB) = \{C, D\}\ }
+\]
+其中 $\mathrm{link}(V)$ 是 $V$ 的邻居集合，$\mathrm{link}(AB)$ 是 $A$、$B$ 的公共邻居。
+
+\textbf{直觉}：若 $A$、$B$ 有额外公共邻居 $E \notin \{C, D\}$，则折叠后 $K$-$E$ 边
+会被两个不同面共享（来自原 $A$-$E$ 和 $B$-$E$），产生非流形。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=6mm, inner sep=0pt, font=\footnotesize},
+  badvert/.style={circle, draw=red!70!black, fill=red!10, minimum size=6mm, inner sep=0pt, font=\footnotesize},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  badhe/.style={-, thick, draw=red!70!black, dashed}
+]
+  \node[vert] (a) at (0,0) {$A$};
+  \node[vert] (b) at (2,0) {$B$};
+  \node[vert] (c) at (3,1.2) {$C$};
+  \node[vert] (d) at (1,-1.2) {$D$};
+  \node[badvert] (e) at (1,1.5) {$E$};
+  \draw[he] (a) -- (b);
+  \draw[he] (a) -- (c);
+  \draw[he] (b) -- (c);
+  \draw[he] (a) -- (d);
+  \draw[he] (b) -- (d);
+  \draw[badhe] (a) -- (e);
+  \draw[badhe] (b) -- (e);
+  \node[below=2.5cm of a, xshift=1cm, font=\small, align=center]
+    {公共邻居 $= \{C, D, E\} \supsetneq \{C, D\}$\\$\Rightarrow$ 链接条件违反};
+\end{tikzpicture}
+\end{center}
+
+\subsection{操作步骤}
+
+\begin{enumerate}
+  \item \textbf{校验}：$h.\mathrm{face}, \mathrm{twin}.\mathrm{face}$ 均 $\mathrm{Some}$；
+        $C \neq D$；链接条件满足。
+  \item \textbf{收集}：遍历 $A$、$B$ 的 outgoing 环，收集所有 \texttt{vertex} $= A$ 或 $B$
+        的存活半边（排除待删除的 $h, \mathrm{twin}, n_1, p_1, n_2, p_2$）。
+  \item \textbf{创建} $K$（位置 $= \frac{A + B}{2}$）。
+  \item \textbf{缝合 twin}：
+    \begin{align}
+      p_1.\mathrm{twin}.\mathrm{twin} &\leftarrow n_1.\mathrm{twin} \\
+      n_1.\mathrm{twin}.\mathrm{twin} &\leftarrow p_1.\mathrm{twin} \\
+      n_2.\mathrm{twin}.\mathrm{twin} &\leftarrow p_2.\mathrm{twin} \\
+      p_2.\mathrm{twin}.\mathrm{twin} &\leftarrow n_2.\mathrm{twin}
+    \end{align}
+  \item \textbf{批量更新}：所有收集到的半边的 \texttt{vertex} $\leftarrow K$。
+  \item \textbf{更新 outgoing}：$K.\mathrm{halfedge} \leftarrow p_1.\mathrm{twin}$（现 $K \to C$）；
+        若 $C$ 或 $D$ 的 outgoing 指向已删除半边，更新为 $n_1.\mathrm{twin}$ 或 $n_2.\mathrm{twin}$。
+  \item \textbf{删除}：$h, \mathrm{twin}, n_1, p_1, n_2, p_2, F_1, F_2, A, B$。
+\end{enumerate}
+
+\subsection{数量变化}
+
+\[
+  \Delta V = -1, \quad \Delta F = -2, \quad \Delta E_{\mathrm{he}} = -6
+\]
+
+\section{extrude\_face：面挤出}
+
+\subsection{算法描述}
+
+设三角面 $F = (v_0, v_1, v_2)$ CCW，半边 $h_0(v_0 \to v_1), h_1(v_1 \to v_2), h_2(v_2 \to v_0)$，
+对应边界 twin $t_0(v_1 \to v_0), t_1(v_2 \to v_1), t_2(v_0 \to v_2)$（均 $\mathrm{face} = \mathrm{None}$）。
+
+\textbf{目标}：沿 $\vec{o}$（offset）方向把 $F$ 挤出为闭合三棱柱——底面 $F$ 保留，
+顶面 $F' = (v_2', v_1', v_0')$ 反向 CCW（外法向向外），三条侧边各分为 2 个三角形。
+
+\subsubsection{限制条件}
+
+$F$ 的三条边必须均为边界边（$\mathrm{twin}.\mathrm{face} = \mathrm{None}$），
+否则返回 \texttt{Inconsistent}。这保证挤出不会破坏邻接面的拓扑。
+
+\subsubsection{退化检查}
+
+\begin{itemize}
+  \item $\|\vec{o}\| < 10^{-12}$：返回 \texttt{DegenerateTriangle}；
+  \item 任一侧面三角形面积 $< 10^{-12}$：返回 \texttt{DegenerateTriangle}。
+\end{itemize}
+
+侧面三角形 $T_{1,i} = (v_{i+1}, v_i, v_i')$ 的面积为
+\[
+  \mathrm{area}_i = \tfrac{1}{2} \bigl| \vec{e}_i \times \vec{o} \bigr|,
+  \quad \vec{e}_i = \mathrm{pos}_{i+1} - \mathrm{pos}_i
+\]
+当 $\vec{o}$ 与 $\vec{e}_i$ 平行时侧面退化。
+
+\subsubsection{创建元素}
+
+\begin{itemize}
+  \item 3 个新顶点 $v_0', v_1', v_2'$，位置 $= \mathrm{pos}_i + \vec{o}$；
+  \item 7 个新面：1 顶面 $F'$ + 6 侧面三角形（每条侧边 2 个）；
+  \item 18 条新半边，重用 3 条原边界 twin $t_0, t_1, t_2$ 作为侧面半边。
+\end{itemize}
+
+\subsubsection{顶面 $F'$}
+
+$F' = (v_2', v_1', v_0')$ CCW（反向），半边
+\[
+  \mathrm{tp}_0(v_2' \to v_1'),\quad
+  \mathrm{tp}_1(v_1' \to v_0'),\quad
+  \mathrm{tp}_2(v_0' \to v_2')
+\]
+形成 $\mathrm{tp}_0 \to \mathrm{tp}_1 \to \mathrm{tp}_2 \to \mathrm{tp}_0$ 闭合环。
+
+\subsubsection{侧面三角形}
+
+对每条侧边 $i \in \{0, 1, 2\}$（indices mod 3）：
+\begin{align*}
+  T_{1,i} &= (v_{i+1}, v_i, v_i') = t_i \to a_i \to b_i \to t_i \\
+  T_{2,i} &= (v_{i+1}, v_i', v_{i+1}') = c_i \to d_i \to e_i \to c_i
+\end{align*}
+
+其中 $a_i(v_i \to v_i')$、$b_i(v_i' \to v_{i+1})$、$c_i(v_{i+1} \to v_i')$、
+$d_i(v_i' \to v_{i+1}')$、$e_i(v_{i+1}' \to v_{i+1})$ 均为新半边。
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=6mm, inner sep=0pt, font=\footnotesize},
+  newvert/.style={circle, draw=red!70!black, fill=red!10, minimum size=6mm, inner sep=0pt, font=\footnotesize},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  newhe/.style={-Stealth, thick, draw=red!70!black},
+  lab/.style={font=\scriptsize, sloped, above}
+]
+  % 底面
+  \node[vert] (v0) at (0,0) {$v_i$};
+  \node[vert] (v1) at (2.5,0) {$v_{i+1}$};
+  % 顶面
+  \node[newvert] (vp0) at (0,2) {$v_i'$};
+  \node[newvert] (vp1) at (2.5,2) {$v_{i+1}'$};
+  % 侧面三角形 T1 = (v_{i+1}, v_i, v_i')
+  \draw[he] (v1) -- node[lab] {$t_i$} (v0);
+  \draw[newhe] (v0) -- node[lab] {$a_i$} (vp0);
+  \draw[newhe] (vp0) -- node[lab] {$b_i$} (v1);
+  % 侧面三角形 T2 = (v_{i+1}, v_i', v_{i+1}')
+  \draw[newhe] (v1) -- node[lab, below=2pt] {$c_i$} (vp0);
+  \draw[newhe] (vp0) -- node[lab] {$d_i$} (vp1);
+  \draw[newhe] (vp1) -- node[lab, right=2pt] {$e_i$} (v1);
+  % 标签
+  \node[font=\scriptsize, below=0.1cm of v0, xshift=0.6cm] {底边 $i$};
+  \node[font=\scriptsize] at (1.25, 1.0) {$T_{1,i}$};
+  \node[font=\scriptsize] at (1.75, 1.4) {$T_{2,i}$};
+\end{tikzpicture}
+\end{center}
+
+\subsubsection{twin 对应（12 对）}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{半边对} & \textbf{关系} & \textbf{说明} \\
+  \midrule
+  $t_i \leftrightarrow h_i$ & 已存在 & 底面边（保留原 twin） \\
+  $a_i \leftrightarrow e_{i-1}$ & 垂直边 & 相邻侧面共享 $v_i \to v_i'$ \\
+  $b_i \leftrightarrow c_i$ & 对角线 & 侧面内对角线 \\
+  $d_i \leftrightarrow \mathrm{tp}_{\mathrm{map}(i)}$ & 顶面边 & 顶面与侧面共享 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+其中顶面 twin 映射 $\mathrm{map}$：
+\[
+  d_0 \leftrightarrow \mathrm{tp}_1,\quad
+  d_1 \leftrightarrow \mathrm{tp}_0,\quad
+  d_2 \leftrightarrow \mathrm{tp}_2
+\]
+（因 $d_0$ 为 $v_0' \to v_1'$，与 $\mathrm{tp}_1$（$v_1' \to v_0'$）互为 twin；其他类推。）
+
+\subsubsection{顶点 outgoing 入口}
+
+新顶点 $v_i'$ 的 outgoing 入口设为 $d_i$（origin $= v_i'$，因 $d_i$ 的 twin 是 $\mathrm{tp}_{\mathrm{map}(i)}$，
+其 $\mathrm{vertex} = v_i'$）。
+
+原顶点 $v_i$ 的 outgoing 不变（仍指向某条原半边，绕 $v_i$ 的 CCW 环已通过 $a_i/e_{i-1}$ 扩展）。
+
+\subsection{校验}
+
+操作完成后调用 \texttt{validate\_topology}（来自 \texttt{validate.rs}）执行完整校验：
+twin 互指、next/prev 一致、面边界环长度 $= 3$、入口字段一致、退化面、流形约束。
+若存在错误，回滚并返回 \texttt{Inconsistent}。
+
+\subsection{数量变化}
+
+\[
+  \Delta V = +3, \quad \Delta F = +7, \quad \Delta E_{\mathrm{he}} = +18
+\]
+
+挤出后 Euler 示性数 $\chi = V - E + F$：
+\[
+  \underbrace{3 - 3 + 1}_{\text{原三角（盘）}= 1}
+  \xrightarrow{\text{extrude}}
+  \underbrace{6 - 12 + 8}_{\text{三棱柱（球）}= 2}
+\]
+即从带边界的盘变为闭合三棱柱（同胚于球面，$\chi = 2$）。
+
+\subsection{批量版本}
+
+\texttt{extrude\_faces(mesh, \&[FaceId], offset)} 逐个调用 \texttt{extrude\_face}，
+累积返回所有新创建的面 ID。若两面共享边，先挤出的面会使共享边变为内部边，
+后续挤出会因「面含内部边」返回 \texttt{Inconsistent}——此时网格已部分修改，
+调用方需自行处理回滚或仅在互不相连的面集合上使用批量接口。
+
+\section{extrude\_region：区域挤出}
+\label{sec:extrude-region}
+
+\texttt{extrude\_region(mesh, \&[FaceId], offset)} 模仿 Blender/Maya 中
+"Extrude Region" 的行为：选中区域内所有面共同移动 \texttt{offset}，
+区域内部边不产生侧面，仅在区域边界生成侧面四边形（三角化）。
+
+\subsection{顶点分类}
+
+对每个区域顶点 $v$，用 \texttt{VertexAdjacentFaces} 收集其邻接面集合 $\mathcal{A}(v)$：
+
+\[
+  \text{内部顶点} \iff \mathcal{A}(v) \neq \emptyset \ \wedge\ \mathcal{A}(v) \subseteq \mathcal{R}
+\]
+
+其中 $\mathcal{R}$ 为区域面集合。内部顶点原地平移 $\text{pos} \mathrel{+}= \vec{o}$，
+$\text{vert\_map}[v] = v$；边界顶点创建新顶点 $v' = \text{pos} + \vec{o}$，
+$\text{vert\_map}[v] = v'$。
+
+\subsection{半边分类}
+
+对每条区域半边 $h$，检查 $h.\text{twin}.\text{face}$：
+
+\[
+  \text{内部半边} \iff h.\text{twin}.\text{face} \in \mathcal{R}
+\]
+
+\begin{itemize}
+  \item \textbf{内部半边}：直接更新 $h.\text{vertex} \leftarrow \text{vert\_map}[v_t]$。
+        twin 同理（也在区域内，会被独立更新）。无需新半边。
+  \item \textbf{边界半边}：创建新顶半边 $h_{\text{top}}$（vertex $= \text{vert\_map}[v_t]$）
+        替换 $h$ 在面环中的位置；$h$ 被释放供侧面使用。
+\end{itemize}
+
+\subsection{侧面创建}
+
+每条边界半边 $h(v_o \to v_t)$ 生成四边形 $(v_o, v_t, v_t', v_o')$，
+沿对角线 $v_o \to v_t'$ 三角化：
+
+\begin{align*}
+  T_1 &= (v_o, v_t, v_t'):\quad h \to \text{up}_t \to \text{diag}_{\text{rev}} \\
+  T_2 &= (v_o, v_t', v_o'):\quad \text{diag} \to s_{\text{top}} \to \text{down}_o
+\end{align*}
+
+其中：
+\begin{itemize}
+  \item $\text{up}_t: v_t \to v_t'$，$\text{down}_o: v_o' \to v_o$：垂直半边，
+        每个边界顶点创建一对 $(\text{up}, \text{down})$，相邻侧面共享。
+  \item $s_{\text{top}}: v_t' \to v_o'$：顶边，是 $h_{\text{top}}$ 的 twin。
+  \item $\text{diag}: v_o \to v_t'$，$\text{diag}_{\text{rev}}: v_t' \to v_o$：对角线对。
+\end{itemize}
+
+\subsection{面环重建}
+
+每个区域面 $F$ 的半边环中，边界半边 $h$ 替换为 $h_{\text{top}}$，内部半边保留。
+新环 $r_0 \to r_1 \to r_2 \to r_0$ 的朝向与原面一致（不反转），
+因此 $F$ 复用为顶面，朝向不变。
+
+\subsection{退化检查}
+
+\begin{itemize}
+  \item $\|\vec{o}\| < 10^{-12}$ 返回 \texttt{DegenerateTriangle}
+  \item 任一侧面面积 $\frac{1}{2}|\vec{e}_i \times \vec{o}| < 10^{-12}$ 返回 \texttt{DegenerateTriangle}
+\end{itemize}
+
+\subsection{边界情况}
+
+\begin{itemize}
+  \item \textbf{区域包含整个网格}：所有顶点为内部顶点，仅平移，无侧面。
+  \item \textbf{区域非连通}：各连通分量独立挤出，共享同一 offset。
+  \item \textbf{空区域}：返回 \texttt{Inconsistent}。
+\end{itemize}
+
+\section{算法流程图}
+
+\subsection{split\_edge 流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=9cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$h$};
+  \node[proc, below=of s, fill=blue!8] (p1) {取 $A, B, F_1, n_1, p_1, C$；若 $h.\mathrm{face}=\mathrm{None}$ 改操作 twin};
+  \node[dec, below=of p1] (d1) {$\mathrm{twin}.\mathrm{face} = \mathrm{Some}$？};
+  \node[proc, below left=of d1, xshift=-1.5cm, fill=green!10] (p2) {内部边：取 $F_2, n_2, p_2, D$\\新建 8 半边 + 2 面};
+  \node[proc, below right=of d1, xshift=1.5cm, fill=yellow!15] (p3) {边界边：新建 6 半边 + 1 面};
+  \node[proc, below=2.0cm of d1, fill=blue!8] (p4) {重连 $F_1=(A \to M \to C \to A)$；新建 $F_{new1}=(M \to B \to C \to M)$};
+  \node[proc, below=of p4, fill=blue!8] (p5) {更新面入口、顶点 outgoing};
+  \node[proc, below=of p5, fill=red!10] (p6) {删除 $h, \mathrm{twin}$；返回 $M$};
+  \node[startend, below=of p6, fill=green!12] (e) {返回 $M$};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {是} (p2);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (p3);
+  \draw[op] (p2) |- (p4);
+  \draw[op] (p3) |- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{flip\_edge 流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=8.5cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$h$};
+  \node[proc, below=of s, fill=blue!8] (p1) {取 $A, B, F_1, F_2, n_1, p_1, n_2, p_2, C, D$};
+  \node[dec, below=of p1] (d1) {$F_1, F_2$ 均 $\mathrm{Some}$？};
+  \node[proc, below=2.0cm of d1, xshift=-3cm, fill=red!10] (err1) {返回 \texttt{FlipOnBoundaryEdge}};
+  \node[dec, below=of d1] (d2) {$C \neq D$？};
+  \node[proc, below=2.0cm of d2, xshift=-3cm, fill=red!10] (err2) {返回 \texttt{DegenerateTriangle}};
+  \node[proc, below=of d2, fill=blue!8] (p2) {$h.\mathrm{vertex} \leftarrow C$；$\mathrm{twin}.\mathrm{vertex} \leftarrow D$};
+  \node[proc, below=of p2, fill=blue!8] (p3) {重连 6 条半边的 next/prev/face};
+  \node[proc, below=of p3, fill=blue!8] (p4) {更新 $B$ 的 outgoing};
+  \node[startend, below=of p4, fill=green!12] (e) {返回 Ok(())};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (err1);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {是} (d2);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {否} (err2);
+  \draw[op] (d2) -- node[right, font=\footnotesize] {是} (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{collapse\_edge 流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=9.5cm, minimum height=0.65cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$h$};
+  \node[proc, below=of s, fill=blue!8] (p1) {取 $A, B, F_1, F_2, n_1, p_1, n_2, p_2, C, D$};
+  \node[dec, below=of p1] (d1) {$F_1, F_2$ 均 Some？};
+  \node[dec, below=of d1] (d2) {$C \neq D$？};
+  \node[dec, below=of d2] (d3) {链接条件：$\mathrm{link}(A) \cap \mathrm{link}(B) = \{C,D\}$？};
+  \node[proc, below=of d3, fill=blue!8] (p2) {收集需更新 vertex 的半边列表};
+  \node[proc, below=of p2, fill=blue!8] (p3) {创建 $K$（中点或 \texttt{target\_pos}）；缝合 twin（$p_1.t \leftrightarrow n_1.t$, $n_2.t \leftrightarrow p_2.t$）};
+  \node[proc, below=of p3, fill=blue!8] (p4) {批量更新 vertex $= A/B \to K$};
+  \node[proc, below=of p4, fill=blue!8] (p5) {更新 $K, C, D$ 的 outgoing};
+  \node[proc, below=of p5, fill=red!10] (p6) {删除 $h, \mathrm{twin}, n_1, p_1, n_2, p_2, F_1, F_2, A, B$};
+  \node[startend, below=of p6, fill=green!12] (e) {返回 $K$};
+
+  \node[proc, right=2.5cm of d1, fill=red!10] (e1) {\texttt{CollapseOnBoundaryEdge}};
+  \node[proc, right=2.5cm of d2, fill=red!10] (e2) {\texttt{DegenerateTriangle}};
+  \node[proc, right=2.5cm of d3, fill=red!10] (e3) {\texttt{LinkConditionViolated}};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {是} (d2);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (e1);
+  \draw[op] (d2) -- node[right, font=\footnotesize] {是} (d3);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {否} (e2);
+  \draw[op] (d3) -- node[right, font=\footnotesize] {是} (p2);
+  \draw[op] (d3) -| node[above, near start, font=\footnotesize] {否} (e3);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{extrude\_face 流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=9.5cm, minimum height=0.65cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$F, \vec{o}$};
+  \node[dec, below=of s] (d0) {$\|\vec{o}\| \geq 10^{-12}$？};
+  \node[proc, right=2.5cm of d0, fill=red!10] (e0) {\texttt{DegenerateTriangle}};
+  \node[proc, below=of d0, fill=blue!8] (p1) {收集 $F$ 的 3 条半边 $h_i$、3 顶点 $v_i$、3 边界 twin $t_i$};
+  \node[dec, below=of p1] (d1) {3 边均为边界边？};
+  \node[proc, right=2.5cm of d1, fill=red!10] (e1) {\texttt{Inconsistent}};
+  \node[dec, below=of d1] (d2) {$\forall i:\ \frac{1}{2}|\vec{e}_i \times \vec{o}| \geq 10^{-12}$？};
+  \node[proc, right=2.5cm of d2, fill=red!10] (e2) {\texttt{DegenerateTriangle}};
+  \node[proc, below=of d2, fill=blue!8] (p2) {创建 3 顶点 $v_i'$、18 半边（tp, a, b, c, d, e）、7 面};
+  \node[proc, below=of p2, fill=blue!8] (p3) {设置顶面 $F'$ 半边环：$\mathrm{tp}_0 \to \mathrm{tp}_1 \to \mathrm{tp}_2$};
+  \node[proc, below=of p3, fill=blue!8] (p4) {循环 $i=0,1,2$ 设置 $T_{1,i}, T_{2,i}$ 半边 next/prev/face/twin};
+  \node[proc, below=of p4, fill=blue!8] (p5) {更新 $v_i'.\mathrm{halfedge} \leftarrow d_i$};
+  \node[dec, below=of p5] (d3) {\texttt{validate\_topology} 通过？};
+  \node[proc, right=2.5cm of d3, fill=red!10] (e3) {\texttt{Inconsistent}};
+  \node[startend, below=of d3, fill=green!12] (e) {返回 7 个新面 ID};
+
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -| node[above, near start, font=\footnotesize] {否} (e0);
+  \draw[op] (d0) -- node[right, font=\footnotesize] {是} (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (e1);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {是} (d2);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {否} (e2);
+  \draw[op] (d2) -- node[right, font=\footnotesize] {是} (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (d3);
+  \draw[op] (d3) -| node[above, near start, font=\footnotesize] {否} (e3);
+  \draw[op] (d3) -- node[right, font=\footnotesize] {是} (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{extrude\_region 流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.6cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：$\mathcal{R}, \vec{o}$};
+  \node[dec, below=of s] (d0) {$\|\vec{o}\| \geq 10^{-12}$ 且 $\mathcal{R} \neq \emptyset$？};
+  \node[proc, right=2.0cm of d0, fill=red!10] (e0) {\texttt{DegenerateTriangle} / \texttt{Inconsistent}};
+  \node[proc, below=of d0, fill=blue!8] (p1) {收集区域半边与顶点；分类顶点（内部/边界），构建 vert\_map};
+  \node[proc, below=of p1, fill=blue!8] (p2) {分类半边（内部/边界）；退化侧面检查 $\frac{1}{2}|\vec{e} \times \vec{o}| \geq 10^{-12}$};
+  \node[dec, below=of p2] (d1) {侧面退化？};
+  \node[proc, right=2.0cm of d1, fill=red!10] (e1) {\texttt{DegenerateTriangle}};
+  \node[proc, below=of d1, fill=blue!8] (p3) {为每个边界顶点创建垂直半边对 $(\text{up}, \text{down})$};
+  \node[proc, below=of p3, fill=blue!8] (p4) {内部半边：$h.\text{vertex} \leftarrow \text{vert\_map}[v_t]$};
+  \node[proc, below=of p4, fill=blue!8] (p5) {边界半边：创建 $h_{\text{top}}, s_{\text{top}}$；重建区域面环（$h \to h_{\text{top}}$）};
+  \node[proc, below=of p5, fill=blue!8] (p6) {每条边界边创建 diag 对 + $T_1, T_2$ 侧面三角形};
+  \node[proc, below=of p6, fill=blue!8] (p7) {修复顶点 outgoing：$v \to \text{up}$，$v' \to \text{down}$};
+  \node[dec, below=of p7] (d2) {\texttt{validate\_topology} 通过？};
+  \node[proc, right=2.0cm of d2, fill=red!10] (e2) {\texttt{Inconsistent}};
+  \node[startend, below=of d2, fill=green!12] (e) {返回侧面 ID 列表};
+
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -| node[above, near start, font=\footnotesize] {否} (e0);
+  \draw[op] (d0) -- node[right, font=\footnotesize] {是} (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {是} (e1);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {否} (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (p7);
+  \draw[op] (p7) -- (d2);
+  \draw[op] (d2) -| node[above, near start, font=\footnotesize] {否} (e2);
+  \draw[op] (d2) -- node[right, font=\footnotesize] {是} (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{add\_triangle：增量三角形构建}
+
+\texttt{add\_triangle(mesh, v0, v1, v2)} 向网格追加一个 CCW 三角形 $(v_0 \to v_1 \to v_2 \to v_0)$，
+自动处理 twin 配对与顶点 outgoing 入口。它是不依赖 \texttt{build\_mesh\_from\_vertices\_and\_faces}
+的细粒度构建 API，适合流式增量构造（如从索引流重建网格、布尔运算结果回写）。
+
+\subsection{算法步骤}
+
+\begin{enumerate}
+  \item \textbf{退化校验}：$v_0 \neq v_1 \neq v_2 \neq v_0$，且三个顶点均存在。
+  \item \textbf{创建 3 条半边}：$h_0: v_0 \to v_1$、$h_1: v_1 \to v_2$、$h_2: v_2 \to v_0$，
+        设置 \texttt{next/prev} 闭环 $h_0 \to h_1 \to h_2 \to h_0$。
+  \item \textbf{创建面} $F$，\texttt{halfedge} $\leftarrow h_0$，三条半边 \texttt{face} $\leftarrow F$。
+  \item \textbf{twin 配对}（对每条边 $h_i: \text{src} \to \text{dst}$）：
+        遍历所有现存半边，查找 $E$ 满足 $E.\mathrm{vertex} = \text{src}$
+        且 $E.\mathrm{twin}.\mathrm{vertex} = \text{dst}$ 且 $E.\mathrm{twin}.\mathrm{face} = \mathrm{None}$
+        （即 $E$ 的 twin 是方向为 $\text{src} \to \text{dst}$ 的边界半边）。
+        \begin{itemize}
+          \item \textbf{命中}：删除旧边界 twin，将 $h_i$ 与 $E$ 互设为 twin（复用已有内部半边）。
+          \item \textbf{未命中}：新建边界半边 $\text{twin}: \text{dst} \to \text{src}$，与 $h_i$ 互指。
+        \end{itemize}
+  \item \textbf{outgoing 入口}：对 $v_0, v_1, v_2$，若其 \texttt{halfedge} 字段为 \texttt{None}，
+        设置为对应的 $h_i$。
+  \item \textbf{最终校验}：调用 \texttt{validate\_mesh}。
+\end{enumerate}
+
+\subsection{twin 查找策略}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.6cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.6, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始：新边 $h_i: \text{src}\to\text{dst}$};
+  \node[proc, below=of s, fill=blue!8] (p1) {扫描所有现存半边 $E$，查找 $E.\mathrm{vertex}=\text{src}$ 且 $E.\mathrm{twin}.\mathrm{vertex}=\text{dst}$ 且 $E.\mathrm{twin}.\mathrm{face}=\mathrm{None}$};
+  \node[dec, below=of p1] (d1) {找到 $E$？};
+  \node[proc, below=of d1, fill=green!10] (yes) {删除 $E$ 的旧边界 twin；$h_i \leftrightarrow E$ 互设 twin};
+  \node[proc, right=2.2cm of d1, fill=blue!8] (no) {新建 twin: $\text{dst}\to\text{src}$（边界）；$h_i \leftrightarrow \text{twin}$};
+  \node[startend, below=of yes, fill=green!12] (e) {返回};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {是} (yes);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (no);
+  \draw[op] (no) |- (e);
+  \draw[op] (yes) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{数量变化}
+
+每次调用：$\Delta V = 0$、$\Delta F = +1$。
+半边数变化取决于共享边数量：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lcc@{}}
+  \toprule
+  \textbf{共享边数 $k$} & $\Delta E_{\mathrm{he}}$ & \textbf{说明} \\
+  \midrule
+  $0$（孤立三角形） & $+6$ & 3 内部 + 3 边界 twin \\
+  $1$（与现有网格共享一边） & $+4$ & 2 新内部 + 2 新边界 twin（旧 twin 被删除复用） \\
+  $2$（嵌入两面之间） & $+2$ & 1 新内部 + 1 新边界 twin \\
+  $3$（封闭体最后一面） & $+0$ & 全部 twin 已存在 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{校验}
+
+\begin{itemize}
+  \item 三顶点两两不同（\texttt{DegenerateTriangle}）；
+  \item 三顶点均存在（\texttt{Inconsistent}）；
+  \item \texttt{validate\_mesh} 通过。
+\end{itemize}
+
+\section{split\_face：面分裂（poke）}
+
+\texttt{split\_face(mesh, face)} 在三角面重心处插入新顶点 $M$，
+将 1 个三角形分裂为 3 个三角形（又称 \emph{poke} 或 \emph{face center insertion}）。
+常用于均匀加密网格、生成径向辐条拓扑。
+
+\subsection{算法步骤}
+
+设原面 $F = (v_0 \to v_1 \to v_2 \to v_0)$，对应半边 $h_0, h_1, h_2$，
+其 twin 分别为 $t_0, t_1, t_2$（部分可能为 \texttt{None}）。
+
+\begin{enumerate}
+  \item \textbf{校验}：$F$ 存在且为三角面（边界环长度 $=3$）。
+  \item \textbf{计算重心}：
+        \[
+          \mathbf{p}_M = \frac{\mathbf{p}_{v_0} + \mathbf{p}_{v_1} + \mathbf{p}_{v_2}}{3}.
+        \]
+  \item \textbf{创建中心顶点} $M$，位置 $= \mathbf{p}_M$。
+  \item \textbf{删除旧面与 3 条半边} $h_0, h_1, h_2$（保留旧 twin $t_0, t_1, t_2$）。
+  \item \textbf{创建 3 个新面}，对 $i \in \{0, 1, 2\}$：
+        \begin{itemize}
+          \item 新建辐条半边 $\text{spoke\_out}_i: M \to v_{i}$ 与 $\text{spoke\_in}_i: v_{i+1} \to M$，互为 twin；
+          \item 新建外边界半边 $\text{outer}_i: v_i \to v_{i+1}$，恢复与 $t_{i+1}$ 的 twin 关系；
+          \item 设置 \texttt{next/prev} 闭环：$\text{spoke\_out}_i \to \text{outer}_i \to \text{spoke\_in}_i \to \text{spoke\_out}_i$；
+          \item 新建面 $F_i$，\texttt{halfedge} $\leftarrow \text{spoke\_out}_i$。
+        \end{itemize}
+  \item \textbf{设置 $M$ 的 outgoing}：$\leftarrow \text{spoke\_out}_0$。
+  \item \textbf{校验}：\texttt{validate\_mesh}。
+\end{enumerate}
+
+\subsection{拓扑示意}
+
+\begin{center}
+\begin{tikzpicture}[
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=7mm, inner sep=0pt, font=\small},
+  newvert/.style={circle, draw=red!70!black, fill=red!10, minimum size=7mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=gray!60!black},
+  newhe/.style={-Stealth, thick, draw=red!70!black},
+  lab/.style={font=\footnotesize, sloped, above}
+]
+  % 左图：分裂前
+  \node[vert] (v0a) at (0,0) {$v_0$};
+  \node[vert] (v1a) at (2,0) {$v_1$};
+  \node[vert] (v2a) at (1,1.8) {$v_2$};
+  \draw[he] (v0a) -- (v1a);
+  \draw[he] (v1a) -- (v2a);
+  \draw[he] (v2a) -- (v0a);
+  \node[below=1.5cm of v1a, xshift=-1cm, font=\small] {分裂前：1 面};
+
+  % 右图：分裂后
+  \node[vert] (v0b) at (5,0) {$v_0$};
+  \node[vert] (v1b) at (7,0) {$v_1$};
+  \node[vert] (v2b) at (6,1.8) {$v_2$};
+  \node[newvert] (m) at (6,0.6) {$M$};
+  \draw[newhe] (m) -- (v0b);
+  \draw[newhe] (m) -- (v1b);
+  \draw[newhe] (m) -- (v2b);
+  \draw[he] (v0b) -- (v1b);
+  \draw[he] (v1b) -- (v2b);
+  \draw[he] (v2b) -- (v0b);
+  \node[below=1.5cm of v1b, xshift=-1cm, font=\small] {分裂后：3 面，3 条辐条边};
+\end{tikzpicture}
+\end{center}
+
+\subsection{twin 恢复策略}
+
+原外边界半边 $h_i: v_i \to v_{i+1}$ 被删除，其 twin $t_i: v_{i+1} \to v_i$ 保留。
+新建的 $\text{outer}_i: v_i \to v_{i+1}$ 与 $t_i$ 重新互设 twin，从而保持外边界邻接面的拓扑不变。
+
+\subsection{数量变化}
+
+\[
+  \Delta V = +1,\quad \Delta F = +2,\quad \Delta E_{\mathrm{he}} = +3
+\]
+（删 3 旧半边，加 3 outer + 6 spoke = 9 新半边；外边界 twin 关系复用。）
+
+\subsection{注意事项}
+
+\texttt{split\_face} 当前\textbf{无单元测试}。建议补充以下用例：
+
+\begin{itemize}
+  \item 单三角面 poke：验证 $+1V +2F +3\text{HE}$ 与重心位置；
+  \item 内部三角面 poke：验证邻接面 twin 关系不被破坏；
+  \item 多次连续 poke：所有面仍为三角面；
+  \item 非三角面 poke：返回 \texttt{Inconsistent}。
+\end{itemize}
+
+\section{复杂度}
+
+设边的度（邻接面数）为 $d_e$（三角网格中 $d_e \in \{1, 2\}$），
+顶点的度为 $d_v$。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{操作} & \textbf{时间复杂度} \\
+  \midrule
+  \texttt{split\_edge}     & $O(1)$（固定数量的半边创建与重连） \\
+  \texttt{flip\_edge}      & $O(1)$（重连 6 条半边） \\
+  \texttt{collapse\_edge}  & $O(d_A + d_B)$（遍历 outgoing 环收集 + 更新） \\
+  \texttt{extrude\_face}   & $O(1)$（固定 18 半边 + 7 面创建）+ $O(|E|+|F|)$（校验） \\
+  \texttt{extrude\_faces}  & $O(n) \cdot (\texttt{extrude\_face} + \texttt{validate})$ \\
+  \texttt{extrude\_region} & $O(|\mathcal{R}| \cdot \bar{d_v}) + O(|\partial\mathcal{R}|)$（顶点分类 + 侧面创建）+ $O(|E|+|F|)$（校验） \\
+  \texttt{add\_triangle}   & $O(|E_{\mathrm{he}}|)$（每条边需扫描现存半边查找可配对 twin）+ $O(|E|+|F|)$（校验） \\
+  \texttt{split\_face}     & $O(1)$（固定 9 半边创建与重连）+ $O(|E|+|F|)$（校验） \\
+  \texttt{validate\_mesh}  & $O(|E_{\mathrm{he}}| + |F|)$（遍历所有半边与面） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{单元测试覆盖}
+
+\texttt{src/topology\_ops.rs} 末尾共 38 个测试，分八组（\texttt{split\_face} 暂无测试）：
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.18}
+\begin{longtable}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{覆盖点} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{校验}} \\
+  \texttt{validate\_clean\_meshes} & 三种 fixture 均通过校验 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{split\_edge}} \\
+  \texttt{split\_boundary\_edge\_of\_single\_triangle} & 边界边分裂：+1V +1F +4HE，中点位置正确 \\
+  \texttt{split\_interior\_edge\_of\_two\_triangles}   & 内部边分裂：+1V +2F +6HE \\
+  \texttt{split\_boundary\_edge\_passed\_as\_boundary\_halfedge} & 传入边界半边自动转 twin \\
+  \midrule
+  \multicolumn{2}{l}{\textit{flip\_edge}} \\
+  \texttt{flip\_interior\_edge\_of\_two\_triangles} & 内部边翻转：数量不变，$h.\mathrm{vertex}=C$ \\
+  \texttt{flip\_boundary\_edge\_fails}              & 边界边翻转返回错误 \\
+  \texttt{flip\_then\_flip\_restores\_topology}     & 双翻恢复拓扑 \\
+  \texttt{flip\_preserves\_boundary\_vertices}      & 翻转后四角仍为边界顶点 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{collapse\_edge}} \\
+  \texttt{collapse\_interior\_edge\_of\_closed\_fan} & 闭合扇形折叠：$-1V -2F -6$HE \\
+  \texttt{collapse\_boundary\_edge\_fails}           & 边界边折叠返回错误 \\
+  \texttt{collapse\_with\_violated\_link\_condition\_fails} & 5 顶点 4 面网格，公共邻居 3 个 \\
+  \texttt{collapse\_link\_condition\_check\_function} & 直接测试 \texttt{check\_link\_condition} \\
+  \texttt{collapse\_then\_remaining\_mesh\_valid}    & 折叠后 $K$ 为边界顶点，网格合法 \\
+  \texttt{collapse\_edge\_uses\_midpoint\_position}  & \texttt{collapse\_edge} 新顶点 $= \frac{A+B}{2}$ \\
+  \texttt{collapse\_edge\_at\_uses\_custom\_position} & \texttt{collapse\_edge\_at} 新顶点 $=$ 指定位置 \\
+  \texttt{collapse\_edge\_at\_preserves\_topology\_counts} & 两函数拓扑计数一致，仅位置不同 \\
+  \texttt{collapse\_edge\_at\_on\_boundary\_edge\_fails} & \texttt{collapse\_edge\_at} 同样禁止边界边 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{extrude\_face}} \\
+  \texttt{extrude\_single\_triangle}                 & 单三角挤出：+3V +7F +18HE，Euler $=2$ \\
+  \texttt{extrude\_zero\_offset\_returns\_error}     & 零向量 offset 返回 \texttt{DegenerateTriangle} \\
+  \texttt{extrude\_degenerate\_side\_face\_returns\_error} & offset 平行边时侧面退化 \\
+  \texttt{extrude\_face\_with\_internal\_edge\_returns\_error} & 面含内部边返回 \texttt{Inconsistent} \\
+  \texttt{extrude\_faces\_batch\_disjoint}           & 3 个不相交三角形批量挤出 \\
+  \texttt{extrude\_face\_from\_built\_mesh}          & \texttt{build\_mesh\_from\_vertices\_and\_faces} 后挤出 \\
+  \texttt{extrude\_face\_invalid\_face\_id}          & 无效 FaceId 返回 \texttt{Inconsistent} \\
+  \texttt{extrude\_face\_preserves\_boundary\_after\_extrude} & 挤出后无边界半边（闭合体） \\
+  \midrule
+  \multicolumn{2}{l}{\textit{extrude\_region}} \\
+  \texttt{extrude\_region\_single\_face\_of\_tetrahedron} & 闭合四面体单面挤出：+3V +6F +18HE，Euler $=2$ \\
+  \texttt{extrude\_region\_two\_adjacent\_faces}     & 双相邻面挤出：共享边为内部边不产生侧面，+4V +8F +24HE \\
+  \texttt{extrude\_region\_three\_faces\_leaving\_cap} & 三面挤出：1 内部顶点原地平移，剩余面成盖子 \\
+  \texttt{extrude\_region\_zero\_offset\_returns\_error} & 零 offset 返回 \texttt{DegenerateTriangle} \\
+  \texttt{extrude\_region\_empty\_faces\_returns\_error} & 空区域返回 \texttt{Inconsistent} \\
+  \texttt{extrude\_region\_degenerate\_side\_returns\_error} & offset 平行边界边时侧面退化 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{综合与错误处理}} \\
+  \texttt{split\_then\_validate\_all\_faces\_triangular} & 连续 split 后所有面仍为三角 \\
+  \texttt{invalid\_halfedge\_returns\_error}         & 无效句柄三个操作均返回 \texttt{InvalidHalfEdge} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{add\_triangle}} \\
+  \texttt{add\_triangle\_to\_empty\_mesh}            & 空网格上添加首三角形，6 半边 / 3 顶点齐全 \\
+  \texttt{add\_two\_adjacent\_triangles}             & 第二三角形与第一共享边，自动 twin 缝合 \\
+  \texttt{add\_degenerate\_triangle\_fails}          & 重复顶点返回 \texttt{DegenerateTriangle} \\
+  \texttt{add\_triangle\_with\_invalid\_vertex\_fails} & 无效 VertexId 返回 \texttt{InvalidVertex} \\
+  \texttt{add\_triangle\_preserves\_existing\_edge}  & 共享边已存在时复用半边，拓扑保持 \\
+  \bottomrule
+\end{longtable}
+\end{center}
+
+全库 \texttt{cargo test} 当前共 \textbf{371 个}用例，全部通过。分布：
+\texttt{topology\_ops}（38）、\texttt{traversal}（62）、\texttt{subdiv}（41）、
+\texttt{geometry}（41）、\texttt{storage}（20）、\texttt{query}（19）、
+\texttt{property}（16）、\texttt{decimate}（15）、\texttt{bvh}（15）、
+\texttt{io}（22）、\texttt{validate}（9）、\texttt{builtin\_attrs}（9）、
+\texttt{test\_util}（8）、\texttt{connectivity}（8）、
+\texttt{primitives}（7）、\texttt{boolean}（7）、\texttt{triangulation}（6）、
+\texttt{remesh}（5）、\texttt{export}（5）、\texttt{linalg}（4）、
+\texttt{conformal}（4）、\texttt{weld}（3）、\texttt{orientation}（2）、
+\texttt{ids}（2）、\texttt{geodesics}（2）、\texttt{parameterization}（1）。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何 split\_edge 自动处理边界半边？} 调用方可能传入边界半边（$\mathrm{face}=\mathrm{None}$），
+        操作语义应与传入其 twin 一致。内部统一转为「$h.\mathrm{face} = \mathrm{Some}$」再处理，
+        避免重复代码。
+  \item \textbf{为何 flip\_edge 禁止边界边？} 翻转边界边会改变网格边界拓扑，
+        且四边形只有一侧有面时翻转无意义。
+  \item \textbf{为何 collapse\_edge 用链接条件而非简单度检查？} 链接条件是流形边折叠的
+        充要条件，度检查只能捕获部分非流形情形。例如 $A$、$B$ 度均为 4 但公共邻居只有 2 个时
+        折叠仍然合法。
+  \item \textbf{为何操作前先 clone 数据？} Rust 借用检查要求修改 \texttt{mesh} 时不能同时持有
+        \texttt{\&HalfEdge} 引用。先 \texttt{clone} 所需字段到局部变量，再进行修改，
+        是最简洁的解法。
+  \item \textbf{为何 collapse\_edge 中先缝合 twin 再更新 vertex？} 若先更新 vertex，
+        \texttt{to\_update} 列表中的半边可能因 vertex 变化而难以判断原值。先缝合 twin
+        确保结构完整，再批量更新 vertex。
+  \item \textbf{为何 collapse\_edge\_at 与 collapse\_edge 共享 \texttt{\_impl}？}
+        QEM 减面需要指定最优折叠位置 $\mathbf{p}_K$（由二次误差矩阵求得），
+        但拓扑修改逻辑与中点折叠完全一致。提取 \texttt{collapse\_edge\_impl}
+        避免代码重复，\texttt{collapse\_edge} 和 \texttt{collapse\_edge\_at}
+        各仅一行委托，符合「始终保持代码整洁」原则。
+  \item \textbf{为何 extrude\_face 限制面三边均为边界边？} 若面含内部边，挤出后该内部边的
+        邻接面会被孤立（共享边变成新顶面/侧面的边），破坏流形性。此限制保证挤出操作只
+        在「自由面」上进行，类似 OpenMesh 的 \texttt{triangulate} 限制。
+  \item \textbf{为何顶面 $F'$ 反向 CCW？} 底面 $F = (v_0, v_1, v_2)$ 法向 $\vec{n}_F$ 朝外，
+        顶面 $F'$ 应法向 $-\vec{n}_F$ 朝外（向外即向上），故 CCW 序列取反：$(v_2', v_1', v_0')$。
+        这保证挤出后整个闭合体的法向一致朝外。
+  \item \textbf{为何每条侧边用 2 个三角形而非 1 个四边形？} 本库仅支持三角网格，
+        侧面四边形必须沿对角线三角化：
+        \[
+          T_{1,i} = (v_{i+1}, v_i, v_i'),\quad
+          T_{2,i} = (v_{i+1}, v_i', v_{i+1}')
+        \]
+  \item \textbf{为何 extrude\_region 复用原面为顶面而非新建？} 区域挤出中，
+        原区域面 $F$ 的法向已朝外（假设输入网格法向一致），挤出后 $F$ 移动到顶面位置，
+        朝向应保持不变。复用 $F$ 避免了删除原面 + 新建顶面的开销，
+        且内部边的 twin 关系天然保留（仅更新 vertex 字段）。
+        这与 \texttt{extrude\_face} 的策略（保留底面 + 新建反向顶面）不同，
+        因为 \texttt{extrude\_face} 处理的是孤立面，而 \texttt{extrude\_region} 处理的是
+        嵌入在网格中的面，需要保持与非区域面的拓扑连接。
+  \item \textbf{为何 extrude\_region 内部顶点原地平移而非复制？} 内部顶点的所有邻接面
+        均在区域内，全部会随挤出移动。复制顶点会导致原顶点变成孤立点（无邻接面），
+        破坏流形性。原地平移 $v.\text{pos} \mathrel{+}= \vec{o}$ 是唯一正确的选择。
+  \item \textbf{为何 extrude\_region 边界顶点的 outgoing 指向 up？} 边界顶点 $v$
+        既连接非区域面（保留原位），又连接侧面（新创建）。$v$ 的 outgoing 入口
+        必须指向一个确实从 $v$ 出发的半边。垂直半边 $\text{up}: v \to v'$ 是最稳定的选择，
+        因为它不依赖于具体的边界边排列顺序。
+  \item \textbf{为何 add\_triangle 暴力扫描半边而非维护邻接表？} 增量构建 API
+        假设调用频率不高（构建完成后转入常规遍历），暴力扫描 $O(|E_{\mathrm{he}}|)$
+        在小规模构建中足够快；维护额外索引会增加 \texttt{MeshStorage} 内存开销
+        并破坏与 \texttt{slotmap} 的简洁集成。大规模重建应使用
+        \texttt{build\_mesh\_from\_vertices\_and\_faces}（一次成型）。
+  \item \textbf{为何 split\_face 删除原半边再重建，而非就地分裂？} poke 操作将
+        3 条外边界半边全部「易主」给新的 3 个面，并新增 6 条辐条半边。若就地修改，
+        需要为每条原半边分配新 twin、调整 next/prev，分支较多。先删除再重建使逻辑
+        清晰、对称，且 \texttt{slotmap} 的 key 复用策略保证内存不会无限增长。
+\end{itemize}
+
+\end{document}

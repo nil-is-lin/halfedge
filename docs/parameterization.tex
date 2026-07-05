@@ -1,0 +1,503 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 曲面参数化模块设计文档} \\ \large \texttt{src/parameterization.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{parameterization.rs} 实现\textbf{网格参数化}（Surface Parameterization /
+UV Unwrapping）：将三角网格的三维曲面映射到二维平面，尽可能保持角度
+（保角 / conformal）或面积（保面积 / equiareal）。
+所有方法都要求网格是\textbf{单连通、开圆盘拓扑}（genus 0、1 条边界环）。
+
+模块对外暴露 4 个公共函数，均接收 \texttt{\&MeshStorage} 并返回
+\texttt{Option<Vec<[f64; 2]>}（每个顶点一组 UV 坐标）：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{2.4cm}p{5.2cm}p{7.1cm}@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  保形（无翻转）
+    & \texttt{tutte\_embedding(mesh)}            & Tutte 重心映射：边界均匀映射到单位圆，内部用均匀拉普拉斯权重求解，保证无翻转 \\
+  \midrule
+  保角
+    & \texttt{harmonic\_parameterization(mesh)}  & 调和参数化：使用余切权重（离散 Laplace-Beltrami），保角性优于 Tutte \\
+  \midrule
+  自由边界保角
+    & \texttt{lscm(mesh)}                        & Least Squares Conformal Maps：固定前两个顶点到 $(0,0)$ 与 $(1,0)$，其余自由求解 \\
+  \midrule
+  保形（无翻转，非凸安全）
+    & \texttt{mvc\_parameterization(mesh)}       & Mean Value Coordinates 参数化（Floater 2003）：
+      权重 $w_i \ge 0$，对所有有效网格（含非凸/非 Delaunay）保证无翻转 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{设计要点}：
+\begin{itemize}
+  \item 四者均构造稀疏线性系统并调用 \texttt{conjugate\_gradient} 求解，
+        迭代上限 $200 \cdot n$，相对残差 $< 10^{-6}$；
+  \item Tutte、Harmonic、MVC 使用\textbf{Dirichlet 边界条件}（边界固定到单位圆），
+        LSCM 仅固定 2 个顶点消去零空间；
+  \item 失败场景统一返回 \texttt{None}（空网格、无边界、求解发散）。
+\end{itemize}
+
+\section{拓扑前置条件}
+
+四个 API 均要求输入网格满足\textbf{开圆盘拓扑}（open disk topology）：
+
+\begin{enumerate}
+  \item \textbf{单连通}：网格连通，无把手（genus $g = 0$）；
+  \item \textbf{唯一边界环}：恰好 1 条边界回路（$b = 1$）；
+  \item \textbf{三角化}：所有面为三角形。
+\end{enumerate}
+
+由 Euler 示性数判定：$\chi = V - E + F = 2 - 2g - b$。
+对开圆盘拓扑 $\chi = 1$（即 $g = 0, b = 1$）。
+若网格为闭合（$b = 0$）或有多条边界环（$b > 1$），Tutte / Harmonic 会因
+\texttt{collect\_boundary\_vertices} 返回多段而不保证正确；
+LSCM 不依赖边界回路但仍要求 $V \ge 2$。
+
+\begin{center}
+\begin{tikzpicture}[
+  scale=0.85,
+  vertex/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=3mm, inner sep=0pt, font=\scriptsize},
+  inner/.style={circle, draw=black!60, fill=gray!10, minimum size=3mm, inner sep=0pt, font=\scriptsize},
+  bdy/.style={very thick, red!70!black},
+  intedge/.style={thin, black!50}
+]
+  % 外圈边界（红色）
+  \draw[bdy] (0,0) -- (4,0) -- (5,2) -- (4,4) -- (1,4.5) -- (-1,3) -- (-1,1) -- cycle;
+  % 内部边
+  \draw[intedge] (1.5,1) -- (3,1.5);
+  \draw[intedge] (3,1.5) -- (3.5,3);
+  \draw[intedge] (3.5,3) -- (1.5,2.5);
+  \draw[intedge] (1.5,2.5) -- (1.5,1);
+  \draw[intedge] (1.5,1) -- (1.5,2.5);
+  \draw[intedge] (3,1.5) -- (1.5,2.5);
+  % 边界顶点
+  \foreach \p/\lbl in {(0,0)/v_b, (4,0)/v_b, (5,2)/v_b, (4,4)/v_b, (1,4.5)/v_b, (-1,3)/v_b, (-1,1)/v_b} {
+    \node[vertex] at \p {};
+  }
+  % 内部顶点
+  \node[inner] at (1.5,1) {};
+  \node[inner] at (3,1.5) {};
+  \node[inner] at (3.5,3) {};
+  \node[inner] at (1.5,2.5) {};
+  % 图例
+  \node[font=\footnotesize, red!70!black, anchor=west] at (6.0, 4.0) {边界环（1 条）};
+  \node[font=\footnotesize, black!60, anchor=west] at (6.0, 3.0) {内部边};
+  \node[font=\footnotesize, blue!70!black, anchor=west] at (6.0, 2.0) {边界顶点 $v_b$};
+  \node[font=\footnotesize, black!60, anchor=west] at (6.0, 1.0) {内部顶点 $v_i$};
+\end{tikzpicture}
+\end{center}
+
+\section{Tutte 重心映射}
+
+\subsection{算法步骤}
+
+Tutte 1963 提出的\textbf{重心映射}（barycentric embedding）是最早的参数化方法，
+步骤如下：
+
+\begin{enumerate}
+  \item \textbf{收集边界顶点}：遍历所有顶点，筛选 \texttt{is\_boundary\_vertex} 为真者；
+  \item \textbf{按环绕顺序排列}：从任一边界顶点出发，沿边界半边
+        \texttt{twin.next} 链路前进，直至回到起点；
+  \item \textbf{边界映射到单位圆}：第 $k$ 个边界顶点（共 $n_b$ 个）固定为
+        \[
+          \theta_k = \frac{2\pi k}{n_b}, \quad
+          (u_k, v_k) = (\cos\theta_k,\, \sin\theta_k);
+        \]
+  \item \textbf{构建均匀拉普拉斯矩阵} $L$（见下小节）；
+  \item \textbf{施加 Dirichlet 边界条件}：边界行替换为单位行，RHS 设为固定 UV；
+  \item \textbf{求解} $L\,u = 0$ 与 $L\,v = 0$（实际为带边界的修正系统）。
+\end{enumerate}
+
+\subsection{均匀拉普拉斯权重}
+
+设顶点 $i$ 的邻接集合为 $N(i)$，度数为 $d_i = |N(i)|$，则均匀拉普拉斯权重为
+\[
+  w_{ij} =
+  \begin{cases}
+    \dfrac{1}{d_i}, & j \in N(i), \\[6pt]
+    1,              & j = i \text{（对角）}.
+  \end{cases}
+\]
+实现中 \texttt{build\_full\_uniform\_laplacian} 对每条邻接边贡献 $-0.5$，
+对角线贡献 $d_i / 2$（等价于上式乘以 $d_i / 2$ 的常数倍，不影响零空间结构）。
+内部顶点的拉普拉斯方程为
+\[
+  \sum_{j \in N(i)} w_{ij}\, (u_j - u_i) = 0,
+  \qquad
+  \sum_{j \in N(i)} w_{ij}\, (v_j - v_i) = 0.
+\]
+
+\subsection{无翻转保证}
+
+\textbf{Tutte 定理}（1963）：若边界顶点严格凸地映射到平面凸多边形（这里是单位圆），
+且权重 $w_{ij} > 0$、$\sum_j w_{ij} = 1$，则上述线性系统的解是
+\textbf{双射且无翻转}的参数化。均匀权重满足此条件，故
+\texttt{tutte\_embedding} 对任意开圆盘拓扑网格保证无翻转。
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=9.5cm, minimum height=0.75cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8]    (p1) {收集边界顶点 \texttt{collect\_boundary\_vertices}};
+  \node[proc, below=of p1, fill=blue!8]   (p2) {按环绕顺序排列 \texttt{order\_boundary\_vertices}};
+  \node[proc, below=of p2, fill=yellow!15](p3) {边界映射到单位圆：$\theta_k = 2\pi k / n_b$，$(u_k,v_k)=(\cos\theta_k,\sin\theta_k)$};
+  \node[proc, below=of p3, fill=green!12] (p4) {构建均匀拉普拉斯矩阵 $L$（$w_{ij}=1/d_i$）};
+  \node[proc, below=of p4, fill=orange!12](p5) {施加 Dirichlet 边界条件：边界行 $= I$，RHS $=$ 固定 UV};
+  \node[proc, below=of p5, fill=red!10]   (p6) {共轭梯度求解 $L\,u = b_u$，$L\,v = b_v$};
+  \node[startend, below=of p6] (e) {返回 \texttt{Vec<[f64; 2]>}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{调和参数化}
+
+\subsection{余切权重}
+
+调和参数化与 Tutte 同框架（边界固定到单位圆 + Dirichlet + 共轭梯度求解），
+但将均匀权重替换为\textbf{余切权重}（离散 Laplace-Beltrami 算子）。
+对内部边 $(i, j)$（其两侧三角形在 $i$ 处对角为 $\alpha_{ij}$，在 $j$ 处对角为 $\beta_{ij}$）：
+\[
+  w_{ij} = \frac{1}{2}\bigl(\cot\alpha_{ij} + \cot\beta_{ij}\bigr).
+\]
+实现 \texttt{build\_full\_cotan\_laplacian} 调用
+\texttt{crate::geometry::cotan\_edge\_weight}，并取其一半以匹配上式对称形式。
+对边界边（仅一个相邻三角形）退化为 $\frac{1}{2}\cot\alpha_{ij}$。
+
+\subsection{保角性优势}
+
+余切权重是\textbf{离散 Laplace-Beltrami 算子}的一阶近似，
+当网格足够细时其解收敛到连续调和映射 $\Delta f = 0$，
+即\textbf{保角映射}（conformal map）的离散化。
+因此 \texttt{harmonic\_parameterization} 在角度保持上显著优于 Tutte：
+\begin{itemize}
+  \item Tutte：均匀权重忽略几何，边界附近角度变形大；
+  \item Harmonic：余切权重编码了面内角，三角形角度近似保持。
+\end{itemize}
+
+\textbf{注意}：余切权重可能为负（当 $\alpha$ 或 $\beta > \pi/2$，即三角形钝角），
+负权重不满足 Tutte 定理的正权条件，故 \texttt{harmonic\_parameterization}
+\textbf{不保证无翻转}，仅期望在质量良好的网格上无翻转。
+
+\section{LSCM：最小二乘保角映射}
+
+\subsection{保角能量}
+
+Least Squares Conformal Maps（Lévy et al. 2002）从\textbf{保角性}出发直接构造
+最小二乘目标。设参数化函数 $f(x, y) = (u(x, y), v(x, y))$，
+由 Cauchy-Riemann 方程，$f$ 保角当且仅当
+\[
+  \frac{\partial f}{\partial x} = -i\,\frac{\partial f}{\partial y}
+  \quad\Longleftrightarrow\quad
+  \frac{\partial u}{\partial x} = \frac{\partial v}{\partial y},\;
+  \frac{\partial u}{\partial y} = -\frac{\partial v}{\partial x}.
+\]
+定义保角能量
+\[
+  E(f) = \sum_{f \in F} A_f \left\|
+    \frac{\partial f}{\partial x} - i\,\frac{\partial f}{\partial y}
+  \right\|^2,
+\]
+其中 $A_f$ 是三角形面积。$E = 0$ 当且仅当 $f$ 严格保角。
+
+\subsection{离散化与零空间}
+
+将每三角形 $f = (v_0, v_1, v_2)$ 在其局部坐标系下展开
+（用 $v_0$ 为原点，$\vec{e}_1 = v_1 - v_0$ 为 $x$ 轴），
+$u, v$ 在三角形上线性，可由三顶点 UV 表出。
+$E(f)$ 是 UV 的二次型，最终化为稀疏最小二乘系统
+\[
+  \min_{u, v} \bigl\| A \, [u; v] \bigr\|^2.
+\]
+
+\textbf{零空间}：平移（$u \to u + c_1, v \to v + c_2$）与旋转
+（$u \to u\cos\phi - v\sin\phi, v \to u\sin\phi + v\cos\phi$）不改变 $E$。
+为消去零空间，固定 2 个顶点：
+\begin{itemize}
+  \item 顶点 $0$ 固定到 $(0, 0)$；
+  \item 顶点 $1$ 固定到 $(1, 0)$；
+  \item 其余 $V - 2$ 个顶点自由。
+\end{itemize}
+
+实现中 \texttt{lscm} 复用 \texttt{build\_full\_cotan\_laplacian} 构造余切拉普拉斯，
+并调用 \texttt{apply\_dirichlet} 仅对这 2 个顶点施加约束（边界顶点自由），
+再用 \texttt{conjugate\_gradient} 求解。
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.75cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8]    (p1) {校验 $V \ge 2$、$F > 0$};
+  \node[proc, below=of p1, fill=green!12] (p2) {构建余切拉普拉斯矩阵 $L$};
+  \node[proc, below=of p2, fill=yellow!15](p3) {固定 $v_0 \to (0,0)$，$v_1 \to (1,0)$};
+  \node[proc, below=of p3, fill=orange!12](p4) {\texttt{apply\_dirichlet}：2 行替换为单位行，RHS 移项};
+  \node[proc, below=of p4, fill=red!10]   (p5) {共轭梯度求解 $L\,u = b_u$，$L\,v = b_v$};
+  \node[startend, below=of p5] (e) {返回 \texttt{Vec<[f64; 2]>}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{Mean Value Coordinates 参数化}
+
+\subsection{MVC 权重}
+
+Mean Value Coordinates（Floater 2003）与 Tutte/Harmonic 同属
+「边界固定 + 内部重心插值」框架，但权重改用\textbf{MVC 权重}。
+
+对内部顶点 $v$，设其邻居按环绕顺序为 $u_1, \dots, u_k$，记
+\[
+  d_i = \|u_i - v\|, \qquad
+  \alpha_i = \angle(u_i - v,\; u_{i+1} - v)
+\]
+（$v$ 处相邻射线夹角，索引模 $k$），则
+\[
+  w_i = \frac{\tan(\alpha_{i-1}/2) + \tan(\alpha_i/2)}{d_i},
+  \qquad
+  \lambda_i = \frac{w_i}{\sum_j w_j}.
+\]
+
+\textbf{关键性质}：
+\begin{itemize}
+  \item $\lambda_i \ge 0$（因 $\alpha_i \in [0, \pi]$，$\tan(\alpha_i/2) \ge 0$，$d_i > 0$）；
+  \item $\sum_i \lambda_i = 1$（归一化）；
+  \item 因此内部顶点位于邻居的\textbf{凸组合}内，\textbf{保证无翻转}。
+\end{itemize}
+
+\subsection{与 Tutte / Harmonic 对比}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{2.4cm}p{3.6cm}p{3.6cm}p{4.0cm}@{}}
+  \toprule
+  \textbf{方法} & \textbf{权重} & \textbf{保形性} & \textbf{无翻转保证} \\
+  \midrule
+  Tutte   & 均匀 $1/d_i$ & 差（忽略几何） & 是（正权 + 凸边界） \\
+  Harmonic & 余切 $\frac{1}{2}(\cot\alpha + \cot\beta)$ & 好（保角近似） & \textbf{否}（余切可负） \\
+  MVC      & $\frac{\tan(\alpha_{i-1}/2) + \tan(\alpha_i/2)}{d_i}$ & 中（介于两者） & \textbf{是}（非凸也安全） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+MVC 是工业上常用的折中方案（pmp-library、libigl 均提供），
+在\textbf{非凸边界}或\textbf{非 Delaunay} 网格上仍保证无翻转，
+而 Harmonic 在这些场景下可能产生翻转。
+
+\subsection{边界邻居处理}
+
+内部顶点 $i$ 的方程为 $p_i = \sum_j \lambda_j\, p_j$。对边界邻居 $j$：
+\begin{itemize}
+  \item 矩阵中跳过 $(i, j)$（边界行已设为单位行，避免污染）；
+  \item 将 $\lambda_j\, p_j$ 移到 RHS：$\text{rhs}_i \mathrel{+}= \lambda_j\, \text{uv}_j$。
+\end{itemize}
+对内部邻居 $j$：写入矩阵 $L_{ij} = -\lambda_j$，对角 $L_{ii} = 1$。
+
+\subsection{边界顶点排序}
+
+\texttt{mvc\_parameterization} 使用 \texttt{traversal::boundary\_loops}
+获取正确的边界半边环（而非手动沿 \texttt{twin.next} 遍历，后者在某些拓扑下会遗漏顶点），
+再从半边 tip 顶点提取有序顶点列表，确保所有边界顶点都被正确映射到单位圆。
+
+\subsection{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10.5cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8] (p1)
+    {\texttt{boundary\_loops} 获取边界半边环，提取有序顶点};
+  \node[proc, below=of p1, fill=yellow!15] (p2)
+    {边界顶点映射到单位圆：$\theta_k = 2\pi k / n_b$};
+  \node[proc, below=of p2, fill=green!12] (p3)
+    {对每个内部顶点：收集 CCW 邻居，计算 $d_i$、$\alpha_i$、$w_i$、$\lambda_i$};
+  \node[proc, below=of p3, fill=orange!12] (p4)
+    {构造矩阵：边界行 $=$ 单位行；内部行对角 $= 1$，
+     内部邻居 $L_{ij}=-\lambda_j$，边界邻居移 RHS};
+  \node[proc, below=of p4, fill=red!10] (p5)
+    {\texttt{regularize\_diagonal} + \texttt{conjugate\_gradient} 求解 $u, v$};
+  \node[startend, below=of p5] (e) {返回 \texttt{Vec<[f64; 2]>}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{退化守卫}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{tutte\_embedding}            & $V = 0$ 或 $F = 0$ & 返回 \texttt{None} \\
+  \texttt{tutte\_embedding}            & 无边界顶点（闭合网格） & 返回 \texttt{None} \\
+  \texttt{tutte\_embedding}            & 共轭梯度发散 & 返回 \texttt{None}（\texttt{?} 传播） \\
+  \midrule
+  \texttt{harmonic\_parameterization}  & $V = 0$ 或 $F = 0$ & 返回 \texttt{None} \\
+  \texttt{harmonic\_parameterization}  & 无边界顶点 & 返回 \texttt{None} \\
+  \texttt{harmonic\_parameterization}  & 余切权重含负值 & 不阻断求解，但\textbf{不保证无翻转} \\
+  \texttt{harmonic\_parameterization}  & 共轭梯度发散 & 返回 \texttt{None} \\
+  \midrule
+  \texttt{lscm}                        & $V < 2$ 或 $F = 0$ & 返回 \texttt{None} \\
+  \texttt{lscm}                        & 共轭梯度发散 & 返回 \texttt{None} \\
+  \midrule
+  \texttt{mvc\_parameterization}       & $V = 0$ 或 $F = 0$ & 返回 \texttt{None} \\
+  \texttt{mvc\_parameterization}       & 无边界顶点（闭合网格） & 返回 \texttt{None} \\
+  \texttt{mvc\_parameterization}       & 邻居距离 $d_i < 10^{-14}$ & 跳过该顶点（视为孤立，单位行） \\
+  \texttt{mvc\_parameterization}       & $\sum w_i < 10^{-14}$ & 回退到均匀权重 $1/k$ \\
+  \texttt{mvc\_parameterization}       & 共轭梯度发散 & 返回 \texttt{None} \\
+  \midrule
+  \texttt{apply\_dirichlet}（内部）    & 对角线奇异 & \texttt{regularize\_diagonal} 加 $10^{-8}$ \\
+  \texttt{order\_boundary\_vertices}（内部） & 无边界环 & 返回空 \texttt{Vec} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{使用示例}
+
+\begin{lstlisting}
+use halfedge::parameterization::{
+    tutte_embedding, harmonic_parameterization, lscm, mvc_parameterization,
+};
+use halfedge::storage::MeshStorage;
+
+let mut mesh = MeshStorage::new();
+// 构造一个开圆盘拓扑网格（略，需调用 topology_ops::add_triangle）
+// ...
+
+// Tutte：保证无翻转，适合 UI 预览
+if let Some(uv) = tutte_embedding(&mesh) {
+    for (i, [u, v]) in uv.iter().enumerate() {
+        println!("v{} -> ({:.4}, {:.4})", i, u, v);
+    }
+}
+
+// Harmonic：保角性更好，适合纹理映射
+let uv_h = harmonic_parameterization(&mesh);
+
+// LSCM：自由边界，适合任意边界形状
+let uv_l = lscm(&mesh);
+
+// MVC：非凸/非 Delaunay 安全，无翻转保证
+let uv_mvc = mvc_parameterization(&mesh);
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{6.2cm}p{8.5cm}@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{test\_lscm\_simple\_quad}
+    & 双三角形四边形网格上 LSCM 成功返回 4 个 UV；$v_0$ 钉在 $(0,0)$、$v_1$ 钉在 $(1,0)$（容差 $0.1$） \\
+  \midrule
+  \texttt{test\_mvc\_simple\_quad}
+    & 双三角形四边形网格上 MVC 成功；所有边界点在单位圆上（$|r - 1| < 10^{-3}$） \\
+  \texttt{test\_mvc\_no\_flip\_on\_concave\_mesh}
+    & L 形非凸网格上 MVC 成功；所有边界点在单位圆上 \\
+  \texttt{test\_mvc\_returns\_none\_on\_empty}
+    & 空网格返回 \texttt{None} \\
+  \texttt{test\_mvc\_returns\_none\_on\_closed\_mesh}
+    & 闭合网格（icosphere）返回 \texttt{None} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/parameterization.rs} 共 \textbf{5 个}单元测试，全库共 \textbf{394 个}。
+
+\end{document}

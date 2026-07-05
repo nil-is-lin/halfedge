@@ -1,0 +1,358 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: Catmull-Clark 细分模块设计文档} \\ \large \texttt{src/subdiv/catmull\_clark.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{catmull\_clark.rs} 在 \texttt{traversal.rs}、\texttt{io.rs} 之上叠加
+\textbf{Catmull-Clark 细分}能力，用于任意多边形网格的光滑细分。与 Loop 细分
+（仅支持三角网格）不同，Catmull-Clark 适用于三角形、四边形及任意 $k$ 边形面，
+且一次细分后所有面变为四边形（输出时三角化为 2 个三角形以兼容
+\texttt{MeshStorage} 的三角面约束）。
+
+\subsection{核心 API}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{API} & \textbf{语义} \\
+  \midrule
+  \texttt{catmull\_clark\_subdivide(\&MeshStorage) -> MeshStorage} & 对任意多边形网格执行一次 Catmull-Clark 细分 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{依赖关系}
+
+\begin{itemize}
+  \item \texttt{storage::MeshStorage}：底层网格容器
+  \item \texttt{traversal::\{FaceHalfEdges, VertexRing, is\_boundary\_vertex, is\_boundary\_edge\}}：面环遍历、顶点邻域遍历、边界判定
+  \item \texttt{io::build\_mesh\_from\_vertices\_and\_faces}：从顶点位置 + 三角面索引构建输出网格
+\end{itemize}
+
+\section{算法}
+
+Catmull-Clark 细分是\textbf{逼近型}细分方案，是双三次 B 样条曲面的精确推广。
+每次细分引入三类新顶点（面点、边点、更新后的原顶点），并将每个 $k$ 边形面
+分裂为 $k$ 个四边形。
+
+\subsection{面点（Face Point）}
+
+每个面的顶点平均值：
+\[
+  \text{fp} = \frac{1}{k}\sum_{i=0}^{k-1} v_i
+\]
+其中 $k$ 为面的边数。每个面产生恰好 1 个面点。
+
+\subsection{边点（Edge Point）}
+
+对每条无向边 $e = (v_0, v_1)$，设其两侧邻接面点为 $\text{fp}_L, \text{fp}_R$：
+
+\[
+  \text{ep} = \begin{cases}
+    \dfrac{v_0 + v_1 + \text{fp}_L + \text{fp}_R}{4} & \text{内部边} \\[6pt]
+    \dfrac{v_0 + v_1}{2} & \text{边界边}
+  \end{cases}
+\]
+
+\subsection{顶点更新（Vertex Point）}
+
+\subsubsection{内部顶点}
+
+设顶点 $v$ 的度（valence）为 $n$，邻接面点均值为 $F$，邻接边中点均值为 $R$，
+原位置为 $P$：
+
+\[
+  v' = \frac{F + 2R + (n-3) \cdot P}{n}
+\]
+
+其中：
+\[
+  F = \frac{1}{n}\sum_{i=1}^{n} \text{fp}_i, \qquad
+  R = \frac{1}{n}\sum_{i=1}^{n} \frac{v + v_i}{2}
+\]
+
+\subsubsection{边界顶点}
+
+设边界顶点 $v$ 沿边界线的两个邻居为 $v_{\text{prev}}, v_{\text{next}}$：
+
+\[
+  v' = \frac{v_{\text{prev}} + 6v + v_{\text{next}}}{8}
+\]
+
+\subsection{面分裂}
+
+每个原始 $k$ 边形面（顶点 $v_0, v_1, \ldots, v_{k-1}$，CCW）分裂为 $k$ 个四边形。
+设 $\text{ep}_i$ 为边 $(v_i, v_{i+1})$ 的边点，$\text{fp}$ 为该面的面点。
+第 $i$ 个四边形为：
+
+\[
+  Q_i = (v_i,\ \text{ep}_i,\ \text{fp},\ \text{ep}_{i-1})
+\]
+
+每个四边形沿对角线 $v_i \to \text{fp}$ 三角化为 2 个三角形：
+\[
+  T_{i,1} = (v_i, \text{ep}_i, \text{fp}), \qquad
+  T_{i,2} = (v_i, \text{fp}, \text{ep}_{i-1})
+\]
+
+\subsection{规模变化}
+
+设原始网格有 $V$ 顶点、$E$ 边、$F$ 面，各面边数为 $k_i$：
+
+\begin{align*}
+  V' &= V + E + F && \text{(原顶点 + 边点 + 面点)} \\
+  F' &= 2\sum_{i=1}^{F} k_i && \text{(每 } k_i \text{-gon 产生 } 2k_i \text{ 三角形)}
+\end{align*}
+
+对于纯四边形网格：$F' = 8F$；对于纯三角网格：$F' = 6F$。
+
+\section{数据结构}
+
+\subsection{顶点布局}
+
+输出网格的顶点数组布局：
+
+\begin{center}
+\begin{tabular}{@{}ccc@{}}
+  \toprule
+  \textbf{区间} & \textbf{内容} & \textbf{数量} \\
+  \midrule
+  $[0, V)$ & 更新后的原始顶点 & $V$ \\
+  $[V, V+E)$ & 边点 & $E$ \\
+  $[V+E, V+E+F)$ & 面点 & $F$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{边键去重}
+
+无向边用 $(\min(i_0, i_1), \max(i_0, i_1))$ 表示，确保每条边只处理一次：
+
+\begin{lstlisting}
+fn edge_key(a: u32, b: u32) -> (u32, u32) {
+    if a < b { (a, b) } else { (b, a) }
+}
+\end{lstlisting}
+
+\subsection{边邻接面点收集}
+
+遍历所有面的所有边，为每条边收集其邻接面点。若一条边恰好有 2 个邻接面点 → 内部边；
+否则（0 或 1 个）→ 边界边处理。
+
+\section{流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.6cm, align=center, font=\small},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12},
+  op/.style={-Stealth, thick},
+]
+  \node[startend] (s) {开始：\texttt{\&MeshStorage}};
+  \node[proc, below=of s, fill=blue!8] (p1) {收集原始顶点 ID 与索引映射；收集所有面为顶点索引环};
+  \node[proc, below=of p1, fill=blue!8] (p2) {计算面点 $\text{fp}_j = \frac{1}{k}\sum v_i$};
+  \node[proc, below=of p2, fill=blue!8] (p3) {收集边邻接面点；遍历半边计算边点（内部/边界分支）};
+  \node[proc, below=of p3, fill=blue!8] (p4) {构建新顶点数组 $[V, E, F]$ 布局；更新原始顶点位置};
+  \node[proc, below=of p4, fill=blue!8] (p5) {三角化：每个 $k$-gon $\to$ $k$ 个四边形 $\to$ $2k$ 个三角形};
+  \node[proc, below=of p5, fill=blue!8] (p6) {\texttt{build\_mesh\_from\_vertices\_and\_faces} 构建输出};
+  \node[startend, below=of p6, fill=green!12] (e) {返回 \texttt{MeshStorage}};
+
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (e);
+\end{tikzpicture}%
+}
+\end{center}
+
+\section{顶点更新分支}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.6cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.6cm, font=\small, fill=gray!12},
+  op/.style={-Stealth, thick},
+]
+  \node[startend] (s) {顶点 $v$};
+  \node[dec, below=of s] (d1) {is\_boundary\_vertex？};
+  \node[proc, below left=0.6cm and -1.5cm of d1, fill=blue!8] (p1) {收集 2 个边界邻居 $v_{\text{prev}}, v_{\text{next}}$};
+  \node[proc, below=of p1, fill=blue!8] (p2) {$v' = \frac{v_{\text{prev}} + 6v + v_{\text{next}}}{8}$};
+  \node[proc, below right=0.6cm and -1.5cm of d1, fill=blue!8] (p3) {收集 $n$ 个邻接面点 $F$ 与 $n$ 个邻接边中点 $R$};
+  \node[proc, below=of p3, fill=blue!8] (p4) {$v' = \frac{F + 2R + (n-3)P}{n}$};
+  \node[startend, below=2.5cm of d1, fill=green!12] (e) {更新后位置};
+
+  \draw[op] (s) -- (d1);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {是} (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (d1) -| node[above, near start, font=\footnotesize] {否} (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p2) |- (e);
+  \draw[op] (p4) |- (e);
+\end{tikzpicture}
+\end{center}
+
+\section{与 Loop 细分的对比}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{特性} & \textbf{Loop} & \textbf{Catmull-Clark} \\
+  \midrule
+  输入面类型 & 仅三角形 & 任意多边形 \\
+  输出面类型 & 三角形 & 四边形（三角化为 2 三角形） \\
+  面点 & 无 & 有（每面 1 个） \\
+  边点权重 & $\frac{3}{8}(v_0{+}v_1) + \frac{1}{8}(v_2{+}v_3)$ & $\frac{1}{4}(v_0{+}v_1{+}\text{fp}_L{+}\text{fp}_R)$ \\
+  顶点更新 & $(1{-}n\beta)v + \beta\sum\text{nb}$ & $\frac{F+2R+(n{-}3)P}{n}$ \\
+  规模变化 & $V'{=}V{+}E$, $F'{=}4F$ & $V'{=}V{+}E{+}F$, $F'{=}2\sum k_i$ \\
+  基础 & 三角 B 样条 & 双三次 B 样条 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{复杂度}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{步骤} & \textbf{复杂度} \\
+  \midrule
+  面点计算 & $O(\sum k_i) = O(E + F)$ \\
+  边点计算 & $O(E)$（每条边一次） \\
+  顶点更新 & $O(V \cdot \bar{n})$（$\bar{n}$=平均度） \\
+  三角化输出 & $O(\sum k_i)$ \\
+  构建网格 & $O(V' + F')$ \\
+  \midrule
+  总计 & $O(V + E + F)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{边界处理}
+
+\subsection{边界边点}
+
+边界边（twin.face = None）的边点简化为两端点中点：
+\[
+  \text{ep}_{\text{boundary}} = \frac{v_0 + v_1}{2}
+\]
+
+\subsection{边界顶点}
+
+边界顶点沿边界线的两个邻居 $v_{\text{prev}}, v_{\text{next}}$ 通过
+\texttt{VertexRing} + \texttt{is\_boundary\_edge} 筛选。若邻居数 $\neq 2$
+（退化情况），保持原位置不变。
+
+\section{退化与健壮性}
+
+\begin{itemize}
+  \item \textbf{孤立顶点}（valence=0）：保持原位置
+  \item \textbf{边界顶点邻居数 $\neq$ 2}：保持原位置
+  \item \textbf{内部顶点部分边无面}（$f\_count \neq n$）：保持原位置
+  \item \textbf{面边数 $< 3$}：跳过该面
+  \item \textbf{边邻接面点数 $> 2$}（非流形）：退化为边界处理
+\end{itemize}
+
+\section{单元测试覆盖}
+
+\texttt{src/subdiv/catmull\_clark.rs} 末尾共 11 个测试：
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.18}
+\begin{longtable}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{覆盖点} \\
+  \midrule
+  \texttt{catmull\_clark\_cube\_vertex\_count} & 立方体 V=26（8+12+6） \\
+  \texttt{catmull\_clark\_cube\_face\_count} & 立方体 F=48（6*4*2） \\
+  \texttt{catmull\_clark\_cube\_halfedge\_count} & 立方体 HE=144（3*48） \\
+  \texttt{catmull\_clark\_cube\_passes\_validation} & 完整拓扑校验通过 \\
+  \texttt{catmull\_clark\_cube\_preserves\_euler\_characteristic} & Euler $\chi=2$ 保持 \\
+  \texttt{catmull\_clark\_single\_quad} & 单四边形 V=9, F=8 \\
+  \texttt{catmull\_clark\_triangle\_input} & 三角形输入 V=7, F=6 \\
+  \texttt{catmull\_clark\_closed\_tetrahedron} & 闭合四面体 V=14, F=24, $\chi=2$ \\
+  \texttt{catmull\_clark\_cube\_face\_point\_at\_center} & 面点位置在面中心 \\
+  \texttt{catmull\_clark\_cube\_vertex\_moves\_inward} & 角点向中心移动 \\
+  \texttt{catmull\_clark\_double\_subdivide} & 二次细分 V=146，拓扑校验通过 \\
+  \bottomrule
+\end{longtable}
+\end{center}
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何输出三角化而非保留四边形？} 当前 \texttt{MeshStorage} 的
+        \texttt{validate\_topology} 要求面边界环长度=3。三角化输出确保与现有
+        校验工具链兼容。未来若放宽三角约束（方案 b），可直接输出四边形。
+  \item \textbf{为何使用 \texttt{build\_mesh\_from\_vertices\_and\_faces} 而非直接
+        构造半边？} 复用成熟的 builder 逻辑（twin/next/prev/边界环自动建立），
+        避免 Catmull-Clark 模块重复实现拓扑构建代码。
+  \item \textbf{为何边点计算需要先收集邻接面点？} Catmull-Clark 边点公式依赖
+        两侧面点。通过 \texttt{edge\_face\_points} HashMap 预收集，避免遍历半边时
+        重复查询面点。
+  \item \textbf{为何内部顶点公式使用边中点而非边点？} 标准 Catmull-Clark 公式中
+        $R$ 是邻接边\textbf{中点}均值 $(v+v_i)/2$，而非邻接\textbf{边点}均值。
+        中点仅依赖原始顶点位置，与边点（依赖面点）解耦，保证计算顺序正确。
+\end{itemize}
+
+\end{document}

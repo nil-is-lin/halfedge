@@ -1,0 +1,248 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 顶点焊接模块设计文档} \\ \large \texttt{src/weld.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{weld.rs} 提供 \texttt{weld\_vertices}：按欧氏距离阈值合并「位置相同」
+的顶点，常用于修复 OBJ/PLY 载入时因浮点精度产生的「裂缝」——同一物理顶点
+被表示为多个微小偏差的副本。
+
+\subsection{API}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{签名} & \texttt{pub fn weld\_vertices(mesh: \&mut MeshStorage, epsilon: f64)} \\
+                & \hspace*{4em}\texttt{-> Result<usize, TopologyError>} \\
+  \midrule
+  \textbf{输入} & \texttt{mesh}：可变借用；\texttt{epsilon}：合并阈值（$\ge 0$） \\
+  \textbf{输出} & 成功时返回被移除的顶点数量 \\
+  \textbf{错误} & 修复后拓扑校验失败时返回 \texttt{TopologyError} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{算法}
+
+\subsection{整体流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[dec, below=of s] (d0) {$V < 2$？};
+  \node[proc, right=1.6cm of d0, fill=green!12] (early) {返回 \texttt{Ok(0)}};
+  \node[proc, below=of d0, fill=blue!8] (p1) {1. 收集所有 (VertexId, position) 到 \texttt{Vec}};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 按 $x$ 坐标排序（\texttt{sort\_by}）};
+  \node[proc, below=of p2, fill=yellow!15] (p3) {3. 双重循环 $i < j$：若 $|x_j - x_i| > \epsilon$ 则 \texttt{break}，否则计算 $\|p_j - p_i\|^2 < \epsilon^2$ 时合并};
+  \node[proc, below=of p3, fill=yellow!15] (p4) {4. Union-Find：\texttt{parent[rj] $\gets$ ri}（路径压缩）};
+  \node[proc, below=of p4, fill=blue!8] (p5) {5. 构建 \texttt{HashMap<VertexId, VertexId>}（old $\to$ rep）};
+  \node[proc, below=of p5, fill=blue!8] (p6) {6. 重映射所有半边的 \texttt{vertex} 引用};
+  \node[proc, below=of p6, fill=blue!8] (p7) {7. 删除非代表顶点（\texttt{remove\_vertex}）};
+  \node[proc, below=of p7, fill=red!12] (p8) {8. 清理退化面（去重后顶点数 $< 3$ 的面）};
+  \node[dec, below=of p8] (d1) {剩余面数 $> 0$？};
+  \node[proc, right=1.6cm of d1, fill=yellow!15] (val) {\texttt{validate\_mesh}；失败 $\to$ 返回 \texttt{Err}};
+  \node[startend, below=of d1, fill=green!12] (e) {返回 \texttt{Ok(removed)}};
+  \draw[op] (s) -- (d0);
+  \draw[op] (d0) -- node[above, font=\scriptsize] {是} (early);
+  \draw[op] (d0) -- node[right, font=\scriptsize] {否} (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (p6);
+  \draw[op] (p6) -- (p7);
+  \draw[op] (p7) -- (p8);
+  \draw[op] (p8) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (val);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (e);
+  \draw[op] (val) |- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\subsection{排序 + 双重循环：$O(n \log n + nk)$}
+
+直接两两比较所有顶点对是 $O(n^2)$，对大网格不可接受。本实现按 $x$ 坐标排序后，
+内层循环遇到 $|x_j - x_i| > \epsilon$ 即 \texttt{break}，将平均复杂度降至
+$O(n \log n + nk)$，其中 $k$ 是 $x$ 邻域内的平均顶点数（对均匀分布网格 $k \approx$ 常数）。
+
+\subsection{Union-Find 等价类}
+
+合并操作使用并查集（Union-Find）：
+
+\begin{lstlisting}
+let mut parent: Vec<usize> = (0..n).collect();
+// find with path halving
+let mut root = i;
+while parent[root] != root { root = parent[root]; }
+// union: parent[rj] = ri  (ri 是 i 的根, rj 是 j 的根)
+if ri != rj { parent[rj] = ri; }
+\end{lstlisting}
+
+\textbf{代表元}：等价类中 $x$ 最小的顶点（因为外层循环 $i$ 升序，
+首次合并时 $i < j$，\texttt{parent[rj] = ri} 保证代表元是序号最小的）。
+
+\subsection{重映射半边 vertex 引用}
+
+收集 \texttt{mapping: HashMap<VertexId, VertexId>}（old $\to$ rep）后，
+遍历所有半边：
+
+\begin{lstlisting}
+for he in mesh.halfedge_ids().collect::<Vec<_>>() {
+    if let Some(h) = mesh.get_halfedge_mut(he) {
+        if let Some(&new_v) = mapping.get(&h.vertex) {
+            h.vertex = new_v;
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{清理退化面}
+
+合并后，可能产生顶点重复的退化面（如原 $[a, b, c]$ 中 $a, b$ 被合并为 $a$，
+则面变为 $[a, a, c]$，唯一顶点数 $= 2 < 3$）。对这些面：
+
+\begin{enumerate}
+  \item 收集面的所有半边；
+  \item 逐条 \texttt{remove\_halfedge}（同时解除 twin 关系）；
+  \item \texttt{remove\_face}。
+\end{enumerate}
+
+\subsection{最终校验}
+
+调用 \texttt{topology\_ops::validate\_mesh} 检查修复后网格的拓扑合法性
+（twin 互指、next/prev 一致、面边界环闭合等）。失败时返回 \texttt{Err}。
+
+\section{复杂度}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{阶段} & \textbf{时间复杂度} & \textbf{备注} \\
+  \midrule
+  排序            & $O(n \log n)$              & $n = V$ \\
+  双重循环        & $O(n k)$                   & $k$ = $x$ 邻域平均顶点数 \\
+  Union-Find     & $O(n \alpha(n))$           & $\alpha$ = 反 Ackermann \\
+  重映射半边     & $O(E)$                     & 遍历所有半边 \\
+  删除冗余顶点   & $O(V)$                     & \\
+  清理退化面     & $O(F \cdot \bar{k})$       & $\bar{k}$ = 平均面边数 \\
+  validate\_mesh & $O(V + E + F)$             & 线性校验 \\
+  \midrule
+  \textbf{总计}  & $O(n \log n + n k + E)$    & 通常 $k$ 很小，接近 $O(n \log n)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{itemize}
+  \item $V < 2$ 时直接返回 \texttt{Ok(0)}，跳过所有处理；
+  \item \texttt{partial\_cmp} 返回 \texttt{None}（NaN）时使用 \texttt{Equal}
+        避免 panic；
+  \item \texttt{remove\_vertex} 内部解除该顶点的所有半边引用，安全；
+  \item \texttt{contains\_halfedge} / \texttt{contains\_face} 防止重复删除；
+  \item 修复后 \texttt{validate\_mesh} 兜底，确保拓扑合法。
+\end{itemize}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{weld\_no\_vertices}        & 空网格返回 \texttt{Ok(0)} \\
+  \texttt{weld\_single\_vertex}      & 单顶点返回 \texttt{Ok(0)} \\
+  \texttt{weld\_two\_close\_vertices} & 距离 $0.001$ 的两顶点在 $\epsilon = 0.01$ 下合并为 1，第三个顶点保留 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 3 个单元测试，覆盖空网格、单顶点、合并三个核心场景；
+项目整体 \texttt{cargo test} 共 371 个用例。
+\textbf{待补充}：退化面清理测试、大规模网格性能测试、$\epsilon = 0$ 严格相等测试。
+
+\section{设计权衡}
+
+\begin{itemize}
+  \item \textbf{排序 + 双重循环 vs 空间哈希}：当前实现简单稳健，对均匀分布
+        顶点接近 $O(n \log n)$；若顶点高度聚集（$k$ 大），可改用空间哈希
+        （uniform grid）将 $k$ 限制为常数；
+  \item \textbf{Union-Find vs 直接覆盖}：并查集支持\textbf{传递合并}
+        （$a \sim b, b \sim c \Rightarrow a \sim c$），避免「链式合并」错误，
+        而直接覆盖可能丢失等价类信息；
+  \item \textbf{仅按 $x$ 排序}：对极端情况（所有顶点 $x$ 相同但 $y, z$ 不同）
+        退化为 $O(n^2)$；可改为按最长轴排序，但实现复杂度增加；
+  \item \textbf{代表元选择}：选择 $x$ 最小的顶点（序号最小），保证幂等性
+        （多次焊接结果相同）；不选择「最近邻」中心点，因为需要计算新位置，
+        增加复杂度；
+  \item \textbf{不更新 Vertex.halfedge 引用}：\texttt{remove\_vertex} 内部
+        已处理解除引用，剩余顶点的入口字段保持有效；
+        若代表元 vertex 的 halfedge 引用指向被删除的顶点相关半边，
+        \texttt{validate\_mesh} 会报告。
+\end{itemize}
+
+\end{document}

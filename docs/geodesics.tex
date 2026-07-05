@@ -1,0 +1,511 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 测地线距离模块设计文档} \\ \large \texttt{src/geodesics.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{geodesics.rs} 在 \texttt{geometry.rs} / \texttt{linalg.rs} 之上实现
+\textbf{Heat Method}（Crane, Weischedel, Wardetzky 2013），通过求解两个稀疏线性系统
+高效计算三角网格上从源顶点出发的测地线距离，并提供沿距离场梯度回溯最短路径的能力。
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llp{6.6cm}@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  距离场（Heat Method）
+    & \texttt{geodesic\_distance\_from\_vertex}
+    & Heat Method：从 \texttt{source} 出发计算所有顶点的测地线距离；
+      返回顺序对应 \texttt{mesh.vertex\_ids()}；求解失败返回 \texttt{None}。 \\
+  路径回溯
+    & \texttt{shortest\_path}
+    & 沿距离场梯度回溯最短路径：返回从 \texttt{target} 到源顶点的顶点序列（含两端）。 \\
+  \midrule
+  距离场（Dijkstra）
+    & \texttt{dijkstra\_geodesic}
+    & 单源 Dijkstra 最短\textbf{图}距离（边长权值），不依赖线性求解器 \\
+  距离场（Dijkstra 多源）
+    & \texttt{dijkstra\_multi\_source\_geodesic}
+    & 多源 Dijkstra：每个顶点到最近源点的图距离 \\
+  路径回溯（Dijkstra）
+    & \texttt{dijkstra\_with\_parent}
+    & Dijkstra + 父节点回溯数组，用于精确路径重建 \\
+  路径（Dijkstra 精确）
+    & \texttt{dijkstra\_shortest\_path}
+    & 返回 \texttt{source} 到 \texttt{target} 的最短顶点序列（含两端） \\
+  \midrule
+  距离场（多源 Heat Method）
+    & \texttt{multi\_source\_geodesic}
+    & 多源 Heat Method：每个顶点到最近源点的测地线距离；
+      源点强制为 $0$ 消除数值误差 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{Heat Method 算法}
+
+Heat Method 把\textbf{非线性}的测地线距离计算转化为\textbf{两个线性系统}：
+先用热流方程扩散初始脉冲得到光滑梯度方向，再用 Poisson 方程从散度场恢复距离。
+其核心洞察是：\emph{热流梯度的方向与测地线梯度方向几乎一致}，且方向对参数不敏感。
+
+\subsection{Step 1：时间步 \texorpdfstring{$\tau = h^2$}{tau = h\^{}2}}
+
+设网格平均边长为 $h$，时间步取
+\[
+  \tau = h^2, \qquad
+  h = \frac{1}{|E|}\sum_{e \in E} L(e).
+\]
+\textbf{取 $h^2$ 的理由}：使热流在每条边上的扩散量
+$\tau \cdot \frac{1}{h^2} \sim O(1)$，既不会过快抹平局部信息，也不会过慢导致数值噪声。
+代码中若 $|E| = 0$，回退 $\tau = 1$。
+
+\subsection{Step 2：热流扩散}
+
+求解线性系统
+\[
+  (M + \tau L)\, u_\tau = M\, u_0,
+\]
+其中 $M$ 为 lumped mass（顶点 Voronoi 面积对角矩阵），$L$ 为余切拉普拉斯，
+$u_0$ 为初始热源。初始热源取源顶点 $s$ 处的\textbf{单位积分脉冲}：
+\[
+  u_0[i] =
+  \begin{cases}
+    1 / M_{ss}, & i = s, \\
+    0,          & \text{otherwise}.
+  \end{cases}
+\]
+等价于热传导方程 $\frac{\partial u}{\partial t} = \Delta u$ 在时间 $\tau$ 后的解。
+代码使用\textbf{共轭梯度法}（\texttt{conjugate\_gradient}）求解，
+最大迭代数 $100\,n$，相对残差 $10^{-6}$，并预先调用
+\texttt{regularize\_diagonal} 加入 $10^{-10}$ 对角正则化以保证 SPD 性。
+
+\subsection{Step 3：单位负梯度}
+
+对每个三角面 $f$，由分段线性基函数求 $u_\tau$ 的常梯度
+$\nabla u_\tau|_f$，再归一化并取负：
+\[
+  X_f = -\frac{\nabla u_\tau|_f}{\|\nabla u_\tau|_f\|}.
+\]
+\textbf{取负原因}：热流从高温（源）流向低温（远端），
+$\nabla u_\tau$ 指向\emph{远离源}，而测地线最短路径应\emph{朝向源}前进，故取负。
+退化面（$\|\nabla u_\tau\| < 10^{-10}$）置 $X_f = \vec{0}$，避免除零。
+
+\subsection{Step 4：散度与 Poisson 求解}
+
+将单位负梯度场 $X$ 投影回顶点散度（弱形式）：
+\[
+  (\nabla \cdot X)_i = \sum_{f \ni i} A_f \cdot \bigl( X_f \cdot \nabla \varphi_i|_f \bigr),
+\]
+其中 $\varphi_i$ 是顶点 $i$ 的分片线性基函数。
+再求解 Poisson 方程
+\[
+  L\, \phi = \nabla \cdot X,
+\]
+$L$ 与 Step 2 共用余切拉普拉斯。同样使用共轭梯度法求解。
+
+\subsection{Step 5：距离场偏移校正}
+
+Poisson 解 $\phi$ 与真实测地线距离 $d$ 仅差一个常数（$\Delta$ 的核空间）。
+取源顶点 $s$ 处为零参考点：
+\[
+  d_i = \bigl|\, \phi_i - \phi_s \,\bigr|.
+\]
+取绝对值是防止数值误差导致个别顶点 $\phi_i$ 略小于 $\phi_s$。
+校正后 $d_s = 0$，其余 $d_i \ge 0$。
+
+\section{算法流程图}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.55cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10.5cm, minimum height=0.75cm, align=center, font=\small},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.8cm, minimum height=0.7cm, font=\small, fill=gray!12},
+  op/.style={-Stealth, thick},
+]
+  \node[startend] (s) {开始：\texttt{source} 已知};
+  \node[proc, below=of s, fill=blue!8] (p1)
+    {Step 1 计算 $h = \frac{1}{|E|}\sum L(e)$，$\tau = h^2$};
+  \node[proc, below=of p1, fill=blue!12] (p2)
+    {Step 2 构建并求解 $(M + \tau L)\, u_\tau = M\, u_0$（CG，残差 $10^{-6}$）};
+  \node[proc, below=of p2, fill=green!12] (p3)
+    {Step 3 逐面求 $\nabla u_\tau|_f$ 并归一化 $X_f = -\nabla u_\tau / \|\nabla u_\tau\|$};
+  \node[proc, below=of p3, fill=yellow!18] (p4)
+    {Step 4 弱形式积分 $\nabla \cdot X$，求解 $L\, \phi = \nabla \cdot X$（CG）};
+  \node[proc, below=of p4, fill=red!10] (p5)
+    {Step 5 偏移校正 $d_i = |\phi_i - \phi_s|$};
+  \node[startend, below=of p5] (e) {返回 \texttt{Some}($d$)};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (p5);
+  \draw[op] (p5) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\section{离散算子}
+
+\subsection{离散拉普拉斯（余切权重）}
+
+对相邻顶点 $i, j$，设边 $ij$ 的两个对角为 $\alpha_{ij}, \beta_{ij}$，则
+\[
+  L_{ij} = -\frac{1}{2}\bigl(\cot \alpha_{ij} + \cot \beta_{ij}\bigr),
+  \qquad
+  L_{ii} = -\sum_{j \ne i} L_{ij}.
+\]
+\textbf{边界边}只有一个对角，使用单边余切。
+实现中仅累加 $w > 0$ 的项（非钝角三角形贡献）以避免负权重导致矩阵非 SPD。
+Lumped mass $M_{ii}$ 取顶点周围面面积的 $1/3$ 之和，退化时钳为 $10^{-14}$。
+
+\subsection{面梯度（FEM 形函数）}
+
+对三角面 $f$ 的三顶点 $i, j, k$，分片线性函数
+$u|_f = u_i \varphi_i + u_j \varphi_j + u_k \varphi_k$ 的常梯度为
+\[
+  \nabla u|_f = \frac{1}{2 A_f}\, \hat{n}_f \times
+  \bigl( u_i \vec{e}_i + u_j \vec{e}_j + u_k \vec{e}_k \bigr),
+\]
+其中 $\vec{e}_i = \vec{p}_k - \vec{p}_j$ 是顶点 $i$ 所对的边向量，
+$A_f$ 是面面积，$\hat{n}_f$ 是面法向。
+
+\subsection{面散度（弱形式积分）}
+
+向量场 $X$ 在顶点 $i$ 处的散度（弱形式）为
+\[
+  (\nabla \cdot X)_i = \sum_{f \ni i} A_f \cdot \bigl( X_f \cdot \nabla \varphi_i|_f \bigr),
+  \qquad
+  \nabla \varphi_i|_f = \frac{1}{2 A_f}\, \hat{n}_f \times \vec{e}_i,
+\]
+等价地写作
+\[
+  (\nabla \cdot X)_i = \frac{1}{2} \sum_{f \ni i} X_f \cdot \bigl( \hat{n}_f \times \vec{e}_i \bigr).
+\]
+代码中 $\nabla \varphi_i|_f$ 直接用 $\hat{n}_f \times \vec{e}_i / (2 A_f)$ 计算，
+再乘以 $A_f$ 与 $X_f$ 的点积，与上式一致。
+
+\section{最短路径回溯}
+
+\texttt{shortest\_path} 在已计算好的距离场 $d$ 上，沿\textbf{贪心梯度下降}
+方向回溯：当前顶点 $v$ 的邻域中，选择 $d$ 最小且严格小于当前距离的顶点 $v'$，
+跳转至 $v'$，重复直至到达源点（$d < 10^{-10}$）或陷入局部极小（无更小邻点）。
+步数上界 $2|V|$ 防止死循环。
+
+\begin{center}
+\begin{tikzpicture}[
+  >=Stealth,
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=8mm, inner sep=0pt, font=\footnotesize},
+  src/.style={circle, draw=red!70!black, fill=red!12, minimum size=8mm, inner sep=0pt, font=\footnotesize},
+  arr/.style={->, thick, red!70!black},
+]
+  % 顶点
+  \node[src] (s) at (0,0) {$s$};
+  \node[vert] (a) at (1.6,1.0) {$a$};
+  \node[vert] (b) at (1.6,-1.0) {$b$};
+  \node[vert] (c) at (3.4,1.6) {$c$};
+  \node[vert] (d) at (3.4,-1.6) {$d$};
+  \node[vert] (e) at (5.0,0.6) {$e$};
+  \node[vert] (t) at (6.6,0) {$t$};
+  % 边
+  \draw[gray!50] (s) -- (a);
+  \draw[gray!50] (s) -- (b);
+  \draw[gray!50] (a) -- (c);
+  \draw[gray!50] (a) -- (e);
+  \draw[gray!50] (b) -- (d);
+  \draw[gray!50] (b) -- (e);
+  \draw[gray!50] (c) -- (e);
+  \draw[gray!50] (d) -- (e);
+  \draw[gray!50] (e) -- (t);
+  \draw[gray!50] (c) -- (t);
+  % 回溯路径
+  \draw[arr] (t) -- (e);
+  \draw[arr] (e) -- (a);
+  \draw[arr] (a) -- (s);
+  % 距离标签
+  \node[font=\tiny, gray] at (-0.5,-0.5) {$d=0$};
+  \node[font=\tiny, gray] at (1.6,1.5) {$d=1.1$};
+  \node[font=\tiny, gray] at (5.0,1.1) {$d=2.4$};
+  \node[font=\tiny, gray] at (6.6,0.5) {$d=3.3$};
+  % 标题
+  \node[font=\footnotesize, align=center] at (3,-2.4)
+    {回溯方向：$t \to e \to a \to s$（沿 $d$ 严格递减）};
+\end{tikzpicture}
+\end{center}
+
+\textbf{贪心策略的局限}：若距离场存在局部极小（数值误差或网格各向异性），
+可能在到达源点前提前终止；上界 $2|V|$ 保证不进入死循环。
+返回序列包含两端顶点，从 \texttt{target} 起到源点止。
+
+\section{Dijkstra 最短图距离}
+
+\texttt{dijkstra\_geodesic} 使用经典 Dijkstra 算法计算\textbf{图最短距离}：
+以边长（欧氏长度）为权值，求源点到所有顶点的最短路径长度。
+相比 Heat Method，Dijkstra 路径只能沿网格边行进，结果为\textbf{图距离上界}，
+但实现简单、不依赖线性求解器，且结果\textbf{精确}（无数值误差）。
+
+\subsection{最小堆实现}
+
+Rust 标准库 \texttt{BinaryHeap} 是最大堆，通过反转 \texttt{Ord} 比较方向实现最小堆：
+\begin{lstlisting}
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QueueEntry { dist: f64, vertex: usize }
+
+impl Ord for QueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // 比较方向取反，使 BinaryHeap 成为最小堆
+        other.dist.partial_cmp(&self.dist).unwrap_or(Ordering::Equal)
+            .then_with(|| other.vertex.cmp(&self.vertex))
+    }
+}
+\end{lstlisting}
+
+\subsection{算法流程}
+
+\begin{enumerate}
+  \item 初始化 \texttt{dist[source] = 0}，其余为 $+\infty$；
+  \item 将 $(0, \text{source})$ 入堆；
+  \item 循环弹出堆顶 $(d, v)$：
+    \begin{itemize}
+      \item 若 $d > \text{dist}[v]$，跳过（已通过更短路径访问过）；
+      \item 遍历 $v$ 的邻居 $u$，若 $d + \|p_u - p_v\| < \text{dist}[u]$，
+            更新 $\text{dist}[u]$ 并入堆 $(d + \|p_u - p_v\|, u)$；
+    \end{itemize}
+  \item 堆空时终止。
+\end{enumerate}
+
+复杂度 $O(|E|\log|V|)$。
+
+\subsection{多源 Dijkstra}
+
+\texttt{dijkstra\_multi\_source\_geodesic} 将所有源点以距离 $0$ 同时入堆，
+自然得到每个顶点到\textbf{最近源点}的距离。
+
+\subsection{路径回溯：dijkstra\_with\_parent}
+
+\texttt{dijkstra\_with\_parent} 在 Dijkstra 同时维护 \texttt{parent} 数组：
+每次松弛 \texttt{dist[u]} 时记录 \texttt{parent[u] = v}。
+返回 \texttt{(dist, parent)} 二元组，便于精确路径重建。
+
+\texttt{dijkstra\_shortest\_path} 在此基础上从 \texttt{target} 沿
+\texttt{parent} 链回溯到 \texttt{source}，得到精确最短顶点序列。
+
+\begin{center}
+\begin{tikzpicture}[
+  >=Stealth,
+  node distance=0.4cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.65cm, align=center, font=\small},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.65cm, font=\small, fill=gray!12},
+  op/.style={-Stealth, thick}
+]
+  \node[startend] (s) {开始：\texttt{source}, \texttt{target}};
+  \node[proc, below=of s, fill=blue!8] (p1)
+    {运行 \texttt{dijkstra\_with\_parent}，得到 \texttt{dist} 与 \texttt{parent}};
+  \node[proc, below=of p1, fill=yellow!18] (p2)
+    {\texttt{cur = target}，\texttt{path = [target]}};
+  \node[proc, below=of p2, fill=green!12] (p3)
+    {循环：\texttt{path.push(parent[cur])}，\texttt{cur = parent[cur]}，
+     直到 \texttt{cur == source} 或 \texttt{parent[cur]} 无定义};
+  \node[proc, below=of p3, fill=orange!12] (p4)
+    {\texttt{path.reverse()}（使顺序为 \texttt{source} $\to$ \texttt{target}）};
+  \node[startend, below=of p4] (e) {返回 \texttt{path}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}
+\end{center}
+
+\section{多源 Heat Method}
+
+\texttt{multi\_source\_geodesic} 将 Heat Method 扩展到\textbf{多源}场景：
+计算每个顶点到最近源点的测地线距离。实现上仅修改初始热源 $u_0$：
+\[
+  u_0[i] =
+  \begin{cases}
+    1 / M_{ii}, & i \in S \text{（任一源点）}, \\
+    0,          & \text{otherwise}.
+  \end{cases}
+\]
+其余步骤（热流扩散、梯度归一化、Poisson 求解、偏移校正）与单源完全相同。
+
+\textbf{源点数值误差处理}：Heat Method 在源点处存在数值误差，
+单源时通过 $\phi_s$ 偏移校正消除；多源时各源点误差不一致，
+故在偏移校正后\textbf{显式将每个源点距离置零}：
+\[
+  \forall s \in S: \quad d_s \leftarrow 0.
+\]
+
+\section{Heat Method 与 Dijkstra 对比}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}p{3.2cm}p{5.4cm}p{5.4cm}@{}}
+  \toprule
+  \textbf{属性} & \textbf{Heat Method} & \textbf{Dijkstra} \\
+  \midrule
+  路径类型 & 测地线（可跨面） & 图路径（仅沿边） \\
+  精度 & 近似（数值求解） & 精确（无误差） \\
+  依赖 & 稀疏线性求解器（CG） & 仅需最小堆 \\
+  复杂度 & $O(k \cdot n)$（CG 迭代） & $O(|E|\log|V|)$ \\
+  源点误差 & 有（偏移校正后 $\approx 0$） & 无 \\
+  多源扩展 & 修改 $u_0$ + 显式置零 & 多源同时入堆 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{退化守卫}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{4.0cm}p{5.4cm}@{}}
+  \toprule
+  \textbf{函数} & \textbf{退化场景} & \textbf{处理} \\
+  \midrule
+  \texttt{geodesic\_distance\_from\_vertex}
+    & 空网格（$|V| = 0$） & 返回 \texttt{Some}(\texttt{Vec::new()}) \\
+  \texttt{geodesic\_distance\_from\_vertex}
+    & \texttt{source} 不在 \texttt{v\_idx} 中 & 返回 \texttt{None}（\texttt{?} 传播） \\
+  \texttt{geodesic\_distance\_from\_vertex}
+    & $|E| = 0$ & 时间步回退 $\tau = 1$ \\
+  \texttt{geodesic\_distance\_from\_vertex}
+    & 共轭梯度未收敛 & CG 返回 \texttt{None}，函数返回 \texttt{None} \\
+  \texttt{build\_laplacian\_and\_mass}
+    & 顶点面积 $< 10^{-14}$ & 钳为 $10^{-14}$，防除零 \\
+  \texttt{build\_laplacian\_and\_mass}
+    & 余切权重 $w \le 0$ & 跳过该边，避免破坏 SPD \\
+  \texttt{compute\_face\_gradients}
+    & 面积 $< 10^{-14}$（退化面） & 跳过该面 \\
+  Step 3 归一化
+    & $\|\nabla u_\tau\| < 10^{-10}$ & $X_f = \vec{0}$ \\
+  \texttt{shortest\_path}
+    & \texttt{target} 无效或越界 & 返回 \texttt{Vec::new()} \\
+  \texttt{shortest\_path}
+    & 陷入局部极小 & 提前终止，返回已收集路径 \\
+  \texttt{shortest\_path}
+    & 步数达上界 $2|V|$ & 终止循环，防止死循环 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{使用示例}
+
+\begin{lstlisting}
+use halfedge::geodesics::{geodesic_distance_from_vertex, shortest_path};
+use halfedge::test_util::build_icosphere;
+
+let mesh = build_icosphere(2);
+let vertices: Vec<_> = mesh.vertex_ids().collect();
+let source = vertices[0];
+let target = vertices[vertices.len() / 2];
+
+// 1. 计算从 source 出发的测地线距离场
+let dist = geodesic_distance_from_vertex(&mesh, source)
+    .expect("heat method ok");
+
+// 源顶点距离应为 0
+assert!(dist[0] < 1e-6);
+
+// 2. 从 target 回溯最短路径（含两端）
+let path = shortest_path(&mesh, &dist, target);
+assert!(path.len() >= 2);
+assert_eq!(*path.first().unwrap(), target);
+assert_eq!(*path.last().unwrap(), source);
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lp{9.6cm}@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \texttt{test\_geodesic\_self\_distance}
+    & 在 icosphere 上调用 \texttt{geodesic\_distance\_from\_vertex}，
+      断言返回 \texttt{Some}；源顶点距离 $< 10^{-6}$；
+      至少一个非源顶点距离 $> 0$。 \\
+  \texttt{test\_geodesic\_monotonicity}
+    & 在 icosphere 上对前若干非源顶点做 sanity check：邻域中至少存在一个顶点
+      距离更小，验证距离场单调性。 \\
+  \midrule
+  \texttt{test\_dijkstra\_self\_distance\_zero}
+    & 源点到自身 Dijkstra 距离 $= 0$ \\
+  \texttt{test\_dijkstra\_symmetric\_on\_icosphere}
+    & icosphere 上 $d(s \to t) \approx d(t \to s)$（容差 $10^{-6}$） \\
+  \texttt{test\_dijkstra\_distance\_upper\_bounds\_heat\_method}
+    & Dijkstra 与 Heat Method 的最大距离在 3 倍以内（图距离 vs 测地线） \\
+  \texttt{test\_dijkstra\_multi\_source}
+    & 多源 Dijkstra：每个顶点距离 $\le$ 单源距离；源点距离 $= 0$ \\
+  \texttt{test\_dijkstra\_shortest\_path\_self}
+    & \texttt{source == target} 时返回 \texttt{[source]} \\
+  \texttt{test\_dijkstra\_shortest\_path\_to\_neighbor}
+    & 邻居路径长度为 2（\texttt{[source, target]}） \\
+  \texttt{test\_dijkstra\_shortest\_path\_consistency\_with\_distance}
+    & 路径长度与距离一致：$\text{dist}[\text{target}] \approx \sum \|p_{i+1} - p_i\|$ \\
+  \midrule
+  \texttt{test\_multi\_source\_geodesic\_sources\_zero}
+    & 多源 Heat Method 所有源点距离 $< 10^{-6}$（强制置零生效） \\
+  \texttt{test\_multi\_source\_geodesic\_le\_single\_source}
+    & 多源最大距离 $\le$ 单源最大距离（容差 $10^{-6}$） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{src/geodesics.rs} 共 \textbf{11 个}单元测试，全库共 \textbf{394 个}。
+
+\end{document}

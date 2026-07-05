@@ -1,0 +1,517 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: OBJ / PLY / STL 读写与网格构建模块设计文档} \\ \large \texttt{src/io.rs}}
+\author{halfedge 库}
+\date{2026-07-05}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{io.rs} 提供五组能力：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \midrule
+  \multirow{2}{*}{构建}
+    & \texttt{build\_mesh\_from\_vertices\_and\_faces} & 顶点+三角面索引 $\to$ 完整半边网格 \\
+    & \texttt{build\_mesh\_from\_polygons}             & 顶点+任意多边形面 $\to$ 三角化半边网格 \\
+  \midrule
+  \multirow{2}{*}{OBJ 读}
+    & \texttt{load\_obj(path)}    & 从文件加载 \\
+    & \texttt{parse\_obj(text)}   & 从文本解析 \\
+  \midrule
+  \multirow{2}{*}{OBJ 写}
+    & \texttt{save\_obj(mesh, path)} & 保存到文件 \\
+    & \texttt{format\_obj(mesh)}     & 序列化为文本 \\
+  \midrule
+  \multirow{2}{*}{PLY 读}
+    & \texttt{load\_ply(path)}    & 从文件加载 PLY ASCII \\
+    & \texttt{parse\_ply(text)}   & 从文本解析 PLY ASCII \\
+  \midrule
+  \multirow{2}{*}{PLY 写}
+    & \texttt{save\_ply(mesh, path)} & 保存到 PLY 文件 \\
+    & \texttt{format\_ply(mesh)}     & 序列化为 PLY 文本 \\
+  \midrule
+  \multirow{5}{*}{STL 读}
+    & \texttt{load\_stl(path)}                  & 从文件加载（自动判别 ASCII / 二进制） \\
+    & \texttt{parse\_stl\_bytes(bytes)}         & 从字节切片解析（启发式判别） \\
+    & \texttt{parse\_stl\_ascii(text)}          & 从文本解析 STL ASCII \\
+    & \texttt{parse\_stl\_binary(bytes, n)}     & 从字节解析 STL 二进制 \\
+  \midrule
+  \multirow{4}{*}{STL 写}
+    & \texttt{save\_stl\_ascii(mesh, path)}     & 保存为 STL ASCII 文件 \\
+    & \texttt{format\_stl\_ascii(mesh)}         & 序列化为 STL ASCII 文本 \\
+    & \texttt{save\_stl\_binary(mesh, path)}    & 保存为 STL 二进制文件 \\
+    & \texttt{format\_stl\_binary(mesh)}        & 序列化为 STL 二进制字节 \\
+  \midrule
+  \multirow{3}{*}{统一入口}
+    & \texttt{MeshError}                            & 统一错误枚举（\texttt{Obj} / \texttt{Ply} / \texttt{Stl} / \texttt{UnsupportedFormat}） \\
+    & \texttt{load\_mesh(path)}                     & 按扩展名自动选择 OBJ / PLY / STL 解析器 \\
+    & \texttt{save\_mesh(mesh, path)}               & 按扩展名自动选择 OBJ / PLY / STL 序列化器 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{OBJ 格式约定}
+
+\begin{lstlisting}
+# 顶点（1-based 索引）
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+# 三角面 / n-gon（支持 v / v/vt / v/vt/vn 形式，仅取 v）
+f 1 2 3
+f 1/1/1 2/2/1 3/3/1
+f 1 2 3 4   # 四边形 n-gon 自动 fan 三角化
+# 负索引：从末尾倒数（OBJ 标准）
+f -3 -2 -1
+\end{lstlisting}
+
+\begin{itemize}
+  \item 仅解析 \texttt{v} 与 \texttt{f} 行；\texttt{vt}、\texttt{vn}、\texttt{g}、
+        \texttt{usemtl} 等其他行被忽略；
+  \item 顶点索引 1-based；负数表示从末尾倒数；
+  \item 支持 n-gon：面顶点数 $\ge 3$ 即可，自动按 fan 方式三角化；
+        仅当面顶点数 $< 3$ 时返回 \texttt{NotTriangular} 错误；
+  \item 索引越界返回 \texttt{IndexOutOfRange} 错误。
+\end{itemize}
+
+\section{错误类型}
+
+\texttt{ObjError} 共 4 个变体：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发场景} \\
+  \midrule
+  \texttt{Io(std::io::Error)}     & 文件读写错误 \\
+  \texttt{Parse\{line, msg\}}     & 解析失败（行号 + 描述） \\
+  \texttt{IndexOutOfRange\{line, idx, vertex\_count\}} & 面索引越界 \\
+  \texttt{NotTriangular\{line, face\_verts\}} & 面顶点数 $< 3$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{build\_mesh\_from\_vertices\_and\_faces 算法}
+
+\subsection{整体流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {开始};
+  \node[proc, below=of s, fill=blue!8] (p1) {1. 创建所有顶点，记录 \texttt{v\_ids[i] $\to$ VertexId}};
+  \node[proc, below=of p1, fill=blue!8] (p2) {2. 为每个面创建 3 条内部半边（CCW），设 next/prev/face，记录 \texttt{edge\_map[(i,j)] = h}};
+  \node[proc, below=of p2, fill=blue!8] (p3) {3. 遍历所有有向边，查反向边：命中 $\to$ 互设 twin；未命中 $\to$ 创建边界 twin};
+  \node[proc, below=of p3, fill=yellow!15] (p4) {4. 用 walking 算法设置边界半边的 next/prev};
+  \node[startend, below=of p4] (e) {返回 \texttt{MeshStorage}};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (p2);
+  \draw[op] (p2) -- (p3);
+  \draw[op] (p3) -- (p4);
+  \draw[op] (p4) -- (e);
+\end{tikzpicture}
+}
+\end{center}
+
+\paragraph{容量预分配}
+入口处调用 \texttt{mesh.reserve(vertices.len(), faces.len() * 6, faces.len())}
+预分配内存，其中半边容量上限 \texttt{faces.len() * 6} 来自每三角面 3 条内部半边
+\texttt{+} 3 条潜在边界 twin。\texttt{build\_mesh\_from\_polygons} 同样在入口处
+调用 \texttt{reserve}，半边容量按 $\sum_i k_i \times 2$ 计算（$k_i$ 为第 $i$ 个面
+的边数）。预分配可将批量构建的 rehash 次数降为 0。
+
+\subsection{步骤 1--2：顶点与内部半边}
+
+对每个面 $[i_0, i_1, i_2]$（0-based），创建三条半边：
+\[
+  h_0: v_{i_0} \to v_{i_1}, \quad
+  h_1: v_{i_1} \to v_{i_2}, \quad
+  h_2: v_{i_2} \to v_{i_0}.
+\]
+设置 $\mathrm{next}(h_0)=h_1,\ \mathrm{next}(h_1)=h_2,\ \mathrm{next}(h_2)=h_0$，
+$\mathrm{prev}$ 反向，$\mathrm{face} = f$。
+记录 \texttt{edge\_map}：$(i_0, i_1) \to h_0$，$(i_1, i_2) \to h_1$，$(i_2, i_0) \to h_2$。
+
+\subsection{步骤 3：twin 建立}
+
+对每条有向边 $(a, b) \to h$：
+\begin{itemize}
+  \item 查 \texttt{edge\_map} 是否有 $(b, a)$：
+    \begin{itemize}
+      \item 命中 $h'$：内部边，互设 $h.\mathrm{twin} = h'$，$h'.\mathrm{twin} = h$；
+      \item 未命中：边界边，创建反向边界半边 $h^*$（$\mathrm{face} = \texttt{None}$），
+            互设 twin，加入 \texttt{boundary\_twins} 列表。
+    \end{itemize}
+\end{itemize}
+
+\subsection{步骤 4：边界半边 next/prev 链接（walking 算法）}
+
+\textbf{问题}：边界半边 $bh$（$A \to B$，$\mathrm{face} = \texttt{None}$）需要
+设置 $\mathrm{next}$ 与 $\mathrm{prev}$，使其与其它边界半边构成外环。
+
+\textbf{旧公式（仅适用单三角形）}：
+\[
+  bh.\mathrm{next} = bh.\mathrm{twin}.\mathrm{prev}.\mathrm{twin}, \quad
+  bh.\mathrm{prev} = bh.\mathrm{twin}.\mathrm{next}.\mathrm{twin}.
+\]
+当 $bh.\mathrm{twin}.\mathrm{prev}$ 的 twin 是内部半边时，此公式失效。
+
+\textbf{新算法（walking）}：
+
+\textbf{求 $bh.\mathrm{next}$}：绕 $bh.\mathrm{tip}$（即 $B$）沿 CCW 方向旋转，
+直到找到边界 outgoing 半边。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {$bh$};
+  \node[proc, below=of s, fill=blue!8] (p1) {$cur \gets bh.\mathrm{twin}$（指向 $B$ 的内部半边）};
+  \node[dec, below=of p1] (d1) {$p \gets cur.\mathrm{prev}$；$pt \gets p.\mathrm{twin}$；$pt.\mathrm{face} = \texttt{None}$？};
+  \node[proc, right=1.6cm of d1, fill=green!12] (yes) {$bh.\mathrm{next} \gets pt$};
+  \node[proc, below=of d1, fill=yellow!15] (no) {$cur \gets pt$；回到 $d1$};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (yes);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (no);
+  \draw[op, dashed] (no.east) -- ++(0.6,0) |- (d1.east);
+\end{tikzpicture}
+\end{center}
+
+\textbf{求 $bh.\mathrm{prev}$}：绕 $bh.\mathrm{origin}$（即 $A$）沿 CW 方向旋转，
+直到找到 twin 为边界半边的 outgoing。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=10cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=3.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {$bh$};
+  \node[proc, below=of s, fill=blue!8] (p1) {$cur \gets bh$（$A$ 的 outgoing，twin 指向 $B$）};
+  \node[dec, below=of p1] (d1) {$t \gets cur.\mathrm{twin}$；$tn \gets t.\mathrm{next}$；$tnt \gets tn.\mathrm{twin}$；$tnt.\mathrm{face} = \texttt{None}$？};
+  \node[proc, right=1.6cm of d1, fill=green!12] (yes) {$bh.\mathrm{prev} \gets tnt$};
+  \node[proc, below=of d1, fill=yellow!15] (no) {$cur \gets tn$；回到 $d1$};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[above, font=\scriptsize] {是} (yes);
+  \draw[op] (d1) -- node[right, font=\scriptsize] {否} (no);
+  \draw[op, dashed] (no.east) -- ++(0.6,0) |- (d1.east);
+\end{tikzpicture}
+\end{center}
+
+\textbf{终止性}：边界半边的 tip 必为边界顶点，边界顶点的 outgoing 环是开链
+（非闭合），walking 必终止。代码设 \texttt{max\_iter = halfedge\_count + 1}
+作安全阀。
+
+\section{面绕向一致性约束}
+
+\texttt{build\_mesh\_from\_vertices\_and\_faces} 假设所有面绕向一致
+（每条无向边在两个面中方向相反）。若输入违反此约束（如两个面都包含
+有向边 $a \to b$），则：
+
+\begin{enumerate}
+  \item \texttt{edge\_map} 第二次插入会覆盖第一次；
+  \item 第一次插入的半边 $h_{\text{first}}$ 不在 \texttt{directed\_edges} 中，
+        永远不会被设置 twin；
+  \item 第二次插入的半边 $h_{\text{second}}$ 查找 $(b, a)$ 失败，创建边界 twin；
+  \item 结果：$h_{\text{first}}.\mathrm{twin} = \texttt{None}$，
+        \texttt{validate\_topology} 会报告 \texttt{HalfEdgeDanglingTwin}
+        或入口不一致。
+\end{enumerate}
+
+\textbf{使用建议}：调用方应保证面绕向一致（如所有面 CCW 朝外）；
+若不确定，应先用 \texttt{validate\_topology} 检查构建结果。
+
+\section{OBJ 序列化}
+
+\texttt{format\_obj} 输出格式：
+\begin{itemize}
+  \item 顶点按 \texttt{vertex\_ids()} 顺序，分配 1-based 索引；
+  \item 面按 \texttt{face\_ids()} 顺序，每行 \texttt{f i j k}；
+  \item 非三角面（边界环长度 $\ne 3$）跳过；
+  \item 顶点位置用 \texttt{{:.6}} 格式化（6 位小数）。
+\end{itemize}
+
+\section{STL 读写}
+
+STL（STereoLithography）格式广泛用于 3D 打印与 CAD 交换。
+\texttt{io.rs} 支持 ASCII 与二进制两种变体，并提供自动判别。
+
+\subsection{ASCII 格式}
+
+\begin{lstlisting}
+solid model
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex 0.0 0.0 0.0
+      vertex 1.0 0.0 0.0
+      vertex 0.0 1.0 0.0
+    endloop
+  endfacet
+endsolid model
+\end{lstlisting}
+
+\texttt{parse\_stl\_ascii} 解析流程：
+\begin{enumerate}
+  \item 按行拆分，跳过 \texttt{solid} / \texttt{endsolid} / \texttt{facet normal} /
+        \texttt{outer loop} / \texttt{endloop} / \texttt{endfacet} 等关键字；
+  \item 提取所有 \texttt{vertex x y z} 行为顶点位置；
+  \item 每连续 3 个顶点构成一个三角面；
+  \item \textbf{顶点去重}：用 \texttt{f64::to\_bits()} 的位模式作为 \texttt{HashMap}
+        键，相同位置的顶点复用同一 \texttt{VertexId}；
+  \item 调用 \texttt{build\_mesh\_from\_vertices\_and\_faces} 构建半边网格。
+\end{enumerate}
+
+\subsection{二进制格式}
+
+\begin{lstlisting}
+[80 字节文件头]
+[4 字节 little-endian 三角面数 N]
+[50 字节 × N：每个三角面 12 字节法向 + 36 字节三顶点 + 2 字节属性]
+\end{lstlisting}
+
+\texttt{parse\_stl\_binary} 解析流程：
+\begin{enumerate}
+  \item 跳过 80 字节文件头；
+  \item 读取 4 字节 \texttt{u32} 作为面数 $N$；
+  \item 校验文件长度 $= 84 + 50N$，不匹配返回 \texttt{BadBinarySize} 错误；
+  \item 每个三角面读取 50 字节，提取三顶点位置（法向被忽略，由网格重建）；
+  \item \textbf{顶点去重}：用 \texttt{f32::to\_bits()} 的位模式（\texttt{u32} 数组）
+        作为 \texttt{HashMap} 键，相同位置的顶点复用同一 \texttt{VertexId}；
+  \item 调用 \texttt{build\_mesh\_from\_vertices\_and\_faces} 构建半边网格。
+\end{enumerate}
+
+\subsection{ASCII / 二进制自动判别}
+
+\texttt{parse\_stl\_bytes(bytes)} 使用\textbf{启发式}判别：
+\begin{itemize}
+  \item 检查文件长度：若 $\text{len} = 84 + 50N$（$N$ 为前 80 字节后的 4 字节
+        \texttt{u32}），判定为二进制；
+  \item 否则尝试以 UTF-8 解码后调用 \texttt{parse\_stl\_ascii}；
+  \item 两者都失败返回 \texttt{StlError::Parse}。
+\end{itemize}
+
+\textbf{为何用文件长度判别？} ASCII STL 起始 80 字节通常含 \texttt{solid} 关键字，
+但二进制文件头也可能是任意 80 字节。文件长度恰好等于 $84 + 50N$ 是二进制的强信号。
+
+\subsection{STL 序列化}
+
+\texttt{format\_stl\_ascii} 输出标准 ASCII 格式：
+\begin{itemize}
+  \item \texttt{solid halfedge} 起始；
+  \item 每面输出 \texttt{facet normal}（用 \texttt{face\_normal} 计算）+
+        三顶点 \texttt{vertex}；
+  \item \texttt{endsolid halfedge} 结束。
+\end{itemize}
+
+\texttt{format\_stl\_binary} 输出标准二进制格式：
+\begin{itemize}
+  \item 80 字节文件头（前缀 \texttt{halfedge binary stl}，余 0）；
+  \item 4 字节 little-endian 面数 $N$；
+  \item 每面 50 字节：法向（12B）+ 三顶点（36B）+ 属性（2B，全 0）。
+\end{itemize}
+
+\subsection{StlError}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{触发场景} \\
+  \midrule
+  \texttt{Io(std::io::Error)}                       & 文件读写错误 \\
+  \texttt{Parse\{line, msg\}}                       & ASCII 解析失败（行号 + 描述） \\
+  \texttt{BadBinarySize\{actual, expected\}}        & 二进制文件长度不匹配 \\
+  \texttt{NotTriangular\{face\_verts\}}             & 非三角面（顶点数 $\ne 3$） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{顶点去重原理}
+
+STL 文件每个三角面独立存储三顶点，无共享顶点索引。
+直接构建网格会产生 $3F$ 个 \texttt{VertexId}（$F$ 为面数），
+而非实际的 $V$ 个顶点（$V \approx F/2$）。
+
+\textbf{去重算法}：
+\[
+  \text{key}(p) = [\texttt{f64::to\_bits}(p_x),\ \texttt{f64::to\_bits}(p_y),\ \texttt{f64::to\_bits}(p_z)]
+\]
+\begin{itemize}
+  \item 用 \texttt{HashMap<[u64; 3], u32>}（ASCII）或
+        \texttt{HashMap<[u32; 3], u32>}（二进制，因 \texttt{f32}）；
+  \item \texttt{to\_bits()} 是位精确比较，浮点数 $0.0 \ne -0.0$；
+  \item 命中已有索引则复用，否则分配新 \texttt{VertexId}。
+\end{itemize}
+
+\textbf{为何用位精确而非 $\epsilon$-tolerance？}
+\begin{itemize}
+  \item STL 文件中相同顶点的浮点表示通常\textbf{完全相同}（同一写入器输出）；
+  \item 位精确比较 $O(1)$ 且无歧义；
+  \item 浮点容差比较需 $O(\log V)$ 查找（KD-tree），且阈值敏感。
+\end{itemize}
+
+若 STL 文件含微小浮点误差导致同顶点不同表示，应先用
+\texttt{weld\_vertices}（按距离阈值合并）做后处理。
+
+\section{统一入口：load\_mesh / save\_mesh / MeshError}
+
+为简化上层调用，\texttt{io.rs} 提供\textbf{按扩展名自动分派}的统一接口：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{扩展名} & \texttt{load\_mesh} 调用 & \texttt{save\_mesh} 调用 \\
+  \midrule
+  \texttt{.obj} & \texttt{load\_obj} & \texttt{save\_obj} \\
+  \texttt{.ply} & \texttt{load\_ply} & \texttt{save\_ply} \\
+  \texttt{.stl} & \texttt{load\_stl} & \texttt{save\_stl\_binary} \\
+  其他 & \multicolumn{2}{c}{\texttt{Err(MeshError::UnsupportedFormat(ext))}} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{MeshError 枚举}
+
+\texttt{MeshError} 是 OBJ / PLY / STL 错误的\textbf{统一包装}，通过 \texttt{From<ObjError>}
+、\texttt{From<PlyError>} 与 \texttt{From<StlError>} 实现自动转换，
+便于在 \texttt{?} 运算符中混用：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{变体} & \textbf{来源} \\
+  \midrule
+  \texttt{Obj(ObjError)}                & \texttt{load\_obj} / \texttt{save\_obj} 错误 \\
+  \texttt{Ply(PlyError)}                & \texttt{load\_ply} / \texttt{save\_ply} 错误 \\
+  \texttt{Stl(StlError)}                & \texttt{load\_stl} / \texttt{save\_stl\_*} 错误 \\
+  \texttt{UnsupportedFormat(String)}    & 未知扩展名 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{使用示例}
+
+\begin{lstlisting}
+// 自动按扩展名加载
+let mesh = halfedge::load_mesh("model.obj")?;
+let mesh = halfedge::load_mesh("model.ply")?;
+
+// 自动按扩展名保存
+halfedge::save_mesh(&mesh, "out.ply")?;
+halfedge::save_mesh(&mesh, "out.obj")?;
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{验证点} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{构建器}} \\
+  \texttt{build\_mesh\_basic\_quad}                  & 4 顶点 2 面 10 半边 \\
+  \texttt{build\_mesh\_passes\_full\_validation}     & 构建结果通过完整校验 \\
+  \texttt{build\_mesh\_closed\_tetrahedron}          & 闭合四面体 12 半边 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{OBJ 往返与解析}} \\
+  \texttt{obj\_roundtrip\_quad}                      & 四边形 OBJ 往返一致 \\
+  \texttt{obj\_roundtrip\_tetrahedron}               & 四面体 OBJ 往返一致 \\
+  \texttt{obj\_parse\_skips\_comments\_and\_other\_lines} & 忽略 \texttt{\#} / \texttt{vt} / \texttt{vn} / \texttt{g} 等 \\
+  \texttt{obj\_parse\_supports\_v\_vt\_vn\_format}   & 解析 \texttt{v/vt/vn} 格式 \\
+  \texttt{obj\_parse\_negative\_indices}             & 负索引支持 \\
+  \texttt{obj\_parse\_quadrilateral\_face\_succeeds} & 四边形面解析成功（支持 n-gon） \\
+  \texttt{obj\_parse\_out\_of\_range\_index\_fails}  & 越界索引报 \texttt{IndexOutOfRange} \\
+  \texttt{obj\_save\_load\_file\_roundtrip}          & 文件 IO 往返一致 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{STL 往返与解析}} \\
+  \texttt{stl\_ascii\_roundtrip}                     & STL ASCII 往返一致 \\
+  \texttt{stl\_binary\_roundtrip}                    & STL 二进制往返一致 \\
+  \texttt{stl\_ascii\_parses\_minimum\_solid}        & 最小 \texttt{solid} 块解析成功 \\
+  \texttt{stl\_ascii\_rejects\_non\_triangular}      & 非三角面报 \texttt{NotTriangular} \\
+  \texttt{stl\_binary\_detects\_size\_mismatch}      & 二进制长度不匹配报 \texttt{BadBinarySize} \\
+  \texttt{stl\_file\_roundtrip\_ascii}               & STL ASCII 文件 IO 往返 \\
+  \texttt{stl\_file\_roundtrip\_binary}              & STL 二进制文件 IO 往返 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{统一入口}} \\
+  \texttt{auto\_detect\_obj}                         & \texttt{load\_mesh(".obj")} 走 OBJ 路径 \\
+  \texttt{auto\_detect\_ply}                         & \texttt{load\_mesh(".ply")} 走 PLY 路径 \\
+  \texttt{auto\_detect\_stl}                         & \texttt{load\_mesh(".stl")} 走 STL 路径 \\
+  \texttt{auto\_detect\_unsupported}                 & 未知扩展名返回 \texttt{UnsupportedFormat} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+全模块共 \textbf{22 个}单元测试，全库共 \textbf{371 个}。
+
+\end{document}

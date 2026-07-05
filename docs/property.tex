@@ -1,0 +1,451 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box,in},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 属性系统设计文档} \\ \large \texttt{src/property.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{模块定位}
+
+\texttt{property.rs} 实现 OpenMesh 风格的属性系统，允许用户为顶点/半边/面
+附加\textbf{任意类型}的自定义数据。设计目标：
+
+\begin{itemize}
+  \item 不依赖 trait 泛型，使用 \texttt{Any + TypeId} 实现类型擦除；
+  \item 同一容器内可并存多种类型（\texttt{f64} / \texttt{String} / 自定义 newtype 等）；
+  \item 与 \texttt{MeshStorage} \textbf{解耦}，作为独立外部结构体
+        \texttt{MeshProperties} 使用；
+  \item 删除网格元素时通过包装函数同步清理属性。
+\end{itemize}
+
+\section{核心数据结构}
+
+\subsection{PropertyStore<T>：单类型属性存储}
+
+\begin{lstlisting}
+pub struct PropertyStore<T> {
+    data: HashMap<usize, T>,  // key = slotmap key 的 idx 部分
+}
+\end{lstlisting}
+
+\textbf{键的选取}：使用 slotmap key 的 \texttt{idx}（槽位索引）部分作为 \texttt{usize} 键，
+而非完整 key（包含 version）。原因：
+
+\begin{itemize}
+  \item 用户需求明确指定 \texttt{HashMap<usize, T>}；
+  \item 同一元素的 idx 在其生命周期内不变；
+  \item 便于 \texttt{ErasedProperty::remove\_by\_index} 在不知类型时批量删除。
+\end{itemize}
+
+\textbf{权衡}：idx 在 slot 复用时会被新元素继承，因此删除元素后\textbf{必须}
+同步清理属性（见 \S\ref{sec:remove-callback}），否则属性会错误关联到新元素。
+
+\subsection{idx 提取辅助函数}
+
+slotmap 1.1.1 的 \texttt{KeyData} 字段为私有，公开 API 仅 \texttt{as\_ffi()}。
+通过 \texttt{Key} trait 的 \texttt{data()} 方法取出 \texttt{KeyData}，
+再调 \texttt{as\_ffi()} 取 64 位编码，取低 32 位即 idx：
+
+\begin{lstlisting}
+#[inline]
+fn idx_of<K: Key>(id: K) -> usize {
+    let ffi = id.data().as_ffi();
+    (ffi & 0xFFFF_FFFF) as usize
+}
+\end{lstlisting}
+
+\texttt{as\_ffi()} 编码格式（slotmap 源码）：
+\[
+\texttt{as\_ffi()} = (\underbrace{\texttt{version}}_{\text{高 32 位}} \ll 32)\;\big|\;\underbrace{\texttt{idx}}_{\text{低 32 位}}
+\]
+
+\subsection{ErasedProperty trait（私有）}
+
+为支持「不知类型时批量删除」，扩展标准库 \texttt{Any}：
+
+\begin{lstlisting}
+trait ErasedProperty {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn remove_by_index(&mut self, idx: usize);
+    fn clear_all(&mut self);
+}
+\end{lstlisting}
+
+\texttt{as\_any} 与 \texttt{as\_any\_mut} 用于 downcast 回具体
+\texttt{PropertyStore<T>}；\texttt{remove\_by\_index} 让容器在
+不知 \texttt{T} 的情况下批量删除某 ID 的所有属性。
+
+\subsection{PropertyHandle<T>：类型化句柄}
+
+\begin{lstlisting}
+pub struct PropertyHandle<T> {
+    _marker: PhantomData<T>,
+}
+\end{lstlisting}
+
+零大小类型，仅用于编译期类型推断，是 \texttt{Copy} 的。属性按 \texttt{TypeId} 索引，
+句柄本身不携带数据，仅让 \texttt{get/set/remove} 方法无需显式标注泛型参数：
+
+\begin{lstlisting}
+let h: PropertyHandle<f64> = props.add_vertex_prop();
+props.set_vertex_prop(h, v, 1.5);  // T 由 h 推断为 f64
+let w = *props.get_vertex_prop(h, v).unwrap();
+\end{lstlisting}
+
+\subsection{MeshProperties：属性容器}
+
+\begin{lstlisting}
+pub struct MeshProperties {
+    vertex_props:   HashMap<TypeId, Box<dyn ErasedProperty>>,
+    halfedge_props: HashMap<TypeId, Box<dyn ErasedProperty>>,
+    face_props:     HashMap<TypeId, Box<dyn ErasedProperty>>,
+}
+\end{lstlisting}
+
+三类属性分别存储在独立 \texttt{HashMap} 中，按 \texttt{TypeId::of::<T>()} 区分类型。
+每个类型 \texttt{T: 'static} 在每类中只能注册一个属性。
+
+\section{CRUD 方法}
+
+每类元素（vertex / halfedge / face）提供 5 个方法：\texttt{add} / \texttt{get} /
+\texttt{get\_mut} / \texttt{set} / \texttt{remove}，加上 \texttt{remove\_*\_all\_props}
+批量删除和 \texttt{clear\_*\_props} 全清。以 vertex 为例：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{方法} & \textbf{签名} & \textbf{语义} \\
+  \midrule
+  \texttt{add\_vertex\_prop::<T>} & \texttt{() -> PropertyHandle<T>} & 注册类型 T \\
+  \texttt{get\_vertex\_prop::<T>} & \texttt{(h, id) -> Option<\&T>} & 读取 \\
+  \texttt{get\_vertex\_prop\_mut::<T>} & \texttt{(h, id) -> Option<\&mut T>} & 可变读 \\
+  \texttt{set\_vertex\_prop::<T>} & \texttt{(h, id, val)} & 写入（自动注册） \\
+  \texttt{remove\_vertex\_prop::<T>} & \texttt{(h, id) -> Option<T>} & 删除单类型 \\
+  \texttt{remove\_vertex\_all\_props} & \texttt{(id)} & 删除所有类型 \\
+  \texttt{has\_vertex\_prop::<T>} & \texttt{() -> bool} & 是否注册 \\
+  \texttt{clear\_vertex\_props} & \texttt{()} & 清空但保留类型槽 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{自动注册}：\texttt{set\_vertex\_prop} 在属性未注册时自动创建
+\texttt{PropertyStore<T>} 并插入，简化用户代码。
+
+\section{类型擦除流程}
+
+\subsection{set 写入流程}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.45cm,
+  proc/.style={draw, rounded corners=2pt, minimum width=11cm, minimum height=0.7cm, align=center, font=\small},
+  dec/.style={diamond, draw, aspect=2.4, fill=orange!12, inner sep=1pt, font=\small, align=center, minimum width=4.5cm},
+  op/.style={-Stealth, thick},
+  startend/.style={draw, rounded corners=10pt, minimum width=2.6cm, minimum height=0.7cm, font=\small, fill=gray!12}
+]
+  \node[startend] (s) {调用 \texttt{set\_vertex\_prop::<T>(h, id, val)}};
+  \node[proc, below=of s, fill=blue!8] (p1) {计算 \texttt{type\_id = TypeId::of::<T>()}};
+  \node[dec, below=of p1] (d1) {\texttt{vertex\_props} 是否含 \texttt{type\_id}？};
+  \node[proc, below=1.0cm of d1, fill=blue!8] (p2) {downcast\_mut 为 \texttt{PropertyStore<T>}，调用 \texttt{set(idx, val)}};
+  \node[proc, right=2.0cm of d1, fill=green!12] (p3) {创建 \texttt{PropertyStore::<T>::new()}，\texttt{set(idx, val)}，\texttt{insert(type\_id, store)}};
+  \node[startend, below=of p2, fill=green!12] (ok) {返回};
+  \draw[op] (s) -- (p1);
+  \draw[op] (p1) -- (d1);
+  \draw[op] (d1) -- node[right, font=\footnotesize] {是} (p2);
+  \draw[op] (d1) -- node[above, near start, font=\footnotesize] {否} (p3);
+  \draw[op] (p2) -- (ok);
+  \draw[op] (p3.south) |- (ok.east);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{get 读取流程}
+
+\begin{lstlisting}
+pub fn get_vertex_prop<T: 'static>(
+    &self,
+    _handle: PropertyHandle<T>,
+    id: VertexId,
+) -> Option<&T> {
+    let entry = self.vertex_props.get(&TypeId::of::<T>())?;
+    let store = entry.as_any().downcast_ref::<PropertyStore<T>>()?;
+    store.get(idx_of(id))
+}
+\end{lstlisting}
+
+三步：(1) 按 \texttt{TypeId} 查表；(2) downcast 回具体 \texttt{PropertyStore<T>}；
+(3) 按 idx 查值。任一环节失败返回 \texttt{None}（属性未注册 / 类型不匹配 / 该 ID 未设值）。
+
+\section{删除回调}
+\label{sec:remove-callback}
+
+\texttt{MeshProperties} 与 \texttt{MeshStorage} 解耦，删除网格元素时不会自动清理
+对应属性。提供三个包装函数同步清理：
+
+\begin{lstlisting}
+pub fn remove_vertex_with_props(
+    mesh: &mut MeshStorage,
+    props: &mut MeshProperties,
+    id: VertexId,
+) -> Option<Vertex> {
+    let result = mesh.remove_vertex(id);
+    props.remove_vertex_all_props(id);  // 遍历所有类型，按 idx 删除
+    result
+}
+\end{lstlisting}
+
+\texttt{remove\_vertex\_all\_props} 通过 \texttt{ErasedProperty::remove\_by\_index}
+在不知具体类型的情况下批量删除：
+
+\begin{lstlisting}
+pub fn remove_vertex_all_props(&mut self, id: VertexId) {
+    let idx = idx_of(id);
+    for store in self.vertex_props.values_mut() {
+        store.remove_by_index(idx);
+    }
+}
+\end{lstlisting}
+
+\section{应用：加权拉普拉斯平滑}
+
+利用顶点属性 \texttt{f64} 存储权重，执行\textbf{加权}拉普拉斯平滑：
+
+\subsection{公式}
+
+等权拉普拉斯（\texttt{geometry.rs} 中已实现）：
+\[
+\vec{p}_v' = \frac{1}{|N(v)|} \sum_{u \in N(v)} \vec{p}_u
+\]
+
+加权拉普拉斯（用属性权重 $w_u$）：
+\[
+\vec{p}_v' = \frac{\displaystyle\sum_{u \in N(v)} w_u \cdot \vec{p}_u}{\displaystyle\sum_{u \in N(v)} w_u}
+\]
+
+权重 $w_u$ 大的邻居对平滑位置贡献更大，平滑位置偏向高权重邻居。
+
+\subsection{实现要点}
+
+\begin{lstlisting}
+let w: PropertyHandle<f64> = props.add_vertex_prop();
+for v in mesh.vertex_ids() {
+    props.set_vertex_prop(w, v, 1.0);
+}
+// 把某个邻居权重调大
+props.set_vertex_prop(w, neighbor, 10.0);
+
+// 加权平均
+let mut sum_w = 0.0;
+let mut sum_p = [0.0; 3];
+for u in VertexAdjacentVerts::new(&mesh, v) {
+    let w_u = *props.get_vertex_prop(w, u).unwrap_or(&1.0);
+    let p = mesh.get_vertex(u).unwrap().position;
+    for k in 0..3 { sum_p[k] += w_u * p[k]; }
+    sum_w += w_u;
+}
+let weighted_avg = [sum_p[0] / sum_w, sum_p[1] / sum_w, sum_p[2] / sum_w];
+\end{lstlisting}
+
+\section{复杂度分析}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.20}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{操作} & \textbf{时间复杂度} & \textbf{空间复杂度} \\
+  \midrule
+  \texttt{add\_*\_prop}（注册类型）       & $O(1)$ & $O(1)$（空 store） \\
+  \texttt{get\_*\_prop}（读取）            & $O(1)$ & $O(1)$ \\
+  \texttt{set\_*\_prop}（写入）            & $O(1)$ 均摊 & $O(1)$ per entry \\
+  \texttt{remove\_*\_prop}（删单类型）     & $O(1)$ & $O(1)$ \\
+  \texttt{remove\_*\_all\_props}（删全类型） & $O(K)$，$K$ = 已注册类型数 & $O(1)$ \\
+  \texttt{clear\_*\_props}（清空）         & $O(K + N)$，$N$ = 总条目数 & $O(1)$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\section{单元测试覆盖}
+
+\texttt{src/property.rs} 末尾共 \textbf{16} 个测试，分四组：
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{测试名} & \textbf{覆盖点} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{PropertyStore 基础}} \\
+  \texttt{property\_store\_basic\_crud}       & set / get / get\_mut / remove / contains / len \\
+  \texttt{property\_store\_iter}              & 迭代 \texttt{(idx, \&T)} 对 \\
+  \texttt{property\_store\_clear}             & clear 后 is\_empty \\
+  \midrule
+  \multicolumn{2}{l}{\textit{类型擦除}} \\
+  \texttt{add\_and\_get\_vertex\_prop}        & 注册 + 读写多顶点 \\
+  \texttt{get\_vertex\_prop\_mut\_works}      & 可变引用就地修改 \\
+  \texttt{remove\_vertex\_prop}               & 删除单类型 + 重复删除返回 None \\
+  \texttt{remove\_vertex\_all\_props\_clears\_all\_types} & 删除顶点时清理所有类型属性 \\
+  \texttt{different\_types\_do\_not\_interfere} & f64 / i32 / String 互不干扰 \\
+  \texttt{vertex\_halfedge\_face\_props\_are\_independent} & 三类属性独立存储 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{自动注册与边缘情况}} \\
+  \texttt{get\_unregistered\_prop\_returns\_none} & 未注册类型读取返回 None \\
+  \texttt{set\_auto\_registers\_prop}         & 未注册时 set 自动注册 \\
+  \texttt{halfedge\_and\_face\_props\_work}   & 半边 / 面属性 CRUD + 批量删 \\
+  \texttt{clear\_all\_vertex\_props}          & 清空数据但保留类型槽 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{句柄与包装函数}} \\
+  \texttt{remove\_vertex\_with\_props\_wrapper} & 包装函数同步清理属性 \\
+  \texttt{property\_handle\_is\_copy\_and\_debug} & 句柄 Copy + Debug \\
+  \texttt{newtype\_wrapper\_for\_multiple\_same\_type\_props} & newtype 区分同底层类型属性 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{cargo test} 全模块共 \textbf{371} 个用例，全部通过（0 失败 / 0 警告）。
+
+\section{设计取舍}
+
+\begin{itemize}
+  \item \textbf{为何用 \texttt{Box<dyn ErasedProperty>} 而非 \texttt{Box<dyn Any>}？} \\
+        标准库 \texttt{Any} 不提供 \texttt{remove\_by\_index}，
+        无法在不知 \texttt{T} 的情况下批量删除。\texttt{ErasedProperty} trait
+        扩展了此能力，使 \texttt{remove\_*\_all\_props} 无需为每个已注册类型
+        显式调用 \texttt{remove}。
+  \item \textbf{为何属性键用 idx 而非完整 key？} \\
+        用户需求明确指定 \texttt{HashMap<usize, T>}。idx 在元素生命周期内不变，
+        满足稀疏存储需求。代价是删除元素后必须同步清理（见 \S\ref{sec:remove-callback}）。
+        若用完整 \texttt{as\_ffi()} 作键，版本号会防止 slot 复用冲突，
+        但偏离用户指定接口且增加 \texttt{ErasedProperty} 复杂度。
+  \item \textbf{为何 \texttt{MeshProperties} 是外部结构体而非 \texttt{MeshStorage} 字段？} \\
+        解耦让 \texttt{MeshStorage} 保持纯粹「存储 + 句柄有效性」职责，
+        不绑定具体属性类型。用户可按需创建 0 个或多个 \texttt{MeshProperties}
+        实例（如分别存放几何属性与渲染属性）。
+  \item \textbf{为何 \texttt{PropertyHandle<T>} 是零大小类型？} \\
+        属性按 \texttt{TypeId} 索引，句柄仅用于编译期类型推断。
+        零大小 \texttt{Copy} 类型可自由复制，无运行时开销。
+  \item \textbf{每类型只能注册一个属性？} \\
+        \texttt{TypeId} 作键意味着同类型只能存一份。需要多个同底层类型属性时，
+        用 newtype 包装：\texttt{struct Weight(f64); struct Temperature(f64);}
+        生成不同 \texttt{TypeId}，互不冲突。
+\end{itemize}
+
+\section{使用示例}
+
+\subsection{基础：注册并读写顶点属性}
+
+\begin{lstlisting}
+let mesh = build_icosphere(1);
+let mut props = MeshProperties::new();
+
+let w: PropertyHandle<f64> = props.add_vertex_prop();
+for v in mesh.vertex_ids() {
+    props.set_vertex_prop(w, v, 1.0);
+}
+let v0 = mesh.vertex_ids().next().unwrap();
+assert_eq!(props.get_vertex_prop(w, v0), Some(&1.0));
+\end{lstlisting}
+
+\subsection{类型擦除：同容器并存多种类型}
+
+\begin{lstlisting}
+let label: PropertyHandle<i32>    = props.add_vertex_prop();
+let name:  PropertyHandle<String> = props.add_vertex_prop();
+let flag:  PropertyHandle<bool>   = props.add_vertex_prop();
+// 三种类型互不干扰，vertex_prop_type_count() == 4（含之前的 f64）
+\end{lstlisting}
+
+\subsection{newtype：同底层类型多属性}
+
+\begin{lstlisting}
+#[derive(Debug, PartialEq)]
+struct Weight(f64);
+#[derive(Debug, PartialEq)]
+struct Temperature(f64);
+
+let hw: PropertyHandle<Weight>      = props.add_vertex_prop();
+let ht: PropertyHandle<Temperature> = props.add_vertex_prop();
+props.set_vertex_prop(hw, v, Weight(1.0));
+props.set_vertex_prop(ht, v, Temperature(25.5));
+\end{lstlisting}
+
+\subsection{半边 / 面属性：缓存边长与面法向}
+
+\begin{lstlisting}
+let edge_len: PropertyHandle<f64>  = props.add_halfedge_prop();
+let normal:   PropertyHandle<Vec3> = props.add_face_prop();
+
+for he in mesh.halfedge_ids() {
+    let h = mesh.get_halfedge(he).unwrap();
+    let tip = h.vertex;
+    let origin = mesh.get_halfedge(h.twin.unwrap()).unwrap().vertex;
+    let l = dist(mesh.get_vertex(tip).unwrap().position,
+                 mesh.get_vertex(origin).unwrap().position);
+    props.set_halfedge_prop(edge_len, he, l);
+}
+\end{lstlisting}
+
+\subsection{删除元素同步清理}
+
+\begin{lstlisting}
+use halfedge::property::remove_vertex_with_props;
+
+let removed = remove_vertex_with_props(&mut mesh, &mut props, vids[0]);
+assert!(removed.is_some());
+assert!(!mesh.contains_vertex(vids[0]));
+assert_eq!(props.get_vertex_prop(w, vids[0]), None);  // 属性已同步清除
+\end{lstlisting}
+
+\end{document}

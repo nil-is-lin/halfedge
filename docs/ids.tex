@@ -1,0 +1,252 @@
+% !TEX program = xelatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[UTF8]{ctex}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{hyperref}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=teal!70!black,
+}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={fn,let,mut,pub,struct,impl,use,mod,self,Self,Option,Some,None,return,if,else,for,while,loop,match,break,continue,as,where,trait,type,enum,move,ref,const,static,unsafe,extern,crate,super,dyn,async,await,box},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{green!40!black}\itshape,
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}
+
+\title{\textbf{halfedge\,: 强类型 ID 模块设计文档} \\ \large \texttt{src/ids.rs}}
+\author{halfedge 库}
+\date{2026-07-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{设计目标}
+
+半边网格（Half-Edge Mesh）中存在三类截然不同的拓扑元素：顶点、半边、面。
+若所有元素都用同一个整数索引表示，把「顶点 ID」误传给「半边 ID」形参的 bug
+会在运行期才暴露，调试代价高昂。本模块的目的是在\textbf{编译期}就把三种句柄
+彻底分开，使类型系统替我们挡住这类误用。
+
+具体要求：
+\begin{itemize}
+  \item 定义 \texttt{VertexId}、\texttt{HalfEdgeId}、\texttt{FaceId}；
+  \item 自动派生 \texttt{Debug}、\texttt{Copy}、\texttt{Eq}、\texttt{Ord}；
+  \item 与 \texttt{slotmap} 无缝衔接，可直接作为 \texttt{SlotMap} 的键。
+  \item 提供 \texttt{EdgeId} 表示无向边（twin 对的规范代表元），
+        用于无向边迭代、属性键等场景。
+\end{itemize}
+
+\section{方案选型}
+
+\subsection{候选方案对比}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{p{3.4cm}|p{4.8cm}|p{4.8cm}}
+  \hline
+  \textbf{方案} & \textbf{优点} & \textbf{缺点} \\
+  \hline
+  普通整数 \texttt{u32}+类型别名 & 写法最简单 & 别名仅是文档，编译期不可区分 \\
+  \hline
+  Newtype \texttt{struct VertexId(u32)} & 类型独立 & 需手写 trait、未带版本号 \\
+  \hline
+  \texttt{slotmap::new\_key\_type!} & 编译期强类型 + 版本号 + 自带全套 trait & 引入 slotmap 依赖（已选用） \\
+  \hline
+\end{tabular}
+\end{center}
+
+由于存储层（\texttt{storage.rs}）本就要使用 \texttt{slotmap}，第三种方案与项目其余部分
+天然吻合，且版本号机制是后续「删除自动失效」能力的基础，因此本模块直接采用
+\texttt{new\_key\_type!} 宏。
+
+\subsection{核心代码}
+
+\begin{lstlisting}
+use slotmap::new_key_type;
+
+new_key_type! {
+    pub struct VertexId;
+    pub struct HalfEdgeId;
+    pub struct FaceId;
+}
+\end{lstlisting}
+
+\texttt{new\_key\_type!} 宏展开后等价于为每个类型派生：
+\[
+\underbrace{\text{Debug},\ \text{Copy},\ \text{Clone}}_{\text{需求 1 显式要求}}
+\quad\cup\quad
+\underbrace{\text{Eq},\ \text{PartialEq},\ \text{Ord},\ \text{PartialOrd},\ \text{Hash},\ \text{Default}}_{\text{额外免费}}
+\]
+
+每个 key 的内部表示为
+\[
+\texttt{Key}\ =\ (\,\underbrace{\text{idx}: u32}_{\text{槽位下标}},\ \underbrace{\text{version}: u32}_{\text{版本号}}\,)
+\]
+共 64 位。
+
+\section{版本号与失效判定}
+
+\texttt{slotmap} 内部为每个槽位维护一个单调递增的版本号，元素的插/删/查都通过
+\texttt{(idx, version)} 二元组完成：
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.9cm and 1.4cm,
+  box/.style={draw, rounded corners=2pt, minimum width=2.4cm, minimum height=0.75cm, align=center, font=\small},
+  op/.style={-Stealth, thick, draw=blue!60!black},
+  lab/.style={font=\footnotesize\itshape, midway, above}
+]
+  \node[box, fill=green!15] (a) {\texttt{insert(v)}};
+  \node[box, fill=yellow!25, right=of a] (b) {槽位 $i$ \\ version $=k$};
+  \node[box, fill=red!15, right=of b] (c) {\texttt{remove(id)}};
+  \node[box, fill=gray!15, right=of c] (d) {槽位 $i$ 空闲 \\ version $=k{+}1$};
+
+  \draw[op] (a) -- node[lab] {分配} (b);
+  \draw[op] (b) -- node[lab] {键有效} (c);
+  \draw[op] (c) -- node[lab] {版本号 $+1$} (d);
+
+  \node[below=1.0cm of b, font=\footnotesize, text=red!60!black] (old)
+    {旧句柄 $(i, k)$ 查询：版本不匹配 $\Rightarrow$ 返回 \texttt{None}};
+  \draw[-Stealth, dashed, draw=red!60!black] (d.south) to[bend left=20] (old.east);
+\end{tikzpicture}
+\end{center}
+
+形式化地，给定句柄 $h=(i,k)$ 与当前槽位版本 $v_i$，有效性判定为
+\[
+\text{valid}(h) \;\Longleftrightarrow\; k = v_i \ \wedge\ \text{slot}_i\ \text{occupied}.
+\]
+
+这一性质是 \texttt{storage.rs} 中「删除即自动失效」的语义基础，本模块不需要再
+额外维护任何 tombstone 位。
+
+\section{类型不可互换性}
+
+三种 ID 在编译期就是不同类型，下列赋值会触发类型错误而非运行期失败：
+
+\begin{lstlisting}
+let _: VertexId   = HalfEdgeId::default(); // 编译失败
+let _: HalfEdgeId = FaceId::default();     // 编译失败
+\end{lstlisting}
+
+这一约束完全由 Rust 的 nominal type 系统在零运行期开销下保证。
+
+\section{EdgeId：无向边的规范代表}
+
+\texttt{HalfEdgeId} 是有向的：每条无向边对应两条互为 twin 的半边。
+但在迭代边、按边存储属性等场景中，需要\textbf{一个无向边的唯一标识}。
+\texttt{EdgeId} 即为此设计。
+
+\subsection{定义}
+
+\begin{lstlisting}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EdgeId(pub(crate) HalfEdgeId);
+
+impl EdgeId {
+    pub fn halfedge(self) -> HalfEdgeId { self.0 }
+
+    pub fn vertices(&self, mesh: &MeshStorage)
+        -> Option<(VertexId, VertexId)>
+    {
+        let he = mesh.get_halfedge(self.0)?;
+        let dst = he.vertex;
+        let src = mesh.get_halfedge(he.twin?)?.vertex;
+        Some((src, dst))
+    }
+}
+\end{lstlisting}
+
+\subsection{规范代表元}
+
+twin 对 $\{h, h^\star\}$ 中，取 slotmap key 较小者作为「规范半边」，
+\texttt{EdgeId} 包装此规范半边。对于边界边（$h^\star = \texttt{None}$），
+直接使用 $h$ 自身作为代表。这保证：
+
+\begin{itemize}
+  \item 同一条无向边对应\textbf{唯一}的 \texttt{EdgeId}；
+  \item \texttt{EdgeId} 可作为 \texttt{HashMap} / \texttt{HashSet} 的键
+        （\texttt{Hash + Eq}）；
+  \item 通过 \texttt{halfedge()} 取出 \texttt{HalfEdgeId} 后即可参与
+        存储层 CRUD。
+\end{itemize}
+
+\subsection{与 slotmap Key 的区别}
+
+\texttt{VertexId}、\texttt{HalfEdgeId}、\texttt{FaceId} 都是 slotmap 的
+\texttt{Key}，可直接用于 \texttt{SlotMap::get / insert / remove}。
+\texttt{EdgeId} \textbf{不是} slotmap 的 Key：它不索引任何槽位，
+只是 \texttt{HalfEdgeId} 的语义包装。对 \texttt{EdgeId} 调用
+\texttt{mesh.get\_halfedge(edge.halfedge())} 才能取回半边数据。
+
+\section{单元测试}
+
+\begin{lstlisting}
+#[test]
+fn ids_are_copy_and_defaultable() {
+    let v: VertexId    = VertexId::default();
+    let h: HalfEdgeId  = HalfEdgeId::default();
+    let f: FaceId      = FaceId::default();
+
+    let v2 = v; // Copy 语义，无需 clone
+    assert_eq!(v, v2);
+    assert!(v <= v2); // Ord
+}
+
+#[test]
+fn ids_have_distinct_types() {
+    // 取消下面任一行的注释会编译失败
+    // let _: VertexId = HalfEdgeId::default();
+    let _v: VertexId   = VertexId::default();
+    let _h: HalfEdgeId = HalfEdgeId::default();
+    let _f: FaceId     = FaceId::default();
+}
+\end{lstlisting}
+
+两个测试分别覆盖了「trait 行为正确」与「类型不可互换」两点。
+
+\section{与 \texttt{storage.rs} 的衔接}
+
+本模块产出的三种 Id 类型直接作为 \texttt{SlotMap} 的键：
+
+\[
+\texttt{SlotMap<VertexId, Vertex>},\quad
+\texttt{SlotMap<HalfEdgeId, HalfEdge>},\quad
+\texttt{SlotMap<FaceId, Face>}.
+\]
+
+也就是说，\texttt{VertexId} 同时承担「用户面 ID」与「slotmap Key」双重身份，
+不需要再额外包一层 newtype，存储层的 \texttt{VertexKey} 概念即由 \texttt{VertexId} 实现。
+
+\end{document}
