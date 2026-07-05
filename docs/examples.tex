@@ -56,8 +56,9 @@
 
 \section{示例总览}
 
-\texttt{examples/} 目录下提供 14 个独立可运行的示例，按功能划分，每个示例聚焦一个模块的核心用法。
-所有示例通过 \texttt{cargo run --example <name>} 运行，无需额外依赖。
+\texttt{examples/} 目录下提供 15 个独立可运行的示例，按功能划分，每个示例聚焦一个模块的核心用法。
+前 14 个示例为纯文本输出，无需额外依赖；第 15 个 \texttt{engvis\_viewer} 为 GPU 交互式 3D 可视化示例，依赖 \texttt{engvis-renderer}（已声明为 \texttt{dev-dependency}）。
+所有示例通过 \texttt{cargo run --example <name>} 运行。
 
 \begin{center}
 \renewcommand{\arraystretch}{1.18}
@@ -79,6 +80,7 @@
   \texttt{validate}                  & \texttt{validate}   & 拓扑自检：干净通过 + 破坏检测 & \texttt{cargo run --example validate} \\
   \texttt{export\_wgpu}              & \texttt{export}     & 导出 wgpu 顶点/索引缓冲       & \texttt{cargo run --example export\_wgpu} \\
   \texttt{icosphere}                 & \texttt{test\_util} & icosphere 生成与性质验证     & \texttt{cargo run --example icosphere} \\
+  \texttt{engvis\_viewer}            & \texttt{可视化}     & engvis-renderer 交互式 3D 可视化 & \texttt{cargo run --example engvis\_viewer} \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -93,7 +95,9 @@
   foundation/.style={base, fill=blue!10},
   builder/.style={base, fill=green!12},
   consumer/.style={base, fill=yellow!18},
-  op/.style={-Stealth, thick, draw=gray!60!black}
+  viewer/.style={base, fill=red!15, draw=red!50!black},
+  op/.style={-Stealth, thick, draw=gray!60!black},
+  opview/.style={-Stealth, thick, draw=red!60!black, dashed}
 ]
   % 基础层
   \node[foundation] (storage) {\texttt{storage\_basic}};
@@ -117,6 +121,9 @@
   \node[consumer, left=of prop] (val) {\texttt{validate}};
   \node[consumer, left=of val] (exp) {\texttt{export\_wgpu}};
 
+  % 可视化层
+  \node[viewer, below=1.0cm of loop] (viewer) {\texttt{engvis\_viewer}};
+
   % 依赖箭头
   \draw[op] (storage) -- (build);
   \draw[op] (build) -- (topo);
@@ -132,11 +139,20 @@
   \draw[op] (traversal) -- (geo);
   \draw[op] (traversal) -- (prop);
 
+  % 可视化示例依赖（虚线表示聚合多个模块）
+  \draw[opview] (ico) -- (viewer);
+  \draw[opview] (loop) -- (viewer);
+  \draw[opview] (topo) -- (viewer);
+  \draw[opview] (extrude) -- (viewer);
+  \draw[opview] (lap) -- (viewer);
+  \draw[opview] (exp) -- (viewer);
+
   % 图例
-  \node[font=\footnotesize, below=0.5cm of exp, align=left] (legend)
+  \node[font=\footnotesize, below=0.4cm of viewer, align=left] (legend)
     {{\color{blue!60!black}$\blacksquare$} 基础层 \quad
      {\color{green!50!black}$\blacksquare$} 构建层 \quad
-     {\color{yellow!60!black}$\blacksquare$} 消费层};
+     {\color{yellow!60!black}$\blacksquare$} 消费层 \quad
+     {\color{red!50!black}$\blacksquare$} 可视化层};
 \end{tikzpicture}
 }
 \end{center}
@@ -304,6 +320,113 @@
   \item Euler 公式 $V - E + F = 2$ 成立。
 \end{itemize}
 
+\subsection{engvis\_viewer：engvis-renderer 交互式 3D 可视化}
+
+前 14 个示例均通过 \texttt{println!} 输出文本结果，缺乏直观的几何观察。
+\texttt{engvis\_viewer} 借助 \texttt{engvis-renderer}（基于 \texttt{wgpu 27} / \texttt{egui 0.33} / \texttt{winit 0.30}）
+提供 GPU 加速的 3D 交互式可视化，将 halfedge 的网格操作结果直接渲染为可旋转、可缩放的立体图形。
+
+\paragraph{依赖声明}
+\texttt{engvis-renderer} 仅作为 \texttt{dev-dependency} 引入，不影响发布到 crates.io 的库本身：
+
+\begin{lstlisting}
+[dev-dependencies]
+egui             = "0.33"
+engvis-core      = "0.1"
+engvis-renderer  = "0.1"
+winit            = "0.30"
+\end{lstlisting}
+
+\paragraph{支持的 5 种操作}
+\texttt{engvis\_viewer} 通过命令行参数或 UI 面板切换 5 种网格操作，覆盖 halfedge 主要模块：
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}llp{6.5cm}@{}}
+  \toprule
+  \textbf{操作} & \textbf{命令行} & \textbf{调用模块} \\
+  \midrule
+  Icosphere 生成     & \texttt{icosphere [n]}                  & \texttt{test\_util::build\_icosphere} \\
+  曲面细分           & \texttt{subdivision <loop|cc|sqrt3> n}  & \texttt{subdiv::\{loop,catmull\_clark,sqrt3\}\_subdivide} \\
+  面挤出             & \texttt{extrude}                        & \texttt{primitives::build\_cube} + \texttt{topology\_ops::extrude\_face} \\
+  Laplacian 平滑     & \texttt{smooth [iters]}                 & \texttt{primitives::build\_uv\_sphere} + \texttt{geometry::laplacian\_smooth\_mesh} \\
+  拓扑操作           & \texttt{topology <split|flip|collapse>} & \texttt{topology\_ops::\{split,flip,collapse\}\_edge} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{halfedge $\to$ engvis 转换}
+halfedge 的 \texttt{MeshStorage} 与 engvis 的 GPU \texttt{Mesh} 之间通过
+\texttt{mesh\_to\_vertex\_index\_buffers} 桥接，输出与 wgpu 兼容的
+\texttt{(Vec<[f32;3]>, Vec<u32>)}，再由 \texttt{Mesh::from\_triangles}
+自动去重、修复绕向、计算平滑法向：
+\[
+\text{MeshStorage} \xrightarrow{\texttt{mesh\_to\_vertex\_index\_buffers}} (\mathbf{V}, \mathbf{I}) \xrightarrow{\texttt{from\_triangles}} \text{engvis Mesh}
+\]
+
+\paragraph{渲染流水线}
+\texttt{EngvisApp} trait 提供声明式生命周期，viewer 在各阶段完成不同任务：
+
+\begin{center}
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=0.5cm and 0.6cm,
+  blk/.style={draw, rounded corners=2pt, minimum width=2.4cm, minimum height=0.8cm, align=center, font=\footnotesize},
+  start/.style={blk, fill=blue!10},
+  lifecycle/.style={blk, fill=green!12},
+  op/.style={-Stealth, thick, draw=gray!60!black},
+  fb/.style={-Stealth, thick, draw=red!60!black, dashed}
+]
+  \node[start] (args) {命令行参数 \\ \texttt{from\_args}};
+  \node[lifecycle, right=of args] (config) {\texttt{config()} \\ 窗口标题/尺寸};
+  \node[lifecycle, right=of config] (setup) {\texttt{on\_setup()} \\ 生成 mesh};
+  \node[lifecycle, right=of setup] (ready) {\texttt{on\_ready()} \\ 相机自适应};
+  \node[lifecycle, right=of ready] (loop_start) {事件循环};
+
+  \node[blk, below=0.6cm of setup, fill=yellow!18] (ui) {\texttt{ui()} \\ SidePanel 控件};
+  \node[blk, right=of ui, fill=yellow!18] (frame) {\texttt{on\_frame()} \\ 重建脏网格};
+  \node[blk, right=of frame, fill=red!15] (render) {wgpu 渲染 \\ PBR + 线框};
+
+  \draw[op] (args) -- (config);
+  \draw[op] (config) -- (setup);
+  \draw[op] (setup) -- (ready);
+  \draw[op] (ready) -- (loop_start);
+  \draw[op] (loop_start) |- (ui);
+  \draw[op] (ui) -- (frame);
+  \draw[op] (frame) -- (render);
+  \draw[fb] (render.north) -- ++(0,0.4) -| (loop_start.north)
+    node[midway, above, font=\scriptsize, text=red!60!black] {下一帧};
+\end{tikzpicture}
+}
+\end{center}
+
+\paragraph{UI 控件}
+右侧 \texttt{egui::SidePanel} 提供以下交互：
+
+\begin{itemize}
+  \item \textbf{操作类型}：5 个 \texttt{selectable\_label} 单选切换；
+  \item \textbf{参数调整}：\texttt{Slider}（细分次数 $n \in [0,4]$、平滑迭代 $\in [0,50]$）、
+        \texttt{ComboBox}（细分类型、拓扑操作）；
+  \item \textbf{网格统计}：实时显示 $V$、$E$、$F$ 与 Euler 示性数 $V - E + F$；
+  \item \textbf{渲染选项}：曲面/网格地面/线框/顶点四个开关，
+        分别绑定 \texttt{RenderState} 的 \texttt{show\_surface} / \texttt{show\_grid} /
+        \texttt{edge\_opts.enabled} / \texttt{vertex\_opts.enabled}。
+\end{itemize}
+
+\paragraph{脏标记重建}
+为避免每帧重建网格造成卡顿，采用 \texttt{dirty} 标记：
+UI 修改参数时置 \texttt{dirty = true}，\texttt{on\_frame} 检测到脏位才重新调用
+\texttt{generate\_mesh} 并替换场景中的第一个 mesh，重置 \texttt{scene\_dirty} 触发 GPU 上传。
+
+\paragraph{关键点}
+\begin{itemize}
+  \item 5 种操作覆盖 \texttt{test\_util} / \texttt{subdiv} / \texttt{topology\_ops} / \texttt{geometry} / \texttt{primitives} / \texttt{export} 六大模块；
+  \item \texttt{Mesh::from\_triangles} 自动完成顶点去重、绕向修复、平滑法向计算；
+  \item 借用检查器冲突通过先收集 \texttt{face\_ids} / \texttt{halfedge\_ids} 到 \texttt{Vec} 再消费的模式解决；
+  \item 窗口标题随操作类型动态变化（\texttt{format!("halfedge viewer — \{\}", self.operation.label())}）；
+  \item 相机 \texttt{fit\_to\_scene} 在 \texttt{on\_ready} 阶段自适应场景包围盒。
+\end{itemize}
+
 \section{运行方式}
 
 \subsection{运行单个示例}
@@ -325,16 +448,45 @@ cargo build --examples
 cargo run --example  # 按 Tab 自动补全
 \end{lstlisting}
 
+\subsection{运行 engvis\_viewer 可视化示例}
+
+\texttt{engvis\_viewer} 接受一个可选的子命令参数指定初始操作，未传时默认 \texttt{icosphere 1}：
+
+\begin{lstlisting}
+# 默认：1 级 icosphere
+cargo run --example engvis_viewer
+
+# 2 级 icosphere
+cargo run --example engvis_viewer -- icosphere 2
+
+# Loop 细分 2 次（也支持 cc / catmull_clark / sqrt3）
+cargo run --example engvis_viewer -- subdivision loop 2
+
+# 挤压 cube 顶面 (+Y 方向)
+cargo run --example engvis_viewer -- extrude
+
+# Laplacian 平滑 10 次
+cargo run --example engvis_viewer -- smooth 10
+
+# 拓扑操作（split / flip / collapse）
+cargo run --example engvis_viewer -- topology split
+\end{lstlisting}
+
+启动后窗口右侧 UI 面板可实时切换 5 种操作与参数，无需重启程序。
+
 \section{示例设计原则}
 
 \begin{enumerate}
   \item \textbf{自包含}：每个示例独立可运行，不依赖其他示例；
   \item \textbf{聚焦单一功能}：每个示例只演示一个模块的核心 API；
-  \item \textbf{可观测输出}：所有示例用 \texttt{println!} 打印关键数据，便于直观验证；
+  \item \textbf{可观测输出}：前 14 个示例用 \texttt{println!} 打印关键数据，便于直观验证；
   \item \textbf{使用真实网格}：大多数示例以 \texttt{build\_icosphere} 作为测试网格，
         保证拓扑合法、几何有意义；
   \item \textbf{包含错误处理}：\texttt{topology\_ops} 与 \texttt{validate} 示例
-        演示了错误路径（翻转边界边、检测破坏）。
+        演示了错误路径（翻转边界边、检测破坏）；
+  \item \textbf{可视化增强}：\texttt{engvis\_viewer} 借助 \texttt{engvis-renderer}
+        提供 GPU 加速 3D 交互式可视化，将文本输出升级为可旋转、可缩放的立体图形，
+        实时切换 5 种网格操作与参数。
 \end{enumerate}
 
 \section{典型输出示例}
@@ -424,6 +576,43 @@ vertex_prop_type_count = 4
   vVertexId(1v1) exists=true, weight=Some(1.0)
 删除后：
   vVertexId(1v1) exists=false, weight=None
+\end{lstlisting}
+
+\subsection{engvis\_viewer 输出片段}
+
+启动时控制台打印操作类型与提示，剩余信息显示在窗口右侧 UI 面板：
+
+\begin{lstlisting}
+=== halfedge engvis viewer ===
+操作: Icosphere (n=1)
+提示: 在窗口右侧 UI 面板实时切换操作与参数
+\end{lstlisting}
+
+UI 面板中的网格统计区会实时显示当前网格的拓扑量（随操作参数变化）：
+
+\begin{lstlisting}
+halfedge viewer
+---------------
+操作类型
+[ ] icosphere
+[ ] subdivision
+[ ] extrude face
+[ ] smooth
+[*] topology
+
+网格统计
+顶点 V = 12
+边   E = 30
+面   F = 20
+Euler V-E+F = 2
+
+渲染选项
+[x] 显示曲面
+[ ] 显示网格
+[x] 显示线框
+[ ] 显示顶点
+
+FPS: 60.0
 \end{lstlisting}
 
 \end{document}
