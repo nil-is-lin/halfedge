@@ -2,6 +2,7 @@
 name = "halfedge"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 authors = ["nil-is-lin <nil.is.lin@gmail.com>"]
 description = "A half-edge mesh data structure library for Rust: traversal, topology operations, geometry, subdivision, decimation, parameterization, geodesics, deformation, boolean operations, and more."
 license = "MIT OR Apache-2.0"
@@ -13,10 +14,16 @@ keywords = ["half-edge", "mesh", "geometry", "3d", "graphics"]
 categories = ["data-structures", "graphics", "mathematics"]
 exclude = [
     "/docs",
-    "/examples",
-    "/benches",
+    "/book",
     "/target",
     "/.github",
+    "/.workbuddy",
+    "/.codeartsdoer",
+    "/.arts",
+    "halfedge_comparison.md",
+    "project_shortcomings_analysis.md",
+    "shortcomings_progress_review.md",
+    "overview.md",
 ]
 
 [dependencies]
@@ -24,13 +31,29 @@ slotmap = "1.0"
 sprs = "0.11"
 rayon = "1"
 robust = "1.2"
+log = "0.4"
+serde = { version = "1", features = ["derive"], optional = true }
+# Optional: exact arithmetic kernel (Rational64) for construction operations
+num-rational = { version = "0.4", optional = true }
+# Optional: interactive 3D viewer example (enables `engvis_viewer`)
+engvis-core = { version = "0.1", optional = true }
+engvis-renderer = { version = "0.1", optional = true }
+egui = { version = "0.33", optional = true }
+winit = { version = "0.30", optional = true }
+# Matches engvis-core's glam so the dependency is unified (single version in tree).
+glam = { version = "0.30", optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "slotmap/serde"]
+viewer = ["dep:engvis-core", "dep:engvis-renderer", "dep:egui", "dep:winit", "dep:glam"]
+# Experimental: exact arithmetic via Rational64. See Roadmap (P1). Not yet wired
+# into the geometry kernel — currently exposes `ExactScalar` for early adopters.
+exact = ["dep:num-rational"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-egui = "0.33"
-engvis-core = "0.1"
-engvis-renderer = "0.1"
-winit = "0.30"
+serde_json = "1"
 
 [[bench]]
 name = "traversal"
@@ -47,3 +70,7 @@ harness = false
 [[bench]]
 name = "geometry_algs"
 harness = false
+
+[[example]]
+name = "engvis_viewer"
+required-features = ["viewer"]

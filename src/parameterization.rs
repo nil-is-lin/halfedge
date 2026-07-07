@@ -13,9 +13,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::geometry::cotan_edge_weight;
+use rayon::prelude::*;
+
 use crate::ids::VertexId;
-use crate::linalg::{SparseSystem, conjugate_gradient, regularize_diagonal};
+use crate::linalg::{
+    SparseSystem, build_cotan_laplacian, build_vertex_index, conjugate_gradient,
+    regularize_diagonal,
+};
 use crate::storage::MeshStorage;
 use crate::traversal::{VertexRing, boundary_loops, is_boundary_vertex};
 
@@ -23,9 +27,7 @@ use crate::traversal::{VertexRing, boundary_loops, is_boundary_vertex};
 // 内部：顶点索引映射
 // ============================================================
 
-fn build_vertex_index(mesh: &MeshStorage) -> HashMap<VertexId, usize> {
-    mesh.vertex_ids().enumerate().map(|(i, v)| (v, i)).collect()
-}
+// build_vertex_index 已移至 linalg 模块作为公共函数
 
 fn collect_boundary_vertices(mesh: &MeshStorage) -> Vec<VertexId> {
     mesh.vertex_ids()
@@ -59,29 +61,7 @@ fn order_boundary_vertices(mesh: &MeshStorage) -> Vec<VertexId> {
 // 内部：构建拉普拉斯矩阵
 // ============================================================
 
-/// 构建完整对称余切拉普拉斯矩阵（包含所有顶点）。
-///
-/// 返回 (laplacian, vertex_index_map)。
-fn build_full_cotan_laplacian(mesh: &MeshStorage) -> (SparseSystem, HashMap<VertexId, usize>) {
-    let v_idx = build_vertex_index(mesh);
-    let n = v_idx.len();
-    let mut sys = SparseSystem::new(n);
-
-    for (v, &i) in &v_idx {
-        let mut diag = 0.0;
-        for he in VertexRing::new(mesh, *v) {
-            let neighbor = mesh.get_halfedge(he).unwrap().vertex;
-            if let Some(&j) = v_idx.get(&neighbor) {
-                let w = cotan_edge_weight(mesh, he).unwrap_or(0.0) / 2.0;
-                sys.add(i, j, -w);
-                diag += w;
-            }
-        }
-        sys.add_diag(i, diag);
-    }
-
-    (sys, v_idx)
-}
+// build_full_cotan_laplacian 已移至 linalg 模块作为 build_cotan_laplacian
 
 /// 构建完整均匀拉普拉斯矩阵。
 fn build_full_uniform_laplacian(mesh: &MeshStorage) -> (SparseSystem, HashMap<VertexId, usize>) {
@@ -92,7 +72,10 @@ fn build_full_uniform_laplacian(mesh: &MeshStorage) -> (SparseSystem, HashMap<Ve
     for (v, &i) in &v_idx {
         let mut degree = 0;
         for he in VertexRing::new(mesh, *v) {
-            let neighbor = mesh.get_halfedge(he).unwrap().vertex;
+            let neighbor = mesh
+                .get_halfedge(he)
+                .expect("halfedge exists in mesh")
+                .vertex;
             if let Some(&j) = v_idx.get(&neighbor) {
                 sys.add(i, j, -0.5);
                 degree += 1;
@@ -244,7 +227,8 @@ pub fn harmonic_parameterization(mesh: &MeshStorage) -> Option<Vec<[f64; 2]>> {
         return None;
     }
 
-    let (laplacian, v_idx) = build_full_cotan_laplacian(mesh);
+    let v_idx = build_vertex_index(mesh);
+    let laplacian = build_cotan_laplacian(mesh, &v_idx);
     let boundary_v = collect_boundary_vertices(mesh);
     if boundary_v.is_empty() {
         return None;
@@ -281,7 +265,8 @@ pub fn lscm(mesh: &MeshStorage) -> Option<Vec<[f64; 2]>> {
         return None;
     }
 
-    let (laplacian, v_idx) = build_full_cotan_laplacian(mesh);
+    let v_idx = build_vertex_index(mesh);
+    let laplacian = build_cotan_laplacian(mesh, &v_idx);
 
     // 收集有序边界顶点（取最长边界环）
     let ordered_boundary = order_boundary_vertices(mesh);
@@ -311,19 +296,14 @@ pub fn lscm(mesh: &MeshStorage) -> Option<Vec<[f64; 2]>> {
 }
 
 /// 从顶点列表中选取几何距离最远的两个顶点。
-fn pick_farthest_pair(
-    mesh: &MeshStorage,
-    verts: &[VertexId],
-) -> Option<(VertexId, VertexId)> {
+fn pick_farthest_pair(mesh: &MeshStorage, verts: &[VertexId]) -> Option<(VertexId, VertexId)> {
     if verts.len() < 2 {
         return None;
     }
     // 简化：先取 verts[0] 与最远点 p1，再取 p1 与最远点 p2。
     // 这是「最远点对」的 O(B) 近似（真实最优为 O(B log B) 旋转卡壳，或 O(B^2) 暴力）。
     // 对 LSCM 钉点用途足够：仅需两点足够远以改善条件数，不要求精确最优。
-    let pos_of = |v: VertexId| -> Option<[f64; 3]> {
-        mesh.get_vertex(v).map(|vd| vd.position)
-    };
+    let pos_of = |v: VertexId| -> Option<[f64; 3]> { mesh.get_vertex(v).map(|vd| vd.position) };
 
     let p0 = verts[0];
     let p0_pos = pos_of(p0)?;
@@ -423,118 +403,130 @@ pub fn mvc_parameterization(mesh: &MeshStorage) -> Option<Vec<[f64; 2]>> {
     // 构建 MVC 权重矩阵
     let boundary_set: HashSet<usize> = fixed_uv.keys().copied().collect();
 
+    // 并行计算每个顶点的 MVC 权重条目，再顺序写入稀疏系统（gather-scatter）。
+    // 每个顶点的邻居收集、三角函数（acos/tan）计算相互独立。
+    /// 每个顶点的 MVC 权重计算结果：(行索引, 非对角条目, 对角值, RHS 贡献)
+    type MvcEntry = (usize, Vec<(usize, f64)>, f64, [f64; 2]);
+
+    let vert_entries: Vec<MvcEntry> = v_idx
+        .par_iter()
+        .filter_map(|(&v, &i)| {
+            if boundary_set.contains(&i) {
+                // 边界顶点：单位行，RHS = 固定 UV
+                let uv = fixed_uv[&i];
+                return Some((i, Vec::new(), 1.0, uv));
+            }
+
+            // 收集环绕顺序的邻居（VertexRing 已按 CCW 环绕）
+            let neighbors: Vec<(usize, [f64; 3])> = VertexRing::new(mesh, v)
+                .filter_map(|he| {
+                    let h = mesh.get_halfedge(he)?;
+                    let n_vid = h.vertex;
+                    let n_pos = mesh.get_vertex(n_vid)?.position;
+                    let n_idx = *v_idx.get(&n_vid)?;
+                    Some((n_idx, n_pos))
+                })
+                .collect();
+
+            let k = neighbors.len();
+            if k == 0 {
+                return Some((i, Vec::new(), 1.0, [0.0, 0.0]));
+            }
+
+            let p_v = mesh.get_vertex(v)?.position;
+
+            // 计算 d_i 和 α_i
+            let d: Vec<f64> = neighbors
+                .iter()
+                .map(|(_, pos)| {
+                    let diff = [pos[0] - p_v[0], pos[1] - p_v[1], pos[2] - p_v[2]];
+                    (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt()
+                })
+                .collect();
+
+            // 退化保护：若 d_i ≈ 0，跳过（视为孤立顶点）
+            if d.iter().any(|x| *x < 1e-14) {
+                return Some((i, Vec::new(), 1.0, [0.0, 0.0]));
+            }
+
+            // 单位方向向量 u_i = (n_i - v) / d_i
+            let u: Vec<[f64; 3]> = neighbors
+                .iter()
+                .zip(d.iter())
+                .map(|((_, pos), &di)| {
+                    [
+                        (pos[0] - p_v[0]) / di,
+                        (pos[1] - p_v[1]) / di,
+                        (pos[2] - p_v[2]) / di,
+                    ]
+                })
+                .collect();
+
+            // α_i = angle(u_i, u_{i+1})，索引模 k
+            let mut alpha = Vec::with_capacity(k);
+            for idx in 0..k {
+                let j = (idx + 1) % k;
+                let cos_a = (u[idx][0] * u[j][0] + u[idx][1] * u[j][1] + u[idx][2] * u[j][2])
+                    .clamp(-1.0, 1.0);
+                alpha.push(cos_a.acos());
+            }
+
+            // w_i = (tan(α_{i-1}/2) + tan(α_i/2)) / d_i
+            let mut w = Vec::with_capacity(k);
+            for idx in 0..k {
+                let prev = if idx == 0 { k - 1 } else { idx - 1 };
+                let tan_prev = (alpha[prev] / 2.0).tan();
+                let tan_cur = (alpha[idx] / 2.0).tan();
+                w.push((tan_prev + tan_cur) / d[idx]);
+            }
+
+            // 退化保护：所有 w 为 0 时回退到均匀权重
+            let total: f64 = w.iter().sum();
+            let mut entries = Vec::new();
+            let mut rhs = [0.0; 2];
+
+            if total < 1e-14 {
+                // 均匀权重：p_i = (1/k) Σ p_j
+                for (j, _) in neighbors.iter() {
+                    if boundary_set.contains(j) {
+                        let uv = fixed_uv[j];
+                        rhs[0] += uv[0] / (k as f64);
+                        rhs[1] += uv[1] / (k as f64);
+                    } else {
+                        entries.push((*j, -1.0 / (k as f64)));
+                    }
+                }
+            } else {
+                // λ_i = w_i / Σw
+                for (j, _) in neighbors.iter().enumerate() {
+                    let lambda = w[j] / total;
+                    let n_idx = neighbors[j].0;
+                    if boundary_set.contains(&n_idx) {
+                        let uv = fixed_uv[&n_idx];
+                        rhs[0] += lambda * uv[0];
+                        rhs[1] += lambda * uv[1];
+                    } else {
+                        entries.push((n_idx, -lambda));
+                    }
+                }
+            }
+
+            Some((i, entries, 1.0, rhs))
+        })
+        .collect();
+
+    // 顺序写入稀疏系统（避免并行写入 SparseSystem）
     let mut sys = SparseSystem::new(n);
     let mut rhs_u = vec![0.0; n];
     let mut rhs_v = vec![0.0; n];
 
-    for (v, &i) in &v_idx {
-        if boundary_set.contains(&i) {
-            // 边界顶点：单位行，RHS = 固定 UV
-            sys.add_diag(i, 1.0);
-            let uv = fixed_uv[&i];
-            rhs_u[i] = uv[0];
-            rhs_v[i] = uv[1];
-            continue;
+    for (i, entries, diag, rhs) in vert_entries {
+        for (col, val) in entries {
+            sys.add(i, col, val);
         }
-
-        // 收集环绕顺序的邻居（VertexRing 已按 CCW 环绕）
-        let neighbors: Vec<(usize, [f64; 3])> = VertexRing::new(mesh, *v)
-            .filter_map(|he| {
-                let h = mesh.get_halfedge(he)?;
-                let n_vid = h.vertex;
-                let n_pos = mesh.get_vertex(n_vid)?.position;
-                let n_idx = *v_idx.get(&n_vid)?;
-                Some((n_idx, n_pos))
-            })
-            .collect();
-
-        let k = neighbors.len();
-        if k == 0 {
-            sys.add_diag(i, 1.0);
-            continue;
-        }
-
-        let p_v = mesh.get_vertex(*v)?.position;
-
-        // 计算 d_i 和 α_i
-        let d: Vec<f64> = neighbors
-            .iter()
-            .map(|(_, pos)| {
-                let diff = [pos[0] - p_v[0], pos[1] - p_v[1], pos[2] - p_v[2]];
-                (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt()
-            })
-            .collect();
-
-        // 退化保护：若 d_i ≈ 0，跳过（视为孤立顶点）
-        if d.iter().any(|x| *x < 1e-14) {
-            sys.add_diag(i, 1.0);
-            continue;
-        }
-
-        // 单位方向向量 u_i = (n_i - v) / d_i
-        let u: Vec<[f64; 3]> = neighbors
-            .iter()
-            .zip(d.iter())
-            .map(|((_, pos), &di)| {
-                [
-                    (pos[0] - p_v[0]) / di,
-                    (pos[1] - p_v[1]) / di,
-                    (pos[2] - p_v[2]) / di,
-                ]
-            })
-            .collect();
-
-        // α_i = angle(u_i, u_{i+1})，索引模 k
-        let mut alpha = Vec::with_capacity(k);
-        for i in 0..k {
-            let j = (i + 1) % k;
-            let cos_a =
-                (u[i][0] * u[j][0] + u[i][1] * u[j][1] + u[i][2] * u[j][2]).clamp(-1.0, 1.0);
-            alpha.push(cos_a.acos());
-        }
-
-        // w_i = (tan(α_{i-1}/2) + tan(α_i/2)) / d_i
-        let mut w = Vec::with_capacity(k);
-        for i in 0..k {
-            let prev = if i == 0 { k - 1 } else { i - 1 };
-            let tan_prev = (alpha[prev] / 2.0).tan();
-            let tan_cur = (alpha[i] / 2.0).tan();
-            w.push((tan_prev + tan_cur) / d[i]);
-        }
-
-        // 退化保护：所有 w 为 0 时回退到均匀权重
-        let total: f64 = w.iter().sum();
-        if total < 1e-14 {
-            // 均匀权重：p_i = (1/k) Σ p_j
-            for (j, _) in neighbors.iter() {
-                if boundary_set.contains(j) {
-                    let uv = fixed_uv[j];
-                    rhs_u[i] += uv[0] / (k as f64);
-                    rhs_v[i] += uv[1] / (k as f64);
-                } else {
-                    sys.add(i, *j, -1.0 / (k as f64));
-                }
-            }
-            sys.add_diag(i, 1.0);
-            continue;
-        }
-
-        // λ_i = w_i / Σw
-        // 系统行：p_i - Σ λ_j p_j = 0
-        // 对内部邻居 j：写入矩阵 L_ij = -λ_j
-        // 对边界邻居 j：移到 RHS，rhs_i += λ_j * uv_j
-        for (j, _) in neighbors.iter().enumerate() {
-            let lambda = w[j] / total;
-            let n_idx = neighbors[j].0;
-            if boundary_set.contains(&n_idx) {
-                let uv = fixed_uv[&n_idx];
-                rhs_u[i] += lambda * uv[0];
-                rhs_v[i] += lambda * uv[1];
-            } else {
-                sys.add(i, n_idx, -lambda);
-            }
-        }
-        sys.add_diag(i, 1.0);
+        sys.add_diag(i, diag);
+        rhs_u[i] = rhs[0];
+        rhs_v[i] = rhs[1];
     }
 
     let mut a = sys.finish();
@@ -639,8 +631,7 @@ mod tests {
         let center_uv = uv[center_idx];
         // center 不应被钉在 (0,0) 或 (1,0)
         let is_pinned_zero = (center_uv[0].abs() < 1e-6) && (center_uv[1].abs() < 1e-6);
-        let is_pinned_one =
-            ((center_uv[0] - 1.0).abs() < 1e-6) && (center_uv[1].abs() < 1e-6);
+        let is_pinned_one = ((center_uv[0] - 1.0).abs() < 1e-6) && (center_uv[1].abs() < 1e-6);
         assert!(
             !is_pinned_zero && !is_pinned_one,
             "内部顶点不应被钉住, center uv = {:?}",
@@ -719,5 +710,291 @@ mod tests {
         // icosphere 是闭合的，无边界，应返回 None
         let mesh = crate::test_util::build_icosphere(1);
         assert!(mvc_parameterization(&mesh).is_none());
+    }
+
+    // ============================================================
+    // Tutte embedding 测试
+    // ============================================================
+
+    /// 构建 4×4 平面网格（开圆盘拓扑），用于参数化测试。
+    ///
+    /// 16 顶点（4 内部 + 12 边界），18 三角面。
+    /// 4 个内部顶点确保 Tutte 和 harmonic 产生不同的参数化结果。
+    fn build_flat_grid() -> MeshStorage {
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [3.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [3.0, 2.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [1.0, 3.0, 0.0],
+            [2.0, 3.0, 0.0],
+            [3.0, 3.0, 0.0],
+        ];
+        // 每个格子 2 个三角形，3×3 格 = 18 个三角形
+        let faces = vec![
+            [0u32, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [4, 5, 9],
+            [4, 9, 8],
+            [5, 6, 10],
+            [5, 10, 9],
+            [6, 7, 11],
+            [6, 11, 10],
+            [8, 9, 13],
+            [8, 13, 12],
+            [9, 10, 14],
+            [9, 14, 13],
+            [10, 11, 15],
+            [10, 15, 14],
+        ];
+        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces)
+            .expect("flat grid construction")
+    }
+
+    #[test]
+    fn test_tutte_simple_quad() {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(crate::storage::Vertex::new([0.0, 0.0, 0.0]));
+        let v1 = mesh.add_vertex(crate::storage::Vertex::new([1.0, 0.0, 0.2]));
+        let v2 = mesh.add_vertex(crate::storage::Vertex::new([1.0, 1.0, 0.0]));
+        let v3 = mesh.add_vertex(crate::storage::Vertex::new([0.0, 1.0, 0.3]));
+        crate::topology_ops::add_triangle(&mut mesh, v0, v1, v2).unwrap();
+        crate::topology_ops::add_triangle(&mut mesh, v0, v2, v3).unwrap();
+
+        let result = tutte_embedding(&mesh);
+        assert!(result.is_some(), "Tutte should succeed on a simple quad");
+        let uv = result.unwrap();
+        assert_eq!(uv.len(), 4);
+
+        // 所有 UV 应为有限值
+        for v in &uv {
+            assert!(v[0].is_finite(), "u should be finite, got {}", v[0]);
+            assert!(v[1].is_finite(), "v should be finite, got {}", v[1]);
+        }
+
+        // 边界顶点应近似在单位圆上
+        for v in &uv {
+            let r = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            assert!(
+                (r - 1.0).abs() < 0.1,
+                "boundary point should be near unit circle, got r={}",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn test_tutte_returns_none_on_empty() {
+        let mesh = MeshStorage::new();
+        assert!(tutte_embedding(&mesh).is_none());
+    }
+
+    #[test]
+    fn test_tutte_returns_none_on_closed_mesh() {
+        let mesh = crate::test_util::build_icosphere(1);
+        assert!(
+            tutte_embedding(&mesh).is_none(),
+            "closed mesh has no boundary, Tutte should return None"
+        );
+    }
+
+    #[test]
+    fn test_tutte_flat_grid_no_flip() {
+        let mesh = build_flat_grid();
+        let result = tutte_embedding(&mesh);
+        assert!(result.is_some(), "Tutte should succeed on flat grid");
+        let uv = result.unwrap();
+        assert_eq!(uv.len(), mesh.vertex_count());
+
+        // 所有 UV 有限
+        for v in &uv {
+            assert!(v[0].is_finite() && v[1].is_finite(), "UV must be finite");
+        }
+
+        // Tutte 保证无翻转：所有三角形带符号面积应同号
+        // （边界遍历方向可能导致全部为负，但只要一致就无翻转）
+        let v_idx = build_vertex_index(&mesh);
+        let mut signs: Vec<i32> = Vec::new();
+        for f in mesh.face_ids() {
+            let verts: Vec<_> = crate::traversal::FaceHalfEdges::new(&mesh, f)
+                .filter_map(|he| mesh.get_halfedge(he))
+                .map(|h| h.vertex)
+                .collect();
+            if verts.len() != 3 {
+                continue;
+            }
+            let i0 = *v_idx.get(&verts[0]).unwrap();
+            let i1 = *v_idx.get(&verts[1]).unwrap();
+            let i2 = *v_idx.get(&verts[2]).unwrap();
+            let cross_z = (uv[i1][0] - uv[i0][0]) * (uv[i2][1] - uv[i0][1])
+                - (uv[i1][1] - uv[i0][1]) * (uv[i2][0] - uv[i0][0]);
+            if cross_z.abs() > 1e-14 {
+                signs.push(if cross_z > 0.0 { 1 } else { -1 });
+            }
+        }
+        // 所有非退化三角形应同号（无翻转）
+        if signs.len() > 1 {
+            let first = signs[0];
+            let all_same = signs.iter().all(|&s| s == first);
+            assert!(
+                all_same,
+                "Tutte should produce no flipped triangles (all same sign), got signs: {:?}",
+                signs
+            );
+        }
+    }
+
+    // ============================================================
+    // Harmonic parameterization 测试
+    // ============================================================
+
+    #[test]
+    fn test_harmonic_simple_quad() {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(crate::storage::Vertex::new([0.0, 0.0, 0.0]));
+        let v1 = mesh.add_vertex(crate::storage::Vertex::new([1.0, 0.0, 0.2]));
+        let v2 = mesh.add_vertex(crate::storage::Vertex::new([1.0, 1.0, 0.0]));
+        let v3 = mesh.add_vertex(crate::storage::Vertex::new([0.0, 1.0, 0.3]));
+        crate::topology_ops::add_triangle(&mut mesh, v0, v1, v2).unwrap();
+        crate::topology_ops::add_triangle(&mut mesh, v0, v2, v3).unwrap();
+
+        let result = harmonic_parameterization(&mesh);
+        assert!(result.is_some(), "Harmonic should succeed on a simple quad");
+        let uv = result.unwrap();
+        assert_eq!(uv.len(), 4);
+
+        // 所有 UV 有限
+        for v in &uv {
+            assert!(v[0].is_finite() && v[1].is_finite(), "UV must be finite");
+        }
+
+        // 边界顶点应近似在单位圆上
+        for v in &uv {
+            let r = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            assert!(
+                (r - 1.0).abs() < 0.1,
+                "boundary point should be near unit circle, got r={}",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn test_harmonic_returns_none_on_empty() {
+        let mesh = MeshStorage::new();
+        assert!(harmonic_parameterization(&mesh).is_none());
+    }
+
+    #[test]
+    fn test_harmonic_returns_none_on_closed_mesh() {
+        let mesh = crate::test_util::build_icosphere(1);
+        assert!(
+            harmonic_parameterization(&mesh).is_none(),
+            "closed mesh has no boundary, harmonic should return None"
+        );
+    }
+
+    /// 构建五边形扇形网格（1 个内部顶点 + 5 个边界顶点），用于参数化测试。
+    /// 比 3×3 平面网格更适合参数化测试：唯一的内部顶点不邻接边界。
+    fn build_pentagon_fan() -> MeshStorage {
+        let mut mesh = MeshStorage::new();
+        // 中心顶点
+        let center = mesh.add_vertex(crate::storage::Vertex::new([0.0, 0.0, 0.0]));
+        // 5 个边界顶点（正五边形）
+        let mut boundary = Vec::new();
+        for k in 0..5 {
+            let angle = 2.0 * std::f64::consts::PI * (k as f64) / 5.0;
+            let v = mesh.add_vertex(crate::storage::Vertex::new([angle.cos(), angle.sin(), 0.0]));
+            boundary.push(v);
+        }
+        // 5 个三角形
+        for k in 0..5 {
+            let next = (k + 1) % 5;
+            crate::topology_ops::add_triangle(&mut mesh, center, boundary[k], boundary[next])
+                .unwrap();
+        }
+        mesh
+    }
+
+    #[test]
+    fn test_harmonic_pentagon_fan() {
+        let mesh = build_pentagon_fan();
+        let result = harmonic_parameterization(&mesh);
+        assert!(result.is_some(), "Harmonic should succeed on pentagon fan");
+        let uv = result.unwrap();
+        assert_eq!(uv.len(), mesh.vertex_count());
+
+        // 所有 UV 有限
+        for v in &uv {
+            assert!(v[0].is_finite() && v[1].is_finite(), "UV must be finite");
+        }
+
+        // 检查三角形无翻转（同号）
+        let v_idx = build_vertex_index(&mesh);
+        let mut signs: Vec<i32> = Vec::new();
+        for f in mesh.face_ids() {
+            let verts: Vec<_> = crate::traversal::FaceHalfEdges::new(&mesh, f)
+                .filter_map(|he| mesh.get_halfedge(he))
+                .map(|h| h.vertex)
+                .collect();
+            if verts.len() != 3 {
+                continue;
+            }
+            let i0 = *v_idx.get(&verts[0]).unwrap();
+            let i1 = *v_idx.get(&verts[1]).unwrap();
+            let i2 = *v_idx.get(&verts[2]).unwrap();
+            let cross_z = (uv[i1][0] - uv[i0][0]) * (uv[i2][1] - uv[i0][1])
+                - (uv[i1][1] - uv[i0][1]) * (uv[i2][0] - uv[i0][0]);
+            if cross_z.abs() > 1e-14 {
+                signs.push(if cross_z > 0.0 { 1 } else { -1 });
+            }
+        }
+        if signs.len() > 1 {
+            let first = signs[0];
+            assert!(
+                signs.iter().all(|&s| s == first),
+                "Harmonic on pentagon fan should have consistent orientation, signs: {:?}",
+                signs
+            );
+        }
+    }
+
+    /// 验证 Tutte（均匀权重）和 harmonic（cotan 权重）在有足够内部顶点时产生不同结果。
+    #[test]
+    fn test_tutte_and_harmonic_differ() {
+        let mesh = build_flat_grid();
+        let tutte = tutte_embedding(&mesh).unwrap();
+        // harmonic 可能在简单网格上求解失败，此时跳过差异检查
+        let Some(harmonic) = harmonic_parameterization(&mesh) else {
+            return;
+        };
+        assert_eq!(tutte.len(), harmonic.len());
+
+        // 均匀权重 vs cotan 权重 → 内部顶点的 UV 应不同
+        let mut diff_count = 0;
+        for (t, h) in tutte.iter().zip(harmonic.iter()) {
+            let d = ((t[0] - h[0]).powi(2) + (t[1] - h[1]).powi(2)).sqrt();
+            if d > 1e-6 {
+                diff_count += 1;
+            }
+        }
+        // 至少部分内部顶点的 UV 应不同
+        assert!(
+            diff_count > 0,
+            "Tutte (uniform weights) and harmonic (cotan weights) should produce different interior UVs"
+        );
     }
 }

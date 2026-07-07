@@ -38,6 +38,7 @@ new_key_type! {
 /// `EdgeId` 不是 slotmap 的 `Key`，不能直接用于 `MeshStorage` 的 CRUD
 /// 方法；使用 `halfedge()` 取出内部的 `HalfEdgeId` 后再操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EdgeId(pub(crate) HalfEdgeId);
 
 impl EdgeId {

@@ -92,7 +92,7 @@ pub fn build_icosphere(subdivisions: usize) -> MeshStorage {
         faces = new_faces;
     }
 
-    build_mesh_from_vertices_and_faces(&vertices, &faces)
+    build_mesh_from_vertices_and_faces(&vertices, &faces).expect("test mesh creation")
 }
 
 /// 单次细分：每个三角面分裂为 4 个小三角形，新顶点归一化到单位球面。

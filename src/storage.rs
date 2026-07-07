@@ -27,19 +27,22 @@
 //!
 //! 此外 `is_empty()` 判断网格是否为空，`edge_count()` 返回无向边数。
 
-use slotmap::SlotMap;
+use slotmap::{SecondaryMap, SlotMap};
 
+use crate::Scalar;
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
 
 /// 顶点数据：3D 位置 + 任一从该顶点出发的半边句柄。
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Vertex {
-    pub position: [f64; 3],
+    pub position: [Scalar; 3],
     pub halfedge: Option<HalfEdgeId>,
 }
 
 /// 半边数据：四向邻接（twin/next/prev/face）+ 目的顶点。
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HalfEdge {
     /// 半边指向的顶点（tip）。
     pub vertex: VertexId,
@@ -55,12 +58,16 @@ pub struct HalfEdge {
 
 /// 面数据：任一围绕该面的半边句柄，作为访问面边界环的入口。
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Face {
     pub halfedge: Option<HalfEdgeId>,
 }
 
 impl Vertex {
-    pub fn new(position: [f64; 3]) -> Self {
+    /// 创建新顶点，指定 3D 位置。
+    ///
+    /// 初始状态下 `halfedge` 为 `None`。
+    pub fn new(position: [Scalar; 3]) -> Self {
         Self {
             position,
             halfedge: None,
@@ -75,6 +82,9 @@ impl Default for Vertex {
 }
 
 impl HalfEdge {
+    /// 创建新半边，指向指定顶点。
+    ///
+    /// 初始状态下 `next`/`prev`/`twin`/`face` 均为 `None`。
     pub fn new(vertex: VertexId) -> Self {
         Self {
             vertex,
@@ -87,6 +97,9 @@ impl HalfEdge {
 }
 
 impl Face {
+    /// 创建新面。
+    ///
+    /// 初始状态下 `halfedge` 为 `None`。
     pub fn new() -> Self {
         Self { halfedge: None }
     }
@@ -102,11 +115,31 @@ impl Default for Face {
 ///
 /// 三类元素分别放在独立的 `SlotMap` 中，互不干扰。所有公开接口都返回 `Option`
 /// 或 ID 类型，访问已删除元素只会得到 `None`，绝不 panic。
+///
+/// ## SOA 位置缓存
+/// 为提升几何热路径的缓存命中率，`MeshStorage` 内部维护一份稠密的
+/// `positions: Vec<[Scalar; 3]>` 缓存，与 `vertices` SlotMap 并行。
+/// 通过 [`position_index`](Self::position_index) 可取得 `VertexId → u32`
+/// 的稠密索引，再用 [`positions_dense`](Self::positions_dense) 做
+/// 24 字节步长的连续访问，避免 SlotMap 槽位元数据造成的缓存浪费。
+///
+/// 缓存由 [`add_vertex`](Self::add_vertex) / [`remove_vertex`](Self::remove_vertex)
+/// / [`set_position`](Self::set_position) 自动同步。若直接通过
+/// [`get_vertex_mut`](Self::get_vertex_mut) 修改 `position` 字段，缓存会
+/// 暂时失效，需调用 [`sync_position`](Self::sync_position) 或
+/// [`rebuild_position_cache`](Self::rebuild_position_cache) 修复。
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MeshStorage {
     vertices: SlotMap<VertexId, Vertex>,
     halfedges: SlotMap<HalfEdgeId, HalfEdge>,
     faces: SlotMap<FaceId, Face>,
+    /// SOA 位置缓存：稠密连续的顶点坐标，索引由 `pos_index` 提供。
+    #[cfg_attr(feature = "serde", serde(skip))]
+    positions: Vec<[Scalar; 3]>,
+    /// VertexId → `positions` 索引。SecondaryMap 由 Vec 支持，O(1) 查找。
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pos_index: SecondaryMap<VertexId, u32>,
 }
 
 impl Default for MeshStorage {
@@ -122,14 +155,23 @@ impl MeshStorage {
             vertices: SlotMap::with_key(),
             halfedges: SlotMap::with_key(),
             faces: SlotMap::with_key(),
+            positions: Vec::new(),
+            pos_index: SecondaryMap::new(),
         }
     }
 
     // ---------- 增 ----------
 
     /// 插入一个顶点，返回新分配的句柄。
+    ///
+    /// 同时将 `vertex.position` 推入 SOA 位置缓存，保持缓存与主存同步。
     pub fn add_vertex(&mut self, vertex: Vertex) -> VertexId {
-        self.vertices.insert(vertex)
+        let pos = vertex.position;
+        let id = self.vertices.insert(vertex);
+        let idx = self.positions.len() as u32;
+        self.positions.push(pos);
+        self.pos_index.insert(id, idx);
+        id
     }
 
     /// 插入一条半边，返回新分配的句柄。
@@ -148,8 +190,30 @@ impl MeshStorage {
     ///
     /// 删除后该句柄永久失效（即使槽位被复用，旧句柄版本号不匹配）。
     /// 注意：本方法不清理指向该顶点的半边引用，拓扑一致性由上层维护。
+    ///
+    /// SOA 位置缓存通过 swap-remove 同步：被删除顶点的位置由末尾元素填补，
+    /// 填补元素的稠密索引被同步更新。
     pub fn remove_vertex(&mut self, id: VertexId) -> Option<Vertex> {
-        self.vertices.remove(id)
+        let removed = self.vertices.remove(id);
+        if removed.is_some()
+            && let Some(idx) = self.pos_index.remove(id)
+        {
+            let idx = idx as usize;
+            // swap-remove：末尾元素填补 idx 槽位
+            self.positions.swap_remove(idx);
+            // 若填补元素非自身（idx 仍在范围内），更新填补元素的稠密索引
+            if idx < self.positions.len() {
+                let old_last_idx = self.positions.len() as u32;
+                // 在 pos_index 中找到值为 old_last_idx 的项，改为 idx
+                for (_k, v) in self.pos_index.iter_mut() {
+                    if *v == old_last_idx {
+                        *v = idx as u32;
+                        break;
+                    }
+                }
+            }
+        }
+        removed
     }
 
     /// 删除指定半边。语义同 [`remove_vertex`](Self::remove_vertex)。
@@ -164,28 +228,38 @@ impl MeshStorage {
 
     // ---------- 查（不可变） ----------
 
+    /// 按 `VertexId` 获取顶点引用。
     pub fn get_vertex(&self, id: VertexId) -> Option<&Vertex> {
         self.vertices.get(id)
     }
 
+    /// 按 `HalfEdgeId` 获取半边引用。
     pub fn get_halfedge(&self, id: HalfEdgeId) -> Option<&HalfEdge> {
         self.halfedges.get(id)
     }
 
+    /// 按 `FaceId` 获取面引用。
     pub fn get_face(&self, id: FaceId) -> Option<&Face> {
         self.faces.get(id)
     }
 
     // ---------- 查（可变） ----------
 
+    /// 按 `VertexId` 获取可变顶点引用。
+    ///
+    /// **注意**：若通过此方法修改 `vertex.position`，SOA 位置缓存会暂时失效。
+    /// 建议改用 [`set_position`](Self::set_position) 更新顶点位置，
+    /// 或在修改后调用 [`sync_position`](Self::sync_position)。
     pub fn get_vertex_mut(&mut self, id: VertexId) -> Option<&mut Vertex> {
         self.vertices.get_mut(id)
     }
 
+    /// 按 `HalfEdgeId` 获取可变半边引用。
     pub fn get_halfedge_mut(&mut self, id: HalfEdgeId) -> Option<&mut HalfEdge> {
         self.halfedges.get_mut(id)
     }
 
+    /// 按 `FaceId` 获取可变面引用。
     pub fn get_face_mut(&mut self, id: FaceId) -> Option<&mut Face> {
         self.faces.get_mut(id)
     }
@@ -278,6 +352,71 @@ impl MeshStorage {
         self.vertex_count() == 0 && self.face_count() == 0
     }
 
+    // ---------- SOA 位置缓存 ----------
+
+    /// 按 `VertexId` 取顶点位置（读 SOA 缓存，24 字节步长连续访问）。
+    ///
+    /// 与 `get_vertex(id).position` 等价，但走稠密 `Vec` 缓存，
+    /// 批量遍历时缓存命中率更高。
+    #[inline]
+    pub fn get_position(&self, id: VertexId) -> Option<[Scalar; 3]> {
+        let idx = self.pos_index.get(id)?;
+        self.positions.get(*idx as usize).copied()
+    }
+
+    /// 返回稠密位置切片 `&[[Scalar; 3]]`，用于批量遍历。
+    ///
+    /// 配合 [`position_index`](Self::position_index) 将 `VertexId` 映射到
+    /// 切片下标，可在热路径中以 24 字节步长连续访问所有顶点位置，
+    /// 避免 SlotMap 槽位元数据的缓存浪费。
+    #[inline]
+    pub fn positions_dense(&self) -> &[[Scalar; 3]] {
+        &self.positions
+    }
+
+    /// `VertexId → u32` 稠密索引，配合 [`positions_dense`](Self::positions_dense) 使用。
+    #[inline]
+    pub fn position_index(&self, id: VertexId) -> Option<u32> {
+        self.pos_index.get(id).copied()
+    }
+
+    /// 更新顶点位置，同时同步主存与 SOA 缓存。
+    ///
+    /// 与 `get_vertex_mut(id).position = pos` 的区别：本方法保持缓存一致性，
+    /// 推荐在所有需要修改顶点位置的场景使用。
+    pub fn set_position(&mut self, id: VertexId, pos: [Scalar; 3]) -> Option<()> {
+        let vertex = self.vertices.get_mut(id)?;
+        vertex.position = pos;
+        if let Some(idx) = self.pos_index.get(id) {
+            self.positions[*idx as usize] = pos;
+        }
+        Some(())
+    }
+
+    /// 将主存中的 `vertex.position` 同步到 SOA 缓存。
+    ///
+    /// 当通过 [`get_vertex_mut`](Self::get_vertex_mut) 修改 `position` 字段后，
+    /// 缓存会暂时失效。调用本方法以单点同步。
+    pub fn sync_position(&mut self, id: VertexId) {
+        if let (Some(v), Some(idx)) = (self.vertices.get(id), self.pos_index.get(id)) {
+            self.positions[*idx as usize] = v.position;
+        }
+    }
+
+    /// 从主存重建整个 SOA 位置缓存。
+    ///
+    /// 适用于反序列化后或大量通过 `get_vertex_mut` 修改位置后的批量修复。
+    /// 时间复杂度 $O(V)$。
+    pub fn rebuild_position_cache(&mut self) {
+        self.positions.clear();
+        self.pos_index.clear();
+        for (id, v) in self.vertices.iter() {
+            let idx = self.positions.len() as u32;
+            self.positions.push(v.position);
+            self.pos_index.insert(id, idx);
+        }
+    }
+
     // ---------- 拓扑诊断 ----------
 
     /// 欧拉示性数 $\chi = V - E + F$。
@@ -313,6 +452,8 @@ impl MeshStorage {
         self.vertices.clear();
         self.halfedges.clear();
         self.faces.clear();
+        self.positions.clear();
+        self.pos_index.clear();
     }
 
     /// 为大约 `vertex_cap` 个顶点、`halfedge_cap` 条半边、`face_cap` 个面预分配内存。
@@ -323,6 +464,7 @@ impl MeshStorage {
         self.vertices.reserve(vertex_cap);
         self.halfedges.reserve(halfedge_cap);
         self.faces.reserve(face_cap);
+        self.positions.reserve(vertex_cap);
     }
 }
 
@@ -619,5 +761,511 @@ mod tests {
         assert_eq!(mesh.vertices().count(), 0);
         assert_eq!(mesh.halfedges().count(), 0);
         assert_eq!(mesh.faces().count(), 0);
+    }
+
+    // ---------- 槽位版本号 / 多轮复用 ----------
+
+    #[test]
+    fn slot_reuse_multiple_cycles() {
+        // 多轮删除/插入循环，验证版本号持续递增、旧句柄始终无效
+        let mut mesh = MeshStorage::new();
+        let mut old_ids = Vec::new();
+
+        for _ in 0..5 {
+            let id = mesh.add_vertex(Vertex::new([1.0; 3]));
+            old_ids.push(id);
+            mesh.remove_vertex(id);
+        }
+
+        // 所有旧句柄都应无效
+        for id in &old_ids {
+            assert!(!mesh.contains_vertex(*id));
+            assert!(mesh.get_vertex(*id).is_none());
+        }
+        assert_eq!(mesh.vertex_count(), 0);
+
+        // 再插入一个新顶点
+        let new_id = mesh.add_vertex(Vertex::new([2.0; 3]));
+        assert!(mesh.contains_vertex(new_id));
+        for id in &old_ids {
+            assert_ne!(*id, new_id);
+        }
+    }
+
+    #[test]
+    fn slot_reuse_halfedge_and_face() {
+        // 半边和面同样有版本号机制
+        let mut mesh = MeshStorage::new();
+
+        let v = mesh.add_vertex(Vertex::new([0.0; 3]));
+        let old_he = mesh.add_halfedge(HalfEdge::new(v));
+        let old_face = mesh.add_face(Face::new());
+
+        mesh.remove_halfedge(old_he);
+        mesh.remove_face(old_face);
+
+        let new_he = mesh.add_halfedge(HalfEdge::new(v));
+        let new_face = mesh.add_face(Face::new());
+
+        assert!(!mesh.contains_halfedge(old_he));
+        assert!(!mesh.contains_face(old_face));
+        assert!(mesh.contains_halfedge(new_he));
+        assert!(mesh.contains_face(new_face));
+        assert_ne!(old_he, new_he);
+        assert_ne!(old_face, new_face);
+    }
+
+    // ---------- 默认值 / 构造 ----------
+
+    #[test]
+    fn vertex_default_is_origin() {
+        let v = Vertex::default();
+        assert_eq!(v.position, [0.0; 3]);
+        assert!(v.halfedge.is_none());
+    }
+
+    #[test]
+    fn face_default_has_no_halfedge() {
+        let f = Face::default();
+        assert!(f.halfedge.is_none());
+    }
+
+    #[test]
+    fn halfedge_new_has_no_links() {
+        let v = VertexId::default();
+        let he = HalfEdge::new(v);
+        assert_eq!(he.vertex, v);
+        assert!(he.twin.is_none());
+        assert!(he.next.is_none());
+        assert!(he.prev.is_none());
+        assert!(he.face.is_none());
+    }
+
+    // ---------- 迭代器一致性 ----------
+
+    #[test]
+    fn iteration_count_consistency_after_remove() {
+        // 删除部分元素后，句柄迭代与数据迭代数量一致
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(Vertex::new([0.0; 3]));
+        let _v1 = mesh.add_vertex(Vertex::new([1.0; 3]));
+        let _v2 = mesh.add_vertex(Vertex::new([2.0; 3]));
+
+        mesh.remove_vertex(v0);
+
+        assert_eq!(mesh.vertex_count(), 2);
+        assert_eq!(mesh.vertex_ids().count(), 2);
+        assert_eq!(mesh.vertices().count(), 2);
+        // 删除的 v0 不出现在迭代中
+        assert!(!mesh.vertex_ids().any(|id| id == v0));
+    }
+
+    #[test]
+    fn halfedges_mut_allows_modification() {
+        let mut mesh = MeshStorage::new();
+        let v = mesh.add_vertex(Vertex::new([0.0; 3]));
+        mesh.add_halfedge(HalfEdge::new(v));
+        mesh.add_halfedge(HalfEdge::new(v));
+
+        for he in mesh.halfedges_mut() {
+            he.face = Some(FaceId::default());
+        }
+        for he in mesh.halfedges() {
+            assert_eq!(he.face, Some(FaceId::default()));
+        }
+    }
+
+    #[test]
+    fn faces_mut_allows_modification() {
+        let mut mesh = MeshStorage::new();
+        let he = mesh.add_halfedge(HalfEdge::new(VertexId::default()));
+        mesh.add_face(Face::new());
+        mesh.add_face(Face::new());
+
+        for f in mesh.faces_mut() {
+            f.halfedge = Some(he);
+        }
+        for f in mesh.faces() {
+            assert_eq!(f.halfedge, Some(he));
+        }
+    }
+
+    // ---------- 欧拉示性数 / 亏格 ----------
+
+    #[test]
+    fn euler_characteristic_of_icosphere_is_two() {
+        // 闭合球面网格 χ = 2
+        let mesh = crate::test_util::build_icosphere(0);
+        assert_eq!(mesh.euler_characteristic(), 2);
+        assert_eq!(mesh.genus(), 0);
+    }
+
+    #[test]
+    fn euler_characteristic_of_tetrahedron_is_two() {
+        // 四面体：V=4, E=6, F=4 → χ = 4-6+4 = 2
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let faces = vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        assert_eq!(mesh.vertex_count(), 4);
+        assert_eq!(mesh.face_count(), 4);
+        assert_eq!(mesh.halfedge_count(), 12);
+        assert_eq!(mesh.euler_characteristic(), 2);
+        assert_eq!(mesh.genus(), 0);
+    }
+
+    #[test]
+    fn euler_characteristic_empty_mesh() {
+        let mesh = MeshStorage::new();
+        assert_eq!(mesh.euler_characteristic(), 0);
+    }
+
+    // ---------- 边界检测 ----------
+
+    #[test]
+    fn closed_mesh_has_no_boundary() {
+        // icosphere 是闭合网格
+        let mesh = crate::test_util::build_icosphere(0);
+        assert!(crate::traversal::is_closed(&mesh));
+    }
+
+    #[test]
+    fn single_triangle_has_boundary() {
+        // 单个三角形（有边界边）不是闭合网格
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        assert!(!crate::traversal::is_closed(&mesh));
+    }
+
+    #[test]
+    fn boundary_halfedges_have_no_face() {
+        // 单三角形的 3 条边界半边 face 字段为 None
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+        let boundary_count = mesh
+            .halfedge_ids()
+            .filter(|he| mesh.get_halfedge(*he).unwrap().face.is_none())
+            .count();
+        assert_eq!(boundary_count, 3, "单三角形应有 3 条边界半边");
+    }
+
+    #[test]
+    fn closed_mesh_has_no_boundary_halfedges() {
+        let mesh = crate::test_util::build_icosphere(0);
+        let boundary_count = mesh
+            .halfedge_ids()
+            .filter(|he| mesh.get_halfedge(*he).unwrap().face.is_none())
+            .count();
+        assert_eq!(boundary_count, 0);
+    }
+
+    // ---------- 校验集成 ----------
+
+    #[test]
+    fn icosphere_passes_full_validation() {
+        let mesh = crate::test_util::build_icosphere(1);
+        assert!(crate::validate::check_topology(&mesh).is_ok());
+    }
+
+    #[test]
+    fn single_triangle_passes_validation() {
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        assert!(crate::validate::check_topology(&mesh).is_ok());
+    }
+
+    #[test]
+    fn two_disconnected_triangles_pass_validation() {
+        // 两个不相连的三角形
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ];
+        let faces = vec![[0, 1, 2], [3, 4, 5]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        assert_eq!(mesh.vertex_count(), 6);
+        assert_eq!(mesh.face_count(), 2);
+        assert_eq!(mesh.halfedge_count(), 12);
+        assert!(crate::validate::check_topology(&mesh).is_ok());
+    }
+
+    // ---------- Twin / next / prev 链正确性 ----------
+
+    #[test]
+    fn twin_relationship_is_symmetric() {
+        // 验证 twin 双向互指
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+        for he_id in mesh.halfedge_ids() {
+            let he = mesh.get_halfedge(he_id).unwrap();
+            if let Some(twin_id) = he.twin {
+                let twin = mesh.get_halfedge(twin_id).unwrap();
+                assert_eq!(twin.twin, Some(he_id), "twin 应双向互指");
+            }
+        }
+    }
+
+    #[test]
+    fn next_prev_chain_is_consistent() {
+        // 验证 next/prev 双向一致
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+        for he_id in mesh.halfedge_ids() {
+            let he = mesh.get_halfedge(he_id).unwrap();
+            if let Some(next_id) = he.next {
+                let next = mesh.get_halfedge(next_id).unwrap();
+                assert_eq!(next.prev, Some(he_id), "next.prev 应互指");
+            }
+            if let Some(prev_id) = he.prev {
+                let prev = mesh.get_halfedge(prev_id).unwrap();
+                assert_eq!(prev.next, Some(he_id), "prev.next 应互指");
+            }
+        }
+    }
+
+    #[test]
+    fn face_boundary_next_chain_closes() {
+        // 面的 next 链应闭合，长度为 3
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+        for f_id in mesh.face_ids() {
+            let face = mesh.get_face(f_id).unwrap();
+            let start = face.halfedge.unwrap();
+            let he1 = start;
+            let he2 = mesh.get_halfedge(he1).unwrap().next.unwrap();
+            let he3 = mesh.get_halfedge(he2).unwrap().next.unwrap();
+            let back = mesh.get_halfedge(he3).unwrap().next.unwrap();
+            assert_eq!(back, he1, "next 链应回到起点");
+            assert_ne!(he1, he2);
+            assert_ne!(he2, he3);
+            assert_ne!(he1, he3);
+        }
+    }
+
+    // ---------- 大网格 ----------
+
+    #[test]
+    fn large_icosphere_counts_correct() {
+        // subdiv=2: V=162, F=320, E=480 → 半边 960
+        let mesh = crate::test_util::build_icosphere(2);
+        assert_eq!(mesh.vertex_count(), 162);
+        assert_eq!(mesh.face_count(), 320);
+        assert_eq!(mesh.halfedge_count(), 960);
+        assert_eq!(mesh.euler_characteristic(), 2);
+        assert!(crate::validate::check_topology(&mesh).is_ok());
+    }
+
+    // ---------- MeshStorage Clone / Debug ----------
+
+    #[test]
+    fn mesh_storage_clone_is_equal() {
+        let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let faces = vec![[0, 1, 2]];
+        let mesh = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+        let cloned = mesh.clone();
+        assert_eq!(cloned.vertex_count(), mesh.vertex_count());
+        assert_eq!(cloned.halfedge_count(), mesh.halfedge_count());
+        assert_eq!(cloned.face_count(), mesh.face_count());
+        assert_eq!(cloned.euler_characteristic(), mesh.euler_characteristic());
+    }
+
+    #[test]
+    fn mesh_storage_debug_formats() {
+        let mut mesh = MeshStorage::new();
+        mesh.add_vertex(Vertex::new([1.0; 3]));
+        let debug = format!("{:?}", mesh);
+        assert!(debug.contains("MeshStorage"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_roundtrip_preserves_topology() {
+        // Build a simple triangle mesh
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let faces = vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
+        let mesh =
+            crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).expect("valid mesh");
+
+        let json = serde_json::to_string(&mesh).expect("serialize");
+        let deserialized: MeshStorage = serde_json::from_str(&json).expect("deserialize");
+
+        // Topology preserved
+        assert_eq!(deserialized.vertex_count(), mesh.vertex_count());
+        assert_eq!(deserialized.halfedge_count(), mesh.halfedge_count());
+        assert_eq!(deserialized.face_count(), mesh.face_count());
+        assert_eq!(
+            deserialized.euler_characteristic(),
+            mesh.euler_characteristic()
+        );
+
+        // Positions preserved
+        let orig_pos: Vec<[f64; 3]> = mesh.vertices().map(|v| v.position).collect();
+        let new_pos: Vec<[f64; 3]> = deserialized.vertices().map(|v| v.position).collect();
+        assert_eq!(orig_pos.len(), new_pos.len());
+        for (a, b) in orig_pos.iter().zip(new_pos.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    // ---------- SOA 位置缓存 ----------
+
+    #[test]
+    fn soa_cache_get_position_matches_vertex() {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(Vertex::new([1.0, 2.0, 3.0]));
+        let v1 = mesh.add_vertex(Vertex::new([4.0, 5.0, 6.0]));
+
+        // get_position 应与 get_vertex().position 一致
+        assert_eq!(mesh.get_position(v0), Some([1.0, 2.0, 3.0]));
+        assert_eq!(mesh.get_position(v1), Some([4.0, 5.0, 6.0]));
+        // 无效句柄返回 None
+        let fake = VertexId::default();
+        assert_eq!(mesh.get_position(fake), None);
+    }
+
+    #[test]
+    fn soa_cache_positions_dense_length_matches() {
+        let mut mesh = MeshStorage::new();
+        mesh.add_vertex(Vertex::new([1.0; 3]));
+        mesh.add_vertex(Vertex::new([2.0; 3]));
+        mesh.add_vertex(Vertex::new([3.0; 3]));
+
+        let dense = mesh.positions_dense();
+        assert_eq!(dense.len(), 3);
+        assert_eq!(dense[0], [1.0; 3]);
+        assert_eq!(dense[1], [2.0; 3]);
+        assert_eq!(dense[2], [3.0; 3]);
+    }
+
+    #[test]
+    fn soa_cache_position_index_round_trip() {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(Vertex::new([10.0, 0.0, 0.0]));
+        let v1 = mesh.add_vertex(Vertex::new([0.0, 20.0, 0.0]));
+
+        let dense = mesh.positions_dense();
+        let idx0 = mesh.position_index(v0).expect("v0 应有索引");
+        let idx1 = mesh.position_index(v1).expect("v1 应有索引");
+
+        assert_eq!(dense[idx0 as usize], [10.0, 0.0, 0.0]);
+        assert_eq!(dense[idx1 as usize], [0.0, 20.0, 0.0]);
+    }
+
+    #[test]
+    fn soa_cache_set_position_syncs_both() {
+        let mut mesh = MeshStorage::new();
+        let v = mesh.add_vertex(Vertex::new([0.0; 3]));
+
+        mesh.set_position(v, [7.0, 8.0, 9.0]);
+
+        // 主存与缓存都应更新
+        assert_eq!(mesh.get_vertex(v).unwrap().position, [7.0, 8.0, 9.0]);
+        assert_eq!(mesh.get_position(v), Some([7.0, 8.0, 9.0]));
+        let idx = mesh.position_index(v).unwrap();
+        assert_eq!(mesh.positions_dense()[idx as usize], [7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn soa_cache_remove_preserves_dense_layout() {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(Vertex::new([1.0; 3]));
+        let _v1 = mesh.add_vertex(Vertex::new([2.0; 3]));
+        let v2 = mesh.add_vertex(Vertex::new([3.0; 3]));
+
+        // 删除中间顶点 v1，末尾 v2 的位置会填补到 v1 的索引
+        mesh.remove_vertex(_v1);
+
+        // 剩余顶点的位置应仍可通过 get_position 正确读取
+        assert_eq!(mesh.get_position(v0), Some([1.0; 3]));
+        assert_eq!(mesh.get_position(v2), Some([3.0; 3]));
+        // 稠密切片长度应为 2
+        assert_eq!(mesh.positions_dense().len(), 2);
+    }
+
+    #[test]
+    fn soa_cache_sync_position_after_get_vertex_mut() {
+        let mut mesh = MeshStorage::new();
+        let v = mesh.add_vertex(Vertex::new([0.0; 3]));
+
+        // 通过 get_vertex_mut 直接修改 position（绕过 set_position）
+        mesh.get_vertex_mut(v).unwrap().position = [5.0, 5.0, 5.0];
+        // 此时缓存已过期
+        assert_eq!(mesh.get_position(v), Some([0.0; 3])); // 仍是旧值
+
+        // 调用 sync_position 修复
+        mesh.sync_position(v);
+        assert_eq!(mesh.get_position(v), Some([5.0, 5.0, 5.0]));
+    }
+
+    #[test]
+    fn soa_cache_rebuild_from_master() {
+        let mut mesh = MeshStorage::new();
+        let v0 = mesh.add_vertex(Vertex::new([1.0; 3]));
+        let v1 = mesh.add_vertex(Vertex::new([2.0; 3]));
+
+        // 模拟缓存损坏：直接修改 Vertex.position 但不同步缓存
+        mesh.get_vertex_mut(v0).unwrap().position = [9.0; 3];
+        mesh.get_vertex_mut(v1).unwrap().position = [8.0; 3];
+
+        // 重建缓存
+        mesh.rebuild_position_cache();
+
+        assert_eq!(mesh.get_position(v0), Some([9.0; 3]));
+        assert_eq!(mesh.get_position(v1), Some([8.0; 3]));
+        assert_eq!(mesh.positions_dense().len(), 2);
+    }
+
+    #[test]
+    fn soa_cache_clear_empties_cache() {
+        let mut mesh = MeshStorage::new();
+        mesh.add_vertex(Vertex::new([1.0; 3]));
+        mesh.add_vertex(Vertex::new([2.0; 3]));
+        assert_eq!(mesh.positions_dense().len(), 2);
+
+        mesh.clear();
+        assert_eq!(mesh.positions_dense().len(), 0);
+    }
+
+    #[test]
+    fn soa_cache_empty_mesh_no_panic() {
+        let mesh = MeshStorage::new();
+        assert_eq!(mesh.positions_dense().len(), 0);
+        assert_eq!(mesh.positions_dense(), &[] as &[[f64; 3]]);
+    }
+
+    #[test]
+    fn soa_cache_icosphere_consistency() {
+        use crate::test_util::build_icosphere;
+        let mesh = build_icosphere(1);
+        // 对所有顶点验证 get_position 与 get_vertex().position 一致
+        for v_id in mesh.vertex_ids() {
+            let from_vertex = mesh.get_vertex(v_id).unwrap().position;
+            let from_cache = mesh.get_position(v_id).unwrap();
+            assert_eq!(from_vertex, from_cache, "顶点 {:?} 缓存不一致", v_id);
+        }
     }
 }

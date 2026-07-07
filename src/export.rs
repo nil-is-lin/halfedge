@@ -65,7 +65,7 @@ pub fn mesh_to_vertex_index_buffers(mesh: &MeshStorage) -> (Vec<[f32; 3]>, Vec<u
         indices.extend_from_slice(&verts);
     }
     if skipped > 0 {
-        eprintln!("[halfedge::mesh_to_vertex_index_buffers] 警告：跳过 {skipped} 个非三角面");
+        log::warn!("[halfedge::mesh_to_vertex_index_buffers] 警告：跳过 {skipped} 个非三角面");
     }
 
     (vertices, indices)
@@ -90,7 +90,7 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let faces = vec![[0, 1, 2], [0, 2, 3]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
 
         let (vb, ib) = mesh_to_vertex_index_buffers(&mesh);
         assert_eq!(vb.len(), 4);
@@ -117,7 +117,7 @@ mod tests {
             [0.0, 0.0, 1.0],
         ];
         let faces = vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let (vb, ib) = mesh_to_vertex_index_buffers(&mesh);
         assert_eq!(vb.len(), 4);
         assert_eq!(ib.len(), 12); // 4 面 * 3 索引
@@ -128,7 +128,7 @@ mod tests {
         // 确保导出的索引顺序与原面 CCW 一致
         let vertices = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = vec![[0, 1, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let (vb, ib) = mesh_to_vertex_index_buffers(&mesh);
 
         // 取出第一个三角形的三个顶点，验证法向为 +z（CCW）
@@ -164,14 +164,14 @@ mod tests {
             [1.0, 1.0, 1.0],
         ];
         let faces = vec![[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let (vb, ib) = mesh_to_vertex_index_buffers(&mesh);
         let verts_f64: Vec<[f64; 3]> = vb
             .iter()
             .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
             .collect();
         let faces_u32: Vec<[u32; 3]> = ib.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
-        let mesh2 = build_mesh_from_vertices_and_faces(&verts_f64, &faces_u32);
+        let mesh2 = build_mesh_from_vertices_and_faces(&verts_f64, &faces_u32).unwrap();
         assert!(check_topology(&mesh2).is_ok(), "导出后重建的网格应通过校验");
         assert_eq!(mesh2.vertex_count(), mesh.vertex_count());
         assert_eq!(mesh2.face_count(), mesh.face_count());

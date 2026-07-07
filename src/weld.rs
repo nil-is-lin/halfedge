@@ -16,7 +16,12 @@ pub fn weld_vertices(mesh: &mut MeshStorage, epsilon: f64) -> Result<usize, Topo
     // 1. 收集 (VertexId, position)
     let verts: Vec<(VertexId, [f64; 3])> = mesh
         .vertex_ids()
-        .map(|id| (id, mesh.get_vertex(id).unwrap().position))
+        .map(|id| {
+            (
+                id,
+                mesh.get_vertex(id).expect("vertex exists in mesh").position,
+            )
+        })
         .collect();
 
     // 2. 按 x 排序

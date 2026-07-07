@@ -19,7 +19,7 @@ fn main() {
         [0, 2, 3], // 三角形 2：v0-v2-v3（共享边 v0-v2）
     ];
 
-    let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+    let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
 
     println!(
         "构建结果：{} 顶点 / {} 半边 / {} 面",

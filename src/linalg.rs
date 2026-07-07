@@ -3,6 +3,8 @@
 //! 在 [`sprs`] 的 [`CsMat`](sprs::CsMat) 稀疏矩阵之上提供：
 //! - [`SparseSystem`]：从网格拉普拉斯矩阵的三元组构建稀疏对称系统；
 //! - [`conjugate_gradient`]：共轭梯度法求解 $Ax = b$（A 对称正定）；
+//! - [`conjugate_gradient_preconditioned`]：预条件共轭梯度法（Jacobi 对角预条件）；
+//! - [`jacobi_preconditioner`]：构建 Jacobi 预条件向量；
 //! - 辅助工具：正则化对角偏移、残差范数计算。
 //!
 //! ## 使用场景
@@ -65,6 +67,62 @@ impl SparseSystem {
 }
 
 // ============================================================
+// 网格拉普拉斯构建
+// ============================================================
+
+/// 构建顶点索引映射 `HashMap<VertexId, usize>`。
+///
+/// 按 `mesh.vertex_ids()` 的遍历顺序为每个顶点分配连续索引。
+/// 这是所有拉普拉斯/线性系统构建的公共前置步骤。
+pub fn build_vertex_index(
+    mesh: &crate::storage::MeshStorage,
+) -> std::collections::HashMap<crate::ids::VertexId, usize> {
+    mesh.vertex_ids().enumerate().map(|(i, v)| (v, i)).collect()
+}
+
+/// 构建对称余切拉普拉斯稀疏系统。
+///
+/// 遍历每个顶点的邻域，用 [`cotan_edge_weight`](crate::geometry::cotan_edge_weight)
+/// 计算边权重（每边除以 2 以补偿双向遍历），组装为 `SparseSystem`。
+///
+/// 对角线 = 该顶点所有出边权重之和；非对角线 = 负的边权重。
+///
+/// # 参数
+/// - `mesh`: 网格存储
+/// - `v_idx`: 顶点到矩阵索引的映射（由 [`build_vertex_index`] 构建）
+///
+/// # 返回
+/// `SparseSystem`，调用 `.finish()` 后得到 CSR 矩阵。
+pub fn build_cotan_laplacian(
+    mesh: &crate::storage::MeshStorage,
+    v_idx: &std::collections::HashMap<crate::ids::VertexId, usize>,
+) -> SparseSystem {
+    use crate::geometry::cotan_edge_weight;
+    use crate::traversal::VertexRing;
+
+    let n = v_idx.len();
+    let mut sys = SparseSystem::new(n);
+
+    for (&v, &i) in v_idx {
+        let mut diag = 0.0;
+        for he in VertexRing::new(mesh, v) {
+            let neighbor = match mesh.get_halfedge(he) {
+                Some(h) => h.vertex,
+                None => continue,
+            };
+            if let Some(&j) = v_idx.get(&neighbor) {
+                let w = cotan_edge_weight(mesh, he).unwrap_or(0.0) / 2.0;
+                sys.add(i, j, -w);
+                diag += w;
+            }
+        }
+        sys.add_diag(i, diag);
+    }
+
+    sys
+}
+
+// ============================================================
 // 共轭梯度法
 // ============================================================
 
@@ -72,6 +130,9 @@ impl SparseSystem {
 ///
 /// **前置条件：** $A$ 必须为对称正定（SPD）矩阵。若 $A$ 半正定（如拉普拉斯矩阵），
 /// 调用方应先做正则化（对 $A$ 的对角线加一个小偏移）。
+///
+/// 内部委托给 [`conjugate_gradient_preconditioned`]，使用单位预条件（全 1），
+/// 因此等价于无预条件的标准 CG。
 ///
 /// # 参数
 /// - `a`: 稀疏 SPD 矩阵（CSR 格式）
@@ -89,8 +150,57 @@ pub fn conjugate_gradient(
     tol: f64,
 ) -> Option<Vec<f64>> {
     let n = a.rows();
-    // 维度不匹配时返回 None 而非 panic
     if n != b.len() {
+        return None;
+    }
+    // 无预条件 = 单位预条件向量
+    let preconditioner = vec![1.0; n];
+    conjugate_gradient_preconditioned(a, b, &preconditioner, max_iter, tol)
+}
+
+/// 预条件共轭梯度法求解 $Ax = b$。
+///
+/// 使用 Jacobi（对角）预条件矩阵 $M^{-1}$ 加速收敛。算法在每步用
+/// $z = M^{-1} r$ 代替 $r$ 来构造搜索方向，对病态系统（如不规则网格上的
+/// 余切拉普拉斯矩阵）可显著减少迭代次数。
+///
+/// **前置条件：** $A$ 必须为对称正定（SPD）矩阵，且 `preconditioner` 长度
+/// 等于 `a.rows()`，每个元素为 $M^{-1}$ 的对角元（即 $1 / A_{ii}$）。
+///
+/// # 算法
+/// 1. $r_0 = b - Ax_0$（初始 $x_0 = 0$，故 $r_0 = b$）
+/// 2. $z_0 = M^{-1} r_0$（逐元素乘）
+/// 3. $p_0 = z_0$
+/// 4. 每次迭代：
+///    - $Ap = A \cdot p$
+///    - $\alpha = (r \cdot z) / (p \cdot Ap)$
+///    - $x \mathrel{+}= \alpha \cdot p$
+///    - $r_{\text{new}} = r - \alpha \cdot Ap$
+///    - $z_{\text{new}} = M^{-1} r_{\text{new}}$
+///    - $\beta = (r_{\text{new}} \cdot z_{\text{new}}) / (r \cdot z)$
+///    - $p = z_{\text{new}} + \beta \cdot p$
+///    - $r = r_{\text{new}},\ z = z_{\text{new}}$
+///
+/// # 参数
+/// - `a`: 稀疏 SPD 矩阵（CSR 格式）
+/// - `b`: 右端向量（长度 = `a.rows()`）
+/// - `preconditioner`: 预条件对角向量 $M^{-1}$（长度 = `a.rows()`）
+/// - `max_iter`: 最大迭代次数
+/// - `tol`: 残差相对下降容差（$\|r_k\| / \|b\| < tol$ 时停止）
+///
+/// # 返回
+/// - `Some(x)`：近似解
+/// - `None`：达到最大迭代次数仍未收敛，或维度不匹配
+pub fn conjugate_gradient_preconditioned(
+    a: &CsMat<f64>,
+    b: &[f64],
+    preconditioner: &[f64],
+    max_iter: usize,
+    tol: f64,
+) -> Option<Vec<f64>> {
+    let n = a.rows();
+    // 维度不匹配时返回 None 而非 panic
+    if n != b.len() || n != preconditioner.len() {
         return None;
     }
     if n == 0 {
@@ -103,14 +213,16 @@ pub fn conjugate_gradient(
     }
 
     let mut x = vec![0.0; n];
-    let mut r = b.to_vec(); // r_0 = b - A*x_0 = b
+    let mut r = b.to_vec(); // r_0 = b - A*x_0 = b（x_0 = 0）
 
-    // r = b - A*x (初始 x=0)
-    // 实际上我们用 r = b 开始，但严格来说应该是 r = b - A*x
-    // 初始残差已正确，因为 x_0 = 0
-
-    let mut p = r.clone();
-    let mut rsold = dot(&r, &r);
+    // z_0 = M^{-1} * r_0（逐元素乘）
+    let mut z: Vec<f64> = r
+        .iter()
+        .zip(preconditioner.iter())
+        .map(|(ri, mi)| ri * mi)
+        .collect();
+    let mut p = z.clone();
+    let mut rz_old = dot(&r, &z);
 
     for _iter in 0..max_iter {
         // Ap = A * p
@@ -121,7 +233,7 @@ pub fn conjugate_gradient(
         if p_ap.abs() < 1e-30 {
             return None;
         }
-        let alpha = rsold / p_ap;
+        let alpha = rz_old / p_ap;
 
         // x_{k+1} = x_k + alpha * p_k
         for i in 0..n {
@@ -133,29 +245,52 @@ pub fn conjugate_gradient(
             r[i] -= alpha * ap[i];
         }
 
-        let rsnew = dot(&r, &r);
-        let residual_rel = rsnew.sqrt() / b_norm;
-
+        let residual_rel = norm2(&r) / b_norm;
         if residual_rel < tol {
             return Some(x);
         }
 
-        // 除零守卫：rsold 为零时无法计算 beta
-        if rsold.abs() < 1e-30 {
+        // z_{k+1} = M^{-1} * r_{k+1}（逐元素乘）
+        for i in 0..n {
+            z[i] = r[i] * preconditioner[i];
+        }
+
+        let rz_new = dot(&r, &z);
+
+        // 除零守卫：rz_old 为零时无法计算 beta
+        if rz_old.abs() < 1e-30 {
             return None;
         }
-        // beta = rsnew / rsold
-        let beta = rsnew / rsold;
+        let beta = rz_new / rz_old;
 
-        // p_{k+1} = r_{k+1} + beta * p_k
+        // p_{k+1} = z_{k+1} + beta * p_k
         for i in 0..n {
-            p[i] = r[i] + beta * p[i];
+            p[i] = z[i] + beta * p[i];
         }
 
-        rsold = rsnew;
+        rz_old = rz_new;
     }
 
     None
+}
+
+/// 构建 Jacobi（对角）预条件向量。
+///
+/// 提取稀疏矩阵 $A$ 的对角线，返回 $M^{-1}$ 的对角元
+/// （$1 / A_{ii}$），用于 [`conjugate_gradient_preconditioned`]。
+///
+/// 对角元为零或缺失的行用 `1.0` 替代以避免除零。
+pub fn jacobi_preconditioner(a: &CsMat<f64>) -> Vec<f64> {
+    let n = a.rows();
+    let mut diag_inv = vec![1.0; n];
+    for (i, slot) in diag_inv.iter_mut().enumerate() {
+        if let Some(&val) = a.get(i, i)
+            && val.abs() > 1e-30
+        {
+            *slot = 1.0 / val;
+        }
+    }
+    diag_inv
 }
 
 /// 对稀疏 SPD 矩阵做对角正则化：`A_reg = A + lambda * I`。
@@ -385,7 +520,10 @@ mod tests {
         tri.add_triplet(2, 2, 1.0);
         let a = tri.to_csr();
         let b = vec![0.0, 0.0, 0.0];
-        assert_eq!(conjugate_gradient(&a, &b, 10, 1e-10), Some(vec![0.0, 0.0, 0.0]));
+        assert_eq!(
+            conjugate_gradient(&a, &b, 10, 1e-10),
+            Some(vec![0.0, 0.0, 0.0])
+        );
     }
 
     #[test]
@@ -458,5 +596,121 @@ mod tests {
         sys.add_diag(0, 2.0);
         let a = sys.finish();
         assert!((a.get(0, 0).unwrap() - 3.0).abs() < 1e-14);
+    }
+
+    // ------------------------------------------------------------
+    // 预条件共轭梯度法（PCG）测试
+    // ------------------------------------------------------------
+
+    #[test]
+    fn test_jacobi_preconditioner_extracts_diagonal() {
+        // A 对角线 = [2, 4, 0.5, 8]，期望 M^{-1} = [0.5, 0.25, 2.0, 0.125]
+        let mut tri = TriMat::new((4, 4));
+        tri.add_triplet(0, 0, 2.0);
+        tri.add_triplet(1, 1, 4.0);
+        tri.add_triplet(2, 2, 0.5);
+        tri.add_triplet(3, 3, 8.0);
+        tri.add_triplet(0, 1, 1.0);
+        tri.add_triplet(1, 0, 1.0);
+        tri.add_triplet(2, 3, -1.0);
+        tri.add_triplet(3, 2, -1.0);
+        let a = tri.to_csr();
+        let precond = jacobi_preconditioner(&a);
+        assert!((precond[0] - 0.5).abs() < 1e-14);
+        assert!((precond[1] - 0.25).abs() < 1e-14);
+        assert!((precond[2] - 2.0).abs() < 1e-14);
+        assert!((precond[3] - 0.125).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_jacobi_preconditioner_zero_diagonal_guard() {
+        // 对角元为零或缺失时应用 1.0 守卫
+        let mut tri = TriMat::new((3, 3));
+        tri.add_triplet(0, 0, 2.0);
+        tri.add_triplet(1, 1, 0.0); // 显式零对角元
+        // (2,2) 不存储，缺失对角元
+        tri.add_triplet(0, 1, 1.0);
+        tri.add_triplet(1, 0, 1.0);
+        let a = tri.to_csr();
+        let precond = jacobi_preconditioner(&a);
+        assert!((precond[0] - 0.5).abs() < 1e-14);
+        assert!((precond[1] - 1.0).abs() < 1e-14, "零对角元应守卫为 1.0");
+        assert!((precond[2] - 1.0).abs() < 1e-14, "缺失对角元应守卫为 1.0");
+    }
+
+    #[test]
+    fn test_pcg_fewer_iterations_than_plain_cg() {
+        // 构造病态对角矩阵：对角线 = [1, 2, 4, ..., 2^19]
+        // 条件数 = 2^19 ≈ 5e5，普通 CG 需多达 n 次迭代
+        // Jacobi 预条件将其变为单位矩阵，PCG 1 步即收敛
+        let n = 20;
+        let mut tri = TriMat::new((n, n));
+        for i in 0..n {
+            tri.add_triplet(i, i, 2f64.powi(i as i32));
+        }
+        let a = tri.to_csr();
+        let b = vec![1.0; n];
+
+        let precond = jacobi_preconditioner(&a);
+
+        // 普通 CG 在 5 次迭代内不收敛
+        assert!(
+            conjugate_gradient(&a, &b, 5, 1e-10).is_none(),
+            "普通 CG 不应在 5 次迭代内收敛此病态系统"
+        );
+
+        // PCG 在 5 次迭代内收敛
+        let x_pcg = conjugate_gradient_preconditioned(&a, &b, &precond, 5, 1e-10)
+            .expect("PCG 应在 5 次迭代内收敛");
+
+        // 验证解的正确性
+        let ax = sparse_matvec(&a, &x_pcg);
+        for i in 0..n {
+            assert!(
+                (ax[i] - b[i]).abs() < 1e-8,
+                "分量 {i}: Ax={} b={}",
+                ax[i],
+                b[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_pcg_same_solution_as_plain_cg() {
+        // A = [[2, 1, 0], [1, 3, -1], [0, -1, 2]]
+        let mut tri = TriMat::new((3, 3));
+        tri.add_triplet(0, 0, 2.0);
+        tri.add_triplet(1, 1, 3.0);
+        tri.add_triplet(2, 2, 2.0);
+        tri.add_triplet(0, 1, 1.0);
+        tri.add_triplet(1, 0, 1.0);
+        tri.add_triplet(1, 2, -1.0);
+        tri.add_triplet(2, 1, -1.0);
+        let a = tri.to_csr();
+        let b = vec![1.0, 0.0, 1.0];
+
+        let x_plain = conjugate_gradient(&a, &b, 100, 1e-12).unwrap();
+        let precond = jacobi_preconditioner(&a);
+        let x_pcg = conjugate_gradient_preconditioned(&a, &b, &precond, 100, 1e-12).unwrap();
+
+        for i in 0..3 {
+            assert!(
+                (x_plain[i] - x_pcg[i]).abs() < 1e-10,
+                "分量 {i}: 普通 CG={} PCG={}",
+                x_plain[i],
+                x_pcg[i]
+            );
+        }
+    }
+
+    #[test]
+    fn pcg_dimension_mismatch_returns_none() {
+        let mut tri = TriMat::new((2, 2));
+        tri.add_triplet(0, 0, 1.0);
+        tri.add_triplet(1, 1, 1.0);
+        let a = tri.to_csr();
+        let b = vec![1.0, 2.0];
+        let precond = vec![1.0, 2.0, 3.0]; // 长度 3 ≠ 矩阵维度 2
+        assert!(conjugate_gradient_preconditioned(&a, &b, &precond, 10, 1e-10).is_none());
     }
 }

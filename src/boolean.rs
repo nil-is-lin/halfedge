@@ -25,6 +25,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
+
 use crate::ids::{FaceId, VertexId};
 use crate::linalg::vec3;
 use crate::predicates::{is_triangle_degenerate_3d, orient3d, point_in_triangle_2d};
@@ -64,7 +66,13 @@ pub enum BoolOp {
 /// - 端点恰在平面上 → 返回 `None`，避免重复顶点。
 ///
 /// 返回 `(交点坐标, 线段参数 t ∈ (1e-9, 1-1e-9))`。
-fn segment_triangle_intersection(p0: vec3::Vec3, p1: vec3::Vec3, v0: vec3::Vec3, v1: vec3::Vec3, v2: vec3::Vec3) -> Option<(vec3::Vec3, f64)> {
+fn segment_triangle_intersection(
+    p0: vec3::Vec3,
+    p1: vec3::Vec3,
+    v0: vec3::Vec3,
+    v1: vec3::Vec3,
+    v2: vec3::Vec3,
+) -> Option<(vec3::Vec3, f64)> {
     let s0 = orient3d(v0, v1, v2, p0);
     let s1 = orient3d(v0, v1, v2, p1);
 
@@ -126,7 +134,12 @@ fn point_in_triangle_3d(p: vec3::Vec3, v0: vec3::Vec3, v1: vec3::Vec3, v2: vec3:
 /// 当两条共面线段不平行时，投影到 2D 用参数方程求交点。
 /// 返回 `(交点坐标, 线段1参数 t1, 线段2参数 t2)`，均 ∈ `(1e-9, 1-1e-9)`。
 /// 平行/共线/端点相交返回 `None`。
-fn coplanar_segment_segment_3d(e1a: vec3::Vec3, e1b: vec3::Vec3, e2a: vec3::Vec3, e2b: vec3::Vec3) -> Option<(vec3::Vec3, f64, f64)> {
+fn coplanar_segment_segment_3d(
+    e1a: vec3::Vec3,
+    e1b: vec3::Vec3,
+    e2a: vec3::Vec3,
+    e2b: vec3::Vec3,
+) -> Option<(vec3::Vec3, f64, f64)> {
     let d1 = vec3::sub(e1b, e1a);
     let d2 = vec3::sub(e2b, e2a);
     let normal = vec3::cross(d1, d2);
@@ -366,7 +379,7 @@ fn is_point_on_segment_3d(p: vec3::Vec3, a: vec3::Vec3, b: vec3::Vec3) -> bool {
     if !(-1e-9..=1.0 + 1e-9).contains(&t) {
         return false;
     }
-    let closest = vec3::add(a, vec3::scale(d, t.max(0.0).min(1.0)));
+    let closest = vec3::add(a, vec3::scale(d, t.clamp(0.0, 1.0)));
     vec3::dot(vec3::sub(p, closest), vec3::sub(p, closest)) < 1e-18
 }
 
@@ -474,7 +487,11 @@ fn collect_face_positions(mesh: &MeshStorage, f: FaceId) -> [vec3::Vec3; 3] {
 /// 可能是背对背共面（A 的面法向 +z，B 的面法向 -z），内向偏移使采样点
 /// 离开对方体积。此时用 2D 包含检测：若三角形重心与网格某面共面且
 /// 在该面的 2D 投影内，则判定为 inside。
-fn is_triangle_inside_mesh(tri: [vec3::Vec3; 3], mesh: &MeshStorage, bvh: &crate::bvh::Bvh) -> bool {
+fn is_triangle_inside_mesh(
+    tri: [vec3::Vec3; 3],
+    mesh: &MeshStorage,
+    bvh: &crate::bvh::Bvh,
+) -> bool {
     if mesh.face_count() == 0 {
         return false;
     }
@@ -539,7 +556,9 @@ fn is_coplanar_centroid_inside_mesh_face(
         let s0 = orient3d(tri_b[0], tri_b[1], tri_b[2], tri[0]);
         let s1 = orient3d(tri_b[0], tri_b[1], tri_b[2], tri[1]);
         let s2 = orient3d(tri_b[0], tri_b[1], tri_b[2], tri[2]);
-        if s0 == 0.0 && s1 == 0.0 && s2 == 0.0
+        if s0 == 0.0
+            && s1 == 0.0
+            && s2 == 0.0
             && point_in_triangle_3d(centroid, tri_b[0], tri_b[1], tri_b[2])
         {
             return true;
@@ -650,7 +669,9 @@ fn collect_triangle_intersections(
         let s0 = orient3d(tri_b[0], tri_b[1], tri_b[2], tri[0]);
         let s1 = orient3d(tri_b[0], tri_b[1], tri_b[2], tri[1]);
         let s2 = orient3d(tri_b[0], tri_b[1], tri_b[2], tri[2]);
-        if s0 == 0.0 && s1 == 0.0 && s2 == 0.0
+        if s0 == 0.0
+            && s1 == 0.0
+            && s2 == 0.0
             && let Some(overlap) = coplanar_triangle_overlap(tri, tri_b)
         {
             coplanar_processed.insert(*f);
@@ -763,46 +784,71 @@ pub fn boolean_operation(mesh_a: &MeshStorage, mesh_b: &MeshStorage, op: BoolOp)
 
     let mut kept_triangles: Vec<[vec3::Vec3; 3]> = Vec::new();
 
-    for f in mesh_a.face_ids() {
-        let tri = collect_face_positions(mesh_a, f);
-        if is_triangle_degenerate_3d(tri[0], tri[1], tri[2]) {
-            continue;
-        }
-
-        let (edge_intersections, interior_points) =
-            collect_triangle_intersections(tri, mesh_b, &bvh_b);
-        let sub_tris = split_triangle_by_intersections(tri, &edge_intersections, &interior_points);
-
-        for sub_tri in sub_tris {
-            if is_triangle_degenerate_3d(sub_tri[0], sub_tri[1], sub_tri[2]) {
-                continue;
+    // 并行处理 mesh_a 的每个面：收集交点 → 分裂 → 内外分类。
+    // 每个面独立计算，无共享可变状态，适合 gather-scatter 并行。
+    let faces_a: Vec<FaceId> = mesh_a.face_ids().collect();
+    let a_results: Vec<Vec<[vec3::Vec3; 3]>> = faces_a
+        .par_iter()
+        .filter_map(|&f| {
+            let tri = collect_face_positions(mesh_a, f);
+            if is_triangle_degenerate_3d(tri[0], tri[1], tri[2]) {
+                return None;
             }
-            let inside_b = is_triangle_inside_mesh(sub_tri, mesh_b, &bvh_b);
-            if classify(op, true, inside_b) {
-                kept_triangles.push(sub_tri);
+
+            let (edge_intersections, interior_points) =
+                collect_triangle_intersections(tri, mesh_b, &bvh_b);
+            let sub_tris =
+                split_triangle_by_intersections(tri, &edge_intersections, &interior_points);
+
+            let mut kept = Vec::new();
+            for sub_tri in sub_tris {
+                if is_triangle_degenerate_3d(sub_tri[0], sub_tri[1], sub_tri[2]) {
+                    continue;
+                }
+                let inside_b = is_triangle_inside_mesh(sub_tri, mesh_b, &bvh_b);
+                if classify(op, true, inside_b) {
+                    kept.push(sub_tri);
+                }
             }
-        }
+            Some(kept)
+        })
+        .collect();
+
+    for kept in a_results {
+        kept_triangles.extend(kept);
     }
 
-    for f in mesh_b.face_ids() {
-        let tri = collect_face_positions(mesh_b, f);
-        if is_triangle_degenerate_3d(tri[0], tri[1], tri[2]) {
-            continue;
-        }
-
-        let (edge_intersections, interior_points) =
-            collect_triangle_intersections(tri, mesh_a, &bvh_a);
-        let sub_tris = split_triangle_by_intersections(tri, &edge_intersections, &interior_points);
-
-        for sub_tri in sub_tris {
-            if is_triangle_degenerate_3d(sub_tri[0], sub_tri[1], sub_tri[2]) {
-                continue;
+    // 并行处理 mesh_b 的每个面（同上）
+    let faces_b: Vec<FaceId> = mesh_b.face_ids().collect();
+    let b_results: Vec<Vec<[vec3::Vec3; 3]>> = faces_b
+        .par_iter()
+        .filter_map(|&f| {
+            let tri = collect_face_positions(mesh_b, f);
+            if is_triangle_degenerate_3d(tri[0], tri[1], tri[2]) {
+                return None;
             }
-            let inside_a = is_triangle_inside_mesh(sub_tri, mesh_a, &bvh_a);
-            if classify(op, false, inside_a) {
-                kept_triangles.push(sub_tri);
+
+            let (edge_intersections, interior_points) =
+                collect_triangle_intersections(tri, mesh_a, &bvh_a);
+            let sub_tris =
+                split_triangle_by_intersections(tri, &edge_intersections, &interior_points);
+
+            let mut kept = Vec::new();
+            for sub_tri in sub_tris {
+                if is_triangle_degenerate_3d(sub_tri[0], sub_tri[1], sub_tri[2]) {
+                    continue;
+                }
+                let inside_a = is_triangle_inside_mesh(sub_tri, mesh_a, &bvh_a);
+                if classify(op, false, inside_a) {
+                    kept.push(sub_tri);
+                }
             }
-        }
+            Some(kept)
+        })
+        .collect();
+
+    for kept in b_results {
+        kept_triangles.extend(kept);
     }
 
     let total_v_cap = kept_triangles.len() * 3;
@@ -821,9 +867,7 @@ pub fn boolean_operation(mesh_a: &MeshStorage, mesh_b: &MeshStorage, op: BoolOp)
     }
 
     if failed_tris > 0 {
-        eprintln!(
-            "[halfedge::boolean] 警告：{failed_tris} 个三角形创建失败（拓扑冲突），已跳过"
-        );
+        log::warn!("[halfedge::boolean] 警告：{failed_tris} 个三角形创建失败（拓扑冲突），已跳过");
     }
 
     result
@@ -927,7 +971,7 @@ mod tests {
             [1, 2, 6],
             [1, 6, 5],
         ];
-        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces)
+        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap()
     }
 
     /// 构建平移后的单位立方体
@@ -956,7 +1000,7 @@ mod tests {
             [1, 2, 6],
             [1, 6, 5],
         ];
-        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces)
+        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap()
     }
 
     #[test]
@@ -1036,13 +1080,22 @@ mod tests {
         let overlap = coplanar_triangle_overlap(big, small);
         assert!(overlap.is_some(), "contained triangle should have overlap");
         let poly = overlap.unwrap();
-        assert_eq!(poly.len(), 3, "overlap of containment should be the inner triangle");
+        assert_eq!(
+            poly.len(),
+            3,
+            "overlap of containment should be the inner triangle"
+        );
         // 验证重叠多边形 ≈ small 三角形
         for &v in &poly {
             let is_small_vertex = small.iter().any(|&s| {
-                (s[0] - v[0]).abs() < 1e-9 && (s[1] - v[1]).abs() < 1e-9 && (s[2] - v[2]).abs() < 1e-9
+                (s[0] - v[0]).abs() < 1e-9
+                    && (s[1] - v[1]).abs() < 1e-9
+                    && (s[2] - v[2]).abs() < 1e-9
             });
-            assert!(is_small_vertex, "overlap vertex should match small triangle vertex");
+            assert!(
+                is_small_vertex,
+                "overlap vertex should match small triangle vertex"
+            );
         }
     }
 
@@ -1052,7 +1105,10 @@ mod tests {
         let a = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
         let b = [[2.0, 0.0, 0.0], [6.0, 0.0, 0.0], [2.0, 4.0, 0.0]];
         let overlap = coplanar_triangle_overlap(a, b);
-        assert!(overlap.is_some(), "partially overlapping triangles should have overlap");
+        assert!(
+            overlap.is_some(),
+            "partially overlapping triangles should have overlap"
+        );
         let poly = overlap.unwrap();
         assert!(poly.len() >= 3, "partial overlap should produce a polygon");
     }
@@ -1063,7 +1119,10 @@ mod tests {
         let a = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let b = [[5.0, 5.0, 0.0], [6.0, 5.0, 0.0], [5.0, 6.0, 0.0]];
         let overlap = coplanar_triangle_overlap(a, b);
-        assert!(overlap.is_none(), "disjoint coplanar triangles should have no overlap");
+        assert!(
+            overlap.is_none(),
+            "disjoint coplanar triangles should have no overlap"
+        );
     }
 
     #[test]
@@ -1072,7 +1131,10 @@ mod tests {
         let a = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let b = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let overlap = coplanar_triangle_overlap(a, b);
-        assert!(overlap.is_none(), "non-coplanar triangles should return None");
+        assert!(
+            overlap.is_none(),
+            "non-coplanar triangles should return None"
+        );
     }
 
     /// 构建长方体 [min, max]³
@@ -1088,14 +1150,20 @@ mod tests {
             [min[0], max[1], max[2]],
         ];
         let faces: Vec<[u32; 3]> = vec![
-            [0, 3, 2], [0, 2, 1],
-            [4, 5, 6], [4, 6, 7],
-            [0, 1, 5], [0, 5, 4],
-            [3, 7, 6], [3, 6, 2],
-            [0, 4, 7], [0, 7, 3],
-            [1, 2, 6], [1, 6, 5],
+            [0, 3, 2],
+            [0, 2, 1],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 1, 5],
+            [0, 5, 4],
+            [3, 7, 6],
+            [3, 6, 2],
+            [0, 4, 7],
+            [0, 7, 3],
+            [1, 2, 6],
+            [1, 6, 5],
         ];
-        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces)
+        crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap()
     }
 
     #[test]
@@ -1109,13 +1177,19 @@ mod tests {
         // A - B: 大立方体顶面应有"洞"（小立方体底面区域被切除）
         // 验证结果非空且是有效闭合流形
         assert!(result.face_count() > 0, "difference should be non-empty");
-        assert!(result.face_count() < big.face_count() + small.face_count(),
-            "difference should have fewer faces than combined input");
+        assert!(
+            result.face_count() < big.face_count() + small.face_count(),
+            "difference should have fewer faces than combined input"
+        );
 
         // 验证拓扑一致性
         let errors = crate::validate::validate_topology(&result);
-        assert!(errors.is_empty(), "result should be topologically valid, got {} errors: {:?}",
-            errors.len(), errors.first());
+        assert!(
+            errors.is_empty(),
+            "result should be topologically valid, got {} errors: {:?}",
+            errors.len(),
+            errors.first()
+        );
     }
 
     #[test]
@@ -1128,8 +1202,12 @@ mod tests {
 
         // 验证拓扑一致性
         let errors = crate::validate::validate_topology(&result);
-        assert!(errors.is_empty(), "result should be topologically valid, got {} errors: {:?}",
-            errors.len(), errors.first());
+        assert!(
+            errors.is_empty(),
+            "result should be topologically valid, got {} errors: {:?}",
+            errors.len(),
+            errors.first()
+        );
     }
 
     #[test]
@@ -1140,7 +1218,10 @@ mod tests {
 
         // 两个立方体仅共面接触（无体积重叠），共面回退将共享面判定为 inside。
         // 交集结果包含两侧的共面面片（可能非流形），验证至少非空。
-        assert!(result.face_count() > 0, "intersection should have the coplanar overlap");
+        assert!(
+            result.face_count() > 0,
+            "intersection should have the coplanar overlap"
+        );
     }
 
     // ===== 空网格测试 =====
@@ -1288,9 +1369,7 @@ mod tests {
         // 绕 Z 轴旋转 45° 的同尺寸 cube
         let theta = std::f64::consts::FRAC_PI_4;
         let (c, s) = (theta.cos(), theta.sin());
-        let rotate = |p: [f64; 3]| -> [f64; 3] {
-            [p[0] * c - p[1] * s, p[0] * s + p[1] * c, p[2]]
-        };
+        let rotate = |p: [f64; 3]| -> [f64; 3] { [p[0] * c - p[1] * s, p[0] * s + p[1] * c, p[2]] };
         let h = 0.5;
         let verts: Vec<[f64; 3]> = [
             [-h, -h, -h],
@@ -1319,7 +1398,7 @@ mod tests {
             [1, 2, 6],
             [1, 6, 5],
         ];
-        let b = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces);
+        let b = crate::io::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
 
         let result = boolean_union(&a, &b);
         assert!(

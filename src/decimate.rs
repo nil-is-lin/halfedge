@@ -22,13 +22,28 @@
 //! - 折叠失败（链接条件、退化）时跳过该边继续。
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::geometry::face_normal;
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
+use crate::predicates::is_triangle_degenerate_3d;
 use crate::storage::MeshStorage;
+
+/// 边代价最小堆条目类型。
+type EdgeCostHeap = BinaryHeap<(Reverse<CostKey>, HalfEdgeId)>;
+/// 边代价映射表：半边 → (代价, 最优位置)。
+type EdgeCostMap = HashMap<HalfEdgeId, (f64, [f64; 3])>;
+
+/// 折叠结果信息，用于更新 quadrics 和重算邻边代价。
+struct CollapseInfo {
+    k: VertexId,
+    v_a: VertexId,
+    v_b: VertexId,
+    q_k: Quadric,
+    deleted_hes: Vec<HalfEdgeId>,
+}
 use crate::topology_ops::{TopologyError, collapse_edge_at};
-use crate::traversal::{FaceHalfEdges, VertexRing, is_boundary_edge};
+use crate::traversal::{FaceHalfEdges, VertexAdjacentFaces, VertexRing, is_boundary_edge};
 
 // ============================================================
 // Quadric 二次误差矩阵
@@ -124,10 +139,7 @@ impl Quadric {
 
         // 相对阈值：以 Frobenius 范数的立方为矩阵规模尺度
         // 对称矩阵 |A|_F² = q00² + 2(q01² + q02² + q12²) + q11² + q22²
-        let norm_sq = q00 * q00
-            + 2.0 * (q01 * q01 + q02 * q02 + q12 * q12)
-            + q11 * q11
-            + q22 * q22;
+        let norm_sq = q00 * q00 + 2.0 * (q01 * q01 + q02 * q02 + q12 * q12) + q11 * q11 + q22 * q22;
         if norm_sq == 0.0 {
             return None; // 零矩阵，奇异
         }
@@ -156,11 +168,31 @@ impl Quadric {
 // ============================================================
 
 /// 计算面的平面方程 $\\(a, b, c, d\\)$，其中 $ax+by+cz+d=0$，$(a,b,c)$ 为单位法向。
+///
+/// 使用 Shewchuk 鲁棒谓词 [`is_triangle_degenerate_3d`] 检测退化三角形，
+/// 确保在近退化情况下不会因浮点误差给出错误平面方程。
 fn face_plane(mesh: &MeshStorage, f: FaceId) -> Option<(f64, f64, f64, f64)> {
-    let n = face_normal(mesh, f)?;
     let he = mesh.get_face(f)?.halfedge?;
-    let v0 = mesh.get_halfedge(he)?.vertex;
+    let h = mesh.get_halfedge(he)?;
+    let v0 = h.vertex;
     let p0 = mesh.get_vertex(v0)?.position;
+
+    let he2 = h.next?;
+    let h2 = mesh.get_halfedge(he2)?;
+    let v1 = h2.vertex;
+    let p1 = mesh.get_vertex(v1)?.position;
+
+    let he3 = h2.next?;
+    let h3 = mesh.get_halfedge(he3)?;
+    let v2 = h3.vertex;
+    let p2 = mesh.get_vertex(v2)?.position;
+
+    // 鲁棒退化检测：跳过退化三角形，避免错误平面方程污染 QEM 矩阵
+    if is_triangle_degenerate_3d(p0, p1, p2) {
+        return None;
+    }
+
+    let n = face_normal(mesh, f)?;
     let d = -(n[0] * p0[0] + n[1] * p0[1] + n[2] * p0[2]);
     Some((n[0], n[1], n[2], d))
 }
@@ -246,6 +278,58 @@ impl Ord for CostKey {
 // 公开 API
 // ============================================================
 
+/// 检查折叠边 `(v_a, v_b)` 到位置 `new_pos` 是否会产生退化三角形。
+///
+/// 遍历 `v_a` 和 `v_b` 的所有邻接面（排除将被删除的两个面 `f1`、`f2`），
+/// 将折叠后保留的顶点替换为 `new_pos`，用 Shewchuk 鲁棒谓词
+/// [`is_triangle_degenerate_3d`] 检测是否退化。
+///
+/// 返回 `true` 表示折叠会产生退化三角形，应跳过该边。
+fn would_collapse_create_degenerate(
+    mesh: &MeshStorage,
+    v_a: VertexId,
+    v_b: VertexId,
+    f1: Option<FaceId>,
+    f2: Option<FaceId>,
+    new_pos: [f64; 3],
+) -> bool {
+    // 收集 v_a 和 v_b 的所有邻接面，排除将被删除的 f1、f2
+    let faces: HashSet<FaceId> = VertexAdjacentFaces::new(mesh, v_a)
+        .chain(VertexAdjacentFaces::new(mesh, v_b))
+        .filter(|&f| Some(f) != f1 && Some(f) != f2)
+        .collect();
+
+    for f in faces {
+        let halfedges: Vec<HalfEdgeId> = FaceHalfEdges::new(mesh, f).collect();
+        if halfedges.len() != 3 {
+            continue;
+        }
+
+        // 获取三角面的三个顶点位置，将 v_a 和 v_b 替换为 new_pos
+        let mut tri = [[0.0; 3]; 3];
+        for (i, &he) in halfedges.iter().enumerate() {
+            let v = match mesh.get_halfedge(he) {
+                Some(h) => h.vertex,
+                None => return false,
+            };
+            tri[i] = if v == v_a || v == v_b {
+                new_pos
+            } else {
+                match mesh.get_vertex(v) {
+                    Some(vt) => vt.position,
+                    None => return false,
+                }
+            };
+        }
+
+        if is_triangle_degenerate_3d(tri[0], tri[1], tri[2]) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// 使用 QEM 将网格简化到目标面数。
 ///
 /// 每次折叠代价最小且满足链接条件的边，直到面数 $\le$ `target_faces`。
@@ -264,76 +348,35 @@ impl Ord for CostKey {
 /// - 边界边不参与折叠；
 /// - QEM 矩阵奇异时回退到端点/中点中代价最小者；
 /// - 折叠失败（链接条件、退化）时跳过。
+///
+/// ```
+/// use halfedge::{build_icosphere, decimate_qem};
+///
+/// let mut mesh = build_icosphere(2); // V=162, F=320
+/// let removed = decimate_qem(&mut mesh, 160).unwrap();
+/// assert!(mesh.face_count() <= 160);
+/// assert!(removed > 0);
+/// ```
 pub fn decimate_qem(mesh: &mut MeshStorage, target_faces: usize) -> Result<usize, TopologyError> {
     let initial_faces = mesh.face_count();
     if target_faces >= initial_faces {
         return Ok(0);
     }
 
-    // ---------- 1. 初始化顶点 Quadric ----------
-    let mut quadrics: HashMap<VertexId, Quadric> = HashMap::new();
-    for v_id in mesh.vertex_ids() {
-        quadrics.insert(v_id, Quadric::zero());
-    }
-    for f_id in mesh.face_ids() {
-        if let Some((a, b, c, d)) = face_plane(mesh, f_id) {
-            let kp = Quadric::from_plane(a, b, c, d);
-            for he in FaceHalfEdges::new(mesh, f_id) {
-                if let Some(h) = mesh.get_halfedge(he)
-                    && let Some(q) = quadrics.get_mut(&h.vertex)
-                {
-                    *q = q.add(&kp);
-                }
-            }
-        }
-    }
+    let mut quadrics = init_vertex_quadrics(mesh);
+    let (mut heap, mut cost_map) = build_edge_cost_heap(mesh, &quadrics);
 
-    // ---------- 2. 构建边代价堆 ----------
-    let mut heap: BinaryHeap<(Reverse<CostKey>, HalfEdgeId)> = BinaryHeap::new();
-    let mut cost_map: HashMap<HalfEdgeId, (f64, [f64; 3])> = HashMap::new();
-
-    for he_id in mesh.halfedge_ids() {
-        if is_boundary_edge(mesh, he_id) {
-            continue;
-        }
-        if let Some((cost, pos)) = edge_cost_and_position(mesh, he_id, &quadrics) {
-            heap.push((Reverse(CostKey(cost)), he_id));
-            cost_map.insert(he_id, (cost, pos));
-        }
-    }
-
-    // ---------- 3. 贪心折叠循环 ----------
     let mut faces_removed = 0;
-
     while mesh.face_count() > target_faces {
         let (Reverse(CostKey(heap_cost)), he_id) = match heap.pop() {
             Some(entry) => entry,
-            None => break, // 堆空，无法继续
+            None => break,
         };
 
-        // 半边是否仍有效
-        if !mesh.contains_halfedge(he_id) {
+        if is_heap_entry_stale(mesh, heap_cost, he_id, &cost_map) {
             continue;
         }
 
-        // 过期条目检测（代价已更新）
-        // 使用相对容差 1e-9 * max(|heap|, |stored|, 1)：
-        // 绝对阈值在大坐标网格上（cost ~ 1e6）会把合法条目误判为过期
-        let (stored_cost, stored_pos) = match cost_map.get(&he_id) {
-            Some(&c) => c,
-            None => continue,
-        };
-        let tol = 1e-9 * heap_cost.abs().max(stored_cost.abs()).max(1.0);
-        if (heap_cost - stored_cost).abs() > tol {
-            continue;
-        }
-
-        // 是否已变为边界边
-        if is_boundary_edge(mesh, he_id) {
-            continue;
-        }
-
-        // 获取端点与待删除半边
         let h = match mesh.get_halfedge(he_id) {
             Some(h) => h.clone(),
             None => continue,
@@ -346,64 +389,187 @@ pub fn decimate_qem(mesh: &mut MeshStorage, target_faces: usize) -> Result<usize
             Some(t) => t.clone(),
             None => continue,
         };
-        let v_a = twin.vertex; // origin
-        let v_b = h.vertex; // tip
+        let v_a = twin.vertex;
+        let v_b = h.vertex;
 
-        // 收集 6 条将被删除的半边
-        let deleted_hes: Vec<HalfEdgeId> = [he_id, twin_id]
-            .iter()
-            .copied()
-            .chain(h.next)
-            .chain(h.prev)
-            .chain(twin.next)
-            .chain(twin.prev)
-            .collect();
+        let deleted_hes = collect_deleted_halfedges(&h, &twin, he_id, twin_id);
 
-        // 合并 Quadric
         let q_a = quadrics.get(&v_a).cloned().unwrap_or_else(Quadric::zero);
         let q_b = quadrics.get(&v_b).cloned().unwrap_or_else(Quadric::zero);
         let q_k = q_a.add(&q_b);
 
-        // 执行折叠
+        let stored_pos = cost_map[&he_id].1;
+        if would_collapse_create_degenerate(mesh, v_a, v_b, h.face, twin.face, stored_pos) {
+            continue;
+        }
+
         match collapse_edge_at(mesh, he_id, stored_pos) {
             Ok(k) => {
                 faces_removed += 2;
-
-                // 更新 quadrics
-                quadrics.remove(&v_a);
-                quadrics.remove(&v_b);
-                quadrics.insert(k, q_k);
-
-                // 清理被删除半边的 cost_map
-                for &dh in &deleted_hes {
-                    cost_map.remove(&dh);
-                }
-
-                // 重新计算 K 的邻接边代价
-                for out_he in VertexRing::new(mesh, k).collect::<Vec<_>>() {
-                    if is_boundary_edge(mesh, out_he) {
-                        continue;
-                    }
-                    if let Some((cost, pos)) = edge_cost_and_position(mesh, out_he, &quadrics) {
-                        let twin_he = mesh.get_halfedge(out_he).and_then(|h| h.twin);
-                        heap.push((Reverse(CostKey(cost)), out_he));
-                        cost_map.insert(out_he, (cost, pos));
-                        // 同步更新 twin（同一边的两个方向）
-                        if let Some(t) = twin_he {
-                            heap.push((Reverse(CostKey(cost)), t));
-                            cost_map.insert(t, (cost, pos));
-                        }
-                    }
-                }
+                let info = CollapseInfo {
+                    k,
+                    v_a,
+                    v_b,
+                    q_k,
+                    deleted_hes,
+                };
+                update_quadrics_and_recompute_costs(
+                    mesh,
+                    &mut quadrics,
+                    &mut heap,
+                    &mut cost_map,
+                    &info,
+                );
             }
-            Err(_) => {
-                // 折叠失败（链接条件、退化等），跳过
-                continue;
-            }
+            Err(_) => continue,
         }
     }
 
     Ok(faces_removed)
+}
+
+// ---- decimate_qem 辅助 ----
+
+/// 为每个顶点初始化 Quadric（并行计算面平面方程，顺序合并到顶点）。
+fn init_vertex_quadrics(mesh: &MeshStorage) -> HashMap<VertexId, Quadric> {
+    use rayon::prelude::*;
+
+    let mut quadrics: HashMap<VertexId, Quadric> = HashMap::new();
+    for v_id in mesh.vertex_ids() {
+        quadrics.insert(v_id, Quadric::zero());
+    }
+
+    // 并行计算每个面的平面方程和对应的顶点列表
+    let face_ids: Vec<FaceId> = mesh.face_ids().collect();
+    let face_quadrics: Vec<(Vec<VertexId>, Quadric)> = face_ids
+        .par_iter()
+        .filter_map(|&f_id| {
+            let (a, b, c, d) = face_plane(mesh, f_id)?;
+            let kp = Quadric::from_plane(a, b, c, d);
+            let verts: Vec<VertexId> = FaceHalfEdges::new(mesh, f_id)
+                .filter_map(|he| mesh.get_halfedge(he).map(|h| h.vertex))
+                .collect();
+            Some((verts, kp))
+        })
+        .collect();
+
+    // 顺序合并 quadric 到顶点（避免并行写入 HashMap）
+    for (verts, kp) in face_quadrics {
+        for v in verts {
+            if let Some(q) = quadrics.get_mut(&v) {
+                *q = q.add(&kp);
+            }
+        }
+    }
+    quadrics
+}
+
+/// 为所有非边界边计算代价并构建最小堆。
+fn build_edge_cost_heap(
+    mesh: &MeshStorage,
+    quadrics: &HashMap<VertexId, Quadric>,
+) -> (EdgeCostHeap, EdgeCostMap) {
+    use rayon::prelude::*;
+
+    let he_ids: Vec<HalfEdgeId> = mesh
+        .halfedge_ids()
+        .filter(|&he| !is_boundary_edge(mesh, he))
+        .collect();
+
+    let edge_costs: Vec<(HalfEdgeId, f64, [f64; 3])> = he_ids
+        .par_iter()
+        .filter_map(|&he_id| {
+            let (cost, pos) = edge_cost_and_position(mesh, he_id, quadrics)?;
+            Some((he_id, cost, pos))
+        })
+        .collect();
+
+    let mut heap: EdgeCostHeap = BinaryHeap::new();
+    let mut cost_map: EdgeCostMap = HashMap::new();
+    for (he_id, cost, pos) in edge_costs {
+        heap.push((Reverse(CostKey(cost)), he_id));
+        cost_map.insert(he_id, (cost, pos));
+    }
+    (heap, cost_map)
+}
+
+/// 检查堆条目是否过期：半边已删除、代价已更新、或已变为边界边。
+fn is_heap_entry_stale(
+    mesh: &MeshStorage,
+    heap_cost: f64,
+    he_id: HalfEdgeId,
+    cost_map: &EdgeCostMap,
+) -> bool {
+    if !mesh.contains_halfedge(he_id) {
+        return true;
+    }
+    let (stored_cost, _stored_pos) = match cost_map.get(&he_id) {
+        Some(&c) => c,
+        None => return true,
+    };
+    // 使用相对容差 1e-9 * max(|heap|, |stored|, 1)：
+    // 绝对阈值在大坐标网格上（cost ~ 1e6）会把合法条目误判为过期
+    let tol = 1e-9 * heap_cost.abs().max(stored_cost.abs()).max(1.0);
+    if (heap_cost - stored_cost).abs() > tol {
+        return true;
+    }
+    if is_boundary_edge(mesh, he_id) {
+        return true;
+    }
+    false
+}
+
+/// 收集折叠时将被删除的 6 条半边。
+fn collect_deleted_halfedges(
+    h: &crate::storage::HalfEdge,
+    twin: &crate::storage::HalfEdge,
+    he_id: HalfEdgeId,
+    twin_id: HalfEdgeId,
+) -> Vec<HalfEdgeId> {
+    [he_id, twin_id]
+        .iter()
+        .copied()
+        .chain(h.next)
+        .chain(h.prev)
+        .chain(twin.next)
+        .chain(twin.prev)
+        .collect()
+}
+
+/// 折叠后更新 quadrics、清理 cost_map，并重新计算 K 的邻接边代价。
+fn update_quadrics_and_recompute_costs(
+    mesh: &mut MeshStorage,
+    quadrics: &mut HashMap<VertexId, Quadric>,
+    heap: &mut EdgeCostHeap,
+    cost_map: &mut EdgeCostMap,
+    info: &CollapseInfo,
+) {
+    // 更新 quadrics
+    quadrics.remove(&info.v_a);
+    quadrics.remove(&info.v_b);
+    quadrics.insert(info.k, info.q_k.clone());
+
+    // 清理被删除半边的 cost_map
+    for &dh in &info.deleted_hes {
+        cost_map.remove(&dh);
+    }
+
+    // 重新计算 K 的邻接边代价
+    for out_he in VertexRing::new(mesh, info.k).collect::<Vec<_>>() {
+        if is_boundary_edge(mesh, out_he) {
+            continue;
+        }
+        if let Some((cost, pos)) = edge_cost_and_position(mesh, out_he, quadrics) {
+            let twin_he = mesh.get_halfedge(out_he).and_then(|h| h.twin);
+            heap.push((Reverse(CostKey(cost)), out_he));
+            cost_map.insert(out_he, (cost, pos));
+            // 同步更新 twin（同一边的两个方向）
+            if let Some(t) = twin_he {
+                heap.push((Reverse(CostKey(cost)), t));
+                cost_map.insert(t, (cost, pos));
+            }
+        }
+    }
 }
 
 /// 简化到目标顶点数（等价于 $2 \cdot \text{target\_verts} - 4$ 个面，闭合流形）。
@@ -537,7 +703,7 @@ mod tests {
             [1.0, 1.0, 0.0],
         ];
         let faces = [[0, 1, 2], [1, 3, 2]];
-        let mut mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mut mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         assert_eq!(mesh.face_count(), 2);
 
         // 简化到 0 面：所有代价为 0（共面），应正确折叠对角线
@@ -553,7 +719,7 @@ mod tests {
         // 单个三角形：3 条边界边，无法折叠
         let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = [[0, 1, 2]];
-        let mut mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mut mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         assert_eq!(mesh.face_count(), 1);
 
         let removed = decimate_qem(&mut mesh, 0).expect("简化应成功");

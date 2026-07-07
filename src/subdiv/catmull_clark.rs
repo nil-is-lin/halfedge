@@ -311,6 +311,7 @@ pub fn catmull_clark_subdivide(mesh: &MeshStorage) -> MeshStorage {
 
     // ---------- 8. 构建输出网格 ----------
     build_mesh_from_vertices_and_faces(&new_positions, &new_faces)
+        .expect("Catmull-Clark subdivision output is always valid")
 }
 
 // ============================================================
@@ -353,7 +354,7 @@ mod tests {
             vec![0, 4, 7, 3], // left (-x)
             vec![1, 2, 6, 5], // right (+x)
         ];
-        build_mesh_from_polygons(&vertices, &faces)
+        build_mesh_from_polygons(&vertices, &faces).unwrap()
     }
 
     // ---------- 规模验证 ----------
@@ -431,7 +432,7 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let faces = vec![vec![0, 1, 2, 3]];
-        let mesh = build_mesh_from_polygons(&vertices, &faces);
+        let mesh = build_mesh_from_polygons(&vertices, &faces).unwrap();
         let refined = catmull_clark_subdivide(&mesh);
         assert_eq!(
             refined.vertex_count(),
@@ -450,7 +451,7 @@ mod tests {
         // V=3, E=3, F=1 → V'=3+3+1=7, F'=2*3=6
         let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = vec![vec![0, 1, 2]];
-        let mesh = build_mesh_from_polygons(&vertices, &faces);
+        let mesh = build_mesh_from_polygons(&vertices, &faces).unwrap();
         let refined = catmull_clark_subdivide(&mesh);
         assert_eq!(refined.vertex_count(), 7, "三角形细分后顶点数应为 3+3+1=7");
         assert_eq!(refined.face_count(), 6, "三角形细分后面数应为 2*3=6");
@@ -475,7 +476,7 @@ mod tests {
             vec![0, 3, 2], // left
             vec![1, 2, 3], // top
         ];
-        let mesh = build_mesh_from_polygons(&vertices, &faces);
+        let mesh = build_mesh_from_polygons(&vertices, &faces).unwrap();
         let refined = catmull_clark_subdivide(&mesh);
         assert_eq!(
             refined.vertex_count(),

@@ -64,7 +64,7 @@ fn main() {
         [2.0, 0.0, 0.0], // 与 A、B 共线
     ];
     let faces = [[0, 1, 2]];
-    let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+    let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
     let errors = validate_topology(&mesh);
     let has_degenerate = errors
         .iter()
@@ -110,7 +110,7 @@ fn build_two_triangle_mesh() -> (halfedge::MeshStorage, Vec<halfedge::HalfEdgeId
         [0.0, 1.0, 0.0],
     ];
     let faces = [[0, 1, 2], [0, 2, 3]];
-    let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+    let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
     let hes: Vec<_> = mesh.halfedge_ids().collect();
     (mesh, hes)
 }

@@ -217,34 +217,42 @@ impl FaceId {
 // ============================================================
 
 impl MeshQuery<HalfEdgeId> {
+    /// 取当前半边的 twin 半边（反向边）。
     pub fn twin(self) -> MeshQuery<HalfEdgeId> {
         self.then(he_twin)
     }
 
+    /// 取当前半边的 next 半边（沿面顺次）。
     pub fn next(self) -> MeshQuery<HalfEdgeId> {
         self.then(he_next)
     }
 
+    /// 取当前半边的 prev 半边（沿面逆顺）。
     pub fn prev(self) -> MeshQuery<HalfEdgeId> {
         self.then(he_prev)
     }
 
+    /// 取当前半边所属的面。
     pub fn face(self) -> MeshQuery<FaceId> {
         self.then(he_face)
     }
 
+    /// 取当前半边的源顶点（origin）。
     pub fn src_vert(self) -> MeshQuery<VertexId> {
         self.then(he_src_vert)
     }
 
+    /// 取当前半边的目标顶点（destination / tip）。
     pub fn dst_vert(self) -> MeshQuery<VertexId> {
         self.then(he_dst_vert)
     }
 
+    /// 取当前半边绕源顶点的 CW 旋转（twin.prev）。
     pub fn cw_rotated(self) -> MeshQuery<HalfEdgeId> {
         self.then(he_cw_rotated)
     }
 
+    /// 取当前半边绕源顶点的 CCW 旋转（prev.twin），等效 `HalfEdgeId::ccw_rotated`。
     pub fn ccw_rotated(self) -> MeshQuery<HalfEdgeId> {
         self.then(he_ccw_rotated)
     }
@@ -255,10 +263,12 @@ impl MeshQuery<HalfEdgeId> {
 // ============================================================
 
 impl MeshQuery<VertexId> {
+    /// 取顶点出发的任一 outgoing 半边。
     pub fn halfedge(self) -> MeshQuery<HalfEdgeId> {
         self.then(vertex_halfedge)
     }
 
+    /// 取从当前顶点到目标顶点 `target` 的半边。
     pub fn halfedge_to(self, target: VertexId) -> MeshQuery<HalfEdgeId> {
         self.then(move |mesh, v| vertex_halfedge_to(mesh, v, target))
     }

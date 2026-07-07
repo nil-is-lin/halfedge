@@ -42,6 +42,7 @@ pub fn build_cube(size: f64) -> MeshStorage {
         [1, 6, 5], // +x
     ];
     crate::io::build_mesh_from_vertices_and_faces(&verts, &faces)
+        .expect("hardcoded valid cube mesh")
 }
 
 // ============================================================

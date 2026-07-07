@@ -3,12 +3,10 @@
 //! 集中验证缺陷 #23 修复的关键 panic 路径不会复现。
 //! 每个测试对应代码评审报告中曾识别的 unwrap / 除零 / 越界风险。
 
+use halfedge::ids::HalfEdgeId;
 use halfedge::{
     build_cube, build_icosphere,
-    geometry::{
-        mesh_volume, mesh_volume_par, ray_mesh_intersects,
-        surface_area, surface_area_par,
-    },
+    geometry::{mesh_volume, mesh_volume_par, ray_mesh_intersects, surface_area, surface_area_par},
     io::{build_mesh_from_vertices_and_faces, parse_obj},
     linalg::{SparseSystem, conjugate_gradient},
     storage::MeshStorage,
@@ -16,7 +14,6 @@ use halfedge::{
     traversal::is_closed,
     validate::validate_topology,
 };
-use halfedge::ids::HalfEdgeId;
 
 // ============================================================
 // geometry.rs：mesh_volume / mesh_volume_par 不应 panic
@@ -162,7 +159,10 @@ fn regression_remesh_on_cube_preserves_topology() {
     use halfedge::isotropic_remesh;
     let mut mesh = build_cube(1.0);
     let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
-    assert!(validate_topology(&mesh).is_empty(), "remesh 后拓扑应保持有效");
+    assert!(
+        validate_topology(&mesh).is_empty(),
+        "remesh 后拓扑应保持有效"
+    );
     assert!(is_closed(&mesh), "remesh 后应仍闭合");
 }
 
@@ -199,13 +199,13 @@ fn regression_collapse_edge_on_invalid_he_returns_err_no_panic() {
 // io.rs：build_mesh_from_vertices_and_faces 索引越界 panic
 // ============================================================
 
-/// 历史 bug：面索引超出顶点数时 unwrap panic。现在显式 panic 给出明确错误信息。
+/// 历史 bug：面索引超出顶点数时 unwrap panic。现在返回 MeshBuildError 而非 panic。
 #[test]
-#[should_panic(expected = "越界")]
-fn regression_build_mesh_index_out_of_range_panics_with_clear_message() {
+fn regression_build_mesh_index_out_of_range_returns_error() {
     let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
     let faces = [[0u32, 1, 99]];
-    let _ = build_mesh_from_vertices_and_faces(&vertices, &faces);
+    let res = build_mesh_from_vertices_and_faces(&vertices, &faces);
+    assert!(res.is_err());
 }
 
 // ============================================================
@@ -244,6 +244,14 @@ fn regression_cube_volume_and_area_correct() {
     let cube = build_cube(2.0); // 边长 2
     let v = mesh_volume(&cube);
     let a = surface_area(&cube);
-    assert!((v.abs() - 8.0).abs() < 0.01, "边长 2 立方体体积应 ≈ 8.0，实际 {}", v);
-    assert!((a - 24.0).abs() < 0.01, "边长 2 立方体表面积应 ≈ 24.0，实际 {}", a);
+    assert!(
+        (v.abs() - 8.0).abs() < 0.01,
+        "边长 2 立方体体积应 ≈ 8.0，实际 {}",
+        v
+    );
+    assert!(
+        (a - 24.0).abs() < 0.01,
+        "边长 2 立方体表面积应 ≈ 24.0，实际 {}",
+        a
+    );
 }

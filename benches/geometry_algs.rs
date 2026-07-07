@@ -221,6 +221,78 @@ fn bench_marching_cubes(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================
+// 7. SOA vs AoS 位置访问对比
+// ============================================================
+
+/// 对比「SlotMap<Vertex> 逐顶点遍历」与「SOA positions_dense 连续遍历」
+/// 在 mesh_volume / mesh_aabb / 纯累加三种场景下的性能差异。
+fn bench_soa_vs_aos(c: &mut Criterion) {
+    use halfedge::geometry::{mesh_aabb, mesh_volume, surface_area};
+    let mut group = c.benchmark_group("soa_vs_aos");
+    group.sample_size(50);
+
+    for n in 1..=3usize {
+        let mesh = build_icosphere(n);
+        let v = mesh.vertex_count();
+        let f = mesh.face_count();
+        println!("[soa_vs_aos] icosphere({}): V={}, F={}", n, v, f);
+
+        // 场景 A：mesh_volume（已改用 SOA 缓存）
+        group.bench_with_input(BenchmarkId::new("mesh_volume_soa", n), &mesh, |b, mesh| {
+            b.iter(|| {
+                black_box(mesh_volume(mesh));
+            });
+        });
+
+        // 场景 B：mesh_aabb（已改用 SOA 缓存）
+        group.bench_with_input(BenchmarkId::new("mesh_aabb_soa", n), &mesh, |b, mesh| {
+            b.iter(|| {
+                black_box(mesh_aabb(mesh));
+            });
+        });
+
+        // 场景 C：纯 AoS 遍历（基线：直接遍历 Vertex.position）
+        group.bench_with_input(BenchmarkId::new("iter_vertex_aos", n), &mesh, |b, mesh| {
+            b.iter(|| {
+                let mut sum = [0.0f64; 3];
+                for v in mesh.vertices() {
+                    sum[0] += v.position[0];
+                    sum[1] += v.position[1];
+                    sum[2] += v.position[2];
+                }
+                black_box(sum);
+            });
+        });
+
+        // 场景 D：纯 SOA 遍历（基线：遍历 positions_dense 切片）
+        group.bench_with_input(
+            BenchmarkId::new("iter_positions_soa", n),
+            &mesh,
+            |b, mesh| {
+                b.iter(|| {
+                    let mut sum = [0.0f64; 3];
+                    for p in mesh.positions_dense() {
+                        sum[0] += p[0];
+                        sum[1] += p[1];
+                        sum[2] += p[2];
+                    }
+                    black_box(sum);
+                });
+            },
+        );
+
+        // 场景 E：surface_area（已改用 SOA 缓存，但 face_area 内部仍走 SlotMap）
+        group.bench_with_input(BenchmarkId::new("surface_area", n), &mesh, |b, mesh| {
+            b.iter(|| {
+                black_box(surface_area(mesh));
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_geodesic,
@@ -228,6 +300,7 @@ criterion_group!(
     bench_decimate,
     bench_intrinsic,
     bench_direction_field,
-    bench_marching_cubes
+    bench_marching_cubes,
+    bench_soa_vs_aos
 );
 criterion_main!(benches);

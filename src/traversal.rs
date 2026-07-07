@@ -93,11 +93,7 @@ pub fn collect_outgoing_halfedges(mesh: &MeshStorage, v: VertexId) -> Vec<HalfEd
 ///     // 使用 buf...
 /// }
 /// ```
-pub fn collect_outgoing_halfedges_into(
-    mesh: &MeshStorage,
-    v: VertexId,
-    buf: &mut Vec<HalfEdgeId>,
-) {
+pub fn collect_outgoing_halfedges_into(mesh: &MeshStorage, v: VertexId, buf: &mut Vec<HalfEdgeId>) {
     buf.clear();
     let start = match mesh.get_vertex(v).and_then(|vt| vt.halfedge) {
         Some(s) => s,
@@ -167,11 +163,7 @@ pub fn collect_face_halfedges(mesh: &MeshStorage, f: FaceId) -> Vec<HalfEdgeId> 
 /// 与 [`collect_face_halfedges`] 相同，但填充调用方提供的 `buf`。
 ///
 /// **内存复用**：`buf.clear()` 后填充，不释放已分配容量。
-pub fn collect_face_halfedges_into(
-    mesh: &MeshStorage,
-    f: FaceId,
-    buf: &mut Vec<HalfEdgeId>,
-) {
+pub fn collect_face_halfedges_into(mesh: &MeshStorage, f: FaceId, buf: &mut Vec<HalfEdgeId>) {
     buf.clear();
     let start = match mesh.get_face(f).and_then(|ft| ft.halfedge) {
         Some(s) => s,
@@ -199,12 +191,26 @@ pub fn collect_face_halfedges_into(
 // ============================================================
 
 /// 顶点环绕半边迭代器：依次产出 `v` 的所有 outgoing 半边（CCW 顺序）。
+///
+/// ```
+/// use halfedge::{build_mesh_from_vertices_and_faces, traversal::VertexRing};
+///
+/// let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+/// let faces = vec![[0u32, 1, 2]];
+/// let mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+/// let v = mesh.vertex_ids().next().unwrap();
+/// let ring: Vec<_> = VertexRing::new(&mesh, v).collect();
+/// assert_eq!(ring.len(), 2);
+/// ```
 pub struct VertexRing {
     halfedges: Vec<HalfEdgeId>,
     cursor: usize,
 }
 
 impl VertexRing {
+    /// 从网格与顶点创建顶点环绕半边迭代器。
+    ///
+    /// 遍历 `v` 出发的所有 outgoing 半边（CCW 顺序）。
     pub fn new(mesh: &MeshStorage, v: VertexId) -> Self {
         Self {
             halfedges: collect_outgoing_halfedges(mesh, v),
@@ -241,6 +247,9 @@ pub struct VertexAdjacentVerts {
 }
 
 impl VertexAdjacentVerts {
+    /// 从网格与顶点创建顶点邻接点迭代器。
+    ///
+    /// 遍历 `v` 的所有邻居顶点（CCW 顺序）。
     pub fn new(mesh: &MeshStorage, v: VertexId) -> Self {
         let verts = collect_outgoing_halfedges(mesh, v)
             .into_iter()
@@ -276,6 +285,9 @@ pub struct VertexAdjacentFaces {
 }
 
 impl VertexAdjacentFaces {
+    /// 从网格与顶点创建顶点邻接面迭代器。
+    ///
+    /// 遍历 `v` 的所有相邻面（CCW 顺序）。
     pub fn new(mesh: &MeshStorage, v: VertexId) -> Self {
         let faces = collect_outgoing_halfedges(mesh, v)
             .into_iter()
@@ -309,12 +321,26 @@ impl ExactSizeIterator for VertexAdjacentFaces {}
 // ============================================================
 
 /// 面边界半边迭代器：按 `next` 顺序产出面的所有边界半边。
+///
+/// ```
+/// use halfedge::{build_mesh_from_vertices_and_faces, traversal::FaceHalfEdges};
+///
+/// let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+/// let faces = vec![[0u32, 1, 2]];
+/// let mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+/// let f = mesh.face_ids().next().unwrap();
+/// let hes: Vec<_> = FaceHalfEdges::new(&mesh, f).collect();
+/// assert_eq!(hes.len(), 3);
+/// ```
 pub struct FaceHalfEdges {
     halfedges: Vec<HalfEdgeId>,
     cursor: usize,
 }
 
 impl FaceHalfEdges {
+    /// 从网格与面创建面半边迭代器。
+    ///
+    /// 遍历 `f` 的所有半边（CCW 顺序）。
     pub fn new(mesh: &MeshStorage, f: FaceId) -> Self {
         Self {
             halfedges: collect_face_halfedges(mesh, f),
@@ -349,6 +375,9 @@ pub struct FaceVertices {
 }
 
 impl FaceVertices {
+    /// 从网格与面创建面邻接面迭代器。
+    ///
+    /// 遍历 `f` 的所有邻接面（CCW 顺序，对边共享面）。
     pub fn new(mesh: &MeshStorage, f: FaceId) -> Self {
         let verts = collect_face_halfedges(mesh, f)
             .into_iter()
@@ -434,6 +463,9 @@ pub struct VertexRingLazy<'a> {
 }
 
 impl<'a> VertexRingLazy<'a> {
+    /// 从网格与顶点创建惰性顶点环绕半边迭代器。
+    ///
+    /// 不预先收集半边，每次 next 动态遍历。
     pub fn new(mesh: &'a MeshStorage, v: VertexId) -> Self {
         let start = match mesh.get_vertex(v).and_then(|vt| vt.halfedge) {
             Some(s) => s,
@@ -490,6 +522,9 @@ pub struct VertexAdjacentVertsLazy<'a> {
 }
 
 impl<'a> VertexAdjacentVertsLazy<'a> {
+    /// 从网格与顶点创建惰性顶点邻接点迭代器。
+    ///
+    /// 延迟遍历，每次 next 动态计算下一个邻居。
     pub fn new(mesh: &'a MeshStorage, v: VertexId) -> Self {
         Self {
             mesh,
@@ -520,6 +555,9 @@ pub struct VertexAdjacentFacesLazy<'a> {
 }
 
 impl<'a> VertexAdjacentFacesLazy<'a> {
+    /// 从网格与顶点创建惰性顶点邻接面迭代器。
+    ///
+    /// 延迟遍历，每次 next 动态计算下一个邻接面。
     pub fn new(mesh: &'a MeshStorage, v: VertexId) -> Self {
         Self {
             mesh,
@@ -551,6 +589,9 @@ pub struct FaceHalfEdgesLazy<'a> {
 }
 
 impl<'a> FaceHalfEdgesLazy<'a> {
+    /// 从网格与面创建惰性面半边迭代器。
+    ///
+    /// 延迟遍历，每次 next 沿 next 链步进。
     pub fn new(mesh: &'a MeshStorage, f: FaceId) -> Self {
         let start = match mesh.get_face(f).and_then(|ft| ft.halfedge) {
             Some(s) => s,
@@ -594,6 +635,9 @@ pub struct FaceVerticesLazy<'a> {
 }
 
 impl<'a> FaceVerticesLazy<'a> {
+    /// 从网格与面创建惰性面邻接面迭代器。
+    ///
+    /// 延迟遍历，每次 next 通过 twin 链步进。
     pub fn new(mesh: &'a MeshStorage, f: FaceId) -> Self {
         Self {
             mesh,
@@ -785,6 +829,9 @@ pub struct EdgeIter<'a> {
 }
 
 impl<'a> EdgeIter<'a> {
+    /// 从网格创建无向边迭代器。
+    ///
+    /// 遍历所有非边界半边（每条边仅产出一次）。
     pub fn new(mesh: &'a MeshStorage) -> Self {
         use std::collections::HashSet;
         let mut seen = HashSet::with_capacity(mesh.edge_count());
@@ -854,12 +901,15 @@ pub struct VertexAdjacentEdges {
 }
 
 impl VertexAdjacentEdges {
+    /// 从网格与顶点创建邻接边迭代器。
+    ///
+    /// 遍历 `v` 的所有邻接边（半边的无向版本）。
     pub fn new(mesh: &MeshStorage, v: VertexId) -> Self {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         let mut edges = Vec::new();
         for he in collect_outgoing_halfedges(mesh, v) {
-            let h = mesh.get_halfedge(he).unwrap();
+            let h = mesh.get_halfedge(he).expect("halfedge exists in mesh");
             let canonical = match h.twin {
                 Some(twin) => {
                     if he < twin {
@@ -1088,6 +1138,9 @@ pub struct BoundaryLoopLazy<'a> {
 }
 
 impl<'a> BoundaryLoopLazy<'a> {
+    /// 从网格与起始半边创建惰性边界环迭代器。
+    ///
+    /// 沿边界 next 链遍历，直到回到起点。
     pub fn new(mesh: &'a MeshStorage, start: HalfEdgeId) -> Self {
         let current = mesh
             .get_halfedge(start)

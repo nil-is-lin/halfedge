@@ -32,8 +32,8 @@ use std::collections::HashMap;
 
 use crate::geometry::{cotan_edge_weight, edge_length, face_normal};
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
-use crate::linalg::{SparseSystem, conjugate_gradient};
 use crate::linalg::norm2;
+use crate::linalg::{SparseSystem, conjugate_gradient};
 use crate::storage::MeshStorage;
 use crate::traversal::{FaceHalfEdges, VertexAdjacentFaces};
 

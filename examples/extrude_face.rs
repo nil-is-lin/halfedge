@@ -16,7 +16,7 @@ fn main() {
     println!("[1] 单个三角形挤出");
     let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0]];
     let faces = vec![[0, 1, 2]];
-    let mut mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+    let mut mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
     print_mesh_stats("  挤出前", &mesh);
 
     let f = mesh.face_ids().next().unwrap();
@@ -49,7 +49,7 @@ fn main() {
         [0.0, 0.0, -2.0], // 沿 -Z 反向
     ];
     for (i, &off) in offsets.iter().enumerate() {
-        let mut m = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let mut m = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
         let f = m.face_ids().next().unwrap();
         match extrude_face(&mut m, f, off) {
             Ok(_) => {
@@ -70,14 +70,14 @@ fn main() {
 
     // ---------- 3. 边界情况：零向量 / 退化 ----------
     println!("\n[3] 边界情况：零向量 / 退化 offset");
-    let mut m = build_mesh_from_vertices_and_faces(&verts, &faces);
+    let mut m = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
     let f = m.face_ids().next().unwrap();
     match extrude_face(&mut m, f, [0.0, 0.0, 0.0]) {
         Ok(_) => println!("  零向量 offset：意外成功"),
         Err(e) => println!("  零向量 offset：{}（预期行为）", e),
     }
 
-    let mut m = build_mesh_from_vertices_and_faces(&verts, &faces);
+    let mut m = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
     let f = m.face_ids().next().unwrap();
     // 三角形在 xy 平面，offset 沿 x 轴 → 与边 v0-v1 平行 → 侧面退化
     match extrude_face(&mut m, f, [1.0, 0.0, 0.0]) {
@@ -99,7 +99,7 @@ fn main() {
         [6.5, 1.0, 0.0],
     ];
     let faces = vec![[0, 1, 2], [3, 4, 5], [6, 7, 8]];
-    let mut mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+    let mut mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
     print_mesh_stats("  批量挤出前", &mesh);
 
     let fids: Vec<_> = mesh.face_ids().collect();
@@ -118,7 +118,7 @@ fn main() {
 
     // ---------- 5. 顶点位置验证 ----------
     println!("\n[5] 顶点位置验证（offset 沿法向）");
-    let mut m = build_mesh_from_vertices_and_faces(&verts, &faces);
+    let mut m = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
     let f = m.face_ids().next().unwrap();
     let offset = [0.0, 0.0, 5.0];
     let _ = extrude_face(&mut m, f, offset).unwrap();

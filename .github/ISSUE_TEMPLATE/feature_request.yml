@@ -1,0 +1,66 @@
+name: Feature request
+description: Suggest a new algorithm, API, or improvement
+title: "[feat]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Describe the use case you're trying to solve.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that halfedge doesn't currently support?
+      placeholder: "I'm trying to ... but halfedge doesn't have ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What API or behaviour would you like? A code sketch helps.
+      placeholder: |
+        ```rust
+        // ideal API
+        mesh.some_new_function(...)?;
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you tried or looked at.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Traversal / query DSL
+        - Topology operations (split / flip / collapse / extrude)
+        - Geometry (normals / curvatures / distance)
+        - Subdivision / decimation
+        - Parameterization / geodesics / deformation
+        - Boolean operations
+        - Remeshing / repair
+        - I/O (OBJ / PLY / STL / OFF / glTF)
+        - Property system / cache
+        - Performance / parallelism
+        - API ergonomics
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions for a duplicate.
+          required: true

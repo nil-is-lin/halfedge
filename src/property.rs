@@ -5,7 +5,7 @@
 //!
 //! ## 设计
 //!
-//! - [`PropertyStore<T>`]：单个属性的存储容器，按 ID 的 index 部分索引。
+//! - [`PropertyStore<T>`]：单个属性的存储容器，按 slotmap key 的 index 部分索引。
 //! - [`PropertyHandle<T>`]：类型化句柄，用于类型安全的属性访问。
 //! - [`MeshProperties`]：管理所有属性的容器，按 `TypeId` 区分不同类型。
 //!
@@ -16,14 +16,22 @@
 //! 私有 trait `ErasedProperty` 提供 `as_any()` 方法用于 downcast 回具体类型，
 //! 同时提供 `remove_by_index()` 用于在不知道具体类型的情况下删除属性。
 //!
+//! ## 存储策略
+//!
+//! `PropertyStore<T>` 内部使用 `Vec<Option<T>>` 按 slotmap key 的 32 位 index
+//! 直接索引，提供：
+//! - **O(1) 直接索引**（无哈希计算）
+//! - **连续内存布局**（更好的缓存局部性）
+//! - **自动稀疏扩展**（按需扩容，未设置的槽位为 `None`）
+//!
 //! ## 限制
 //!
 //! - 每个类型 `T` 在每类（vertex/halfedge/face）中只能注册一个属性。
 //!   如需多个同类型属性，可用 newtype 包装：`struct Weight(f64); struct Temp(f64);`
-//! - 属性键为 slotmap key 的**完整 64 位 ffi 值**（idx + version，参见 `idx_of`）。
-//!   slot 被复用时 version 递增，旧属性*不会*被新元素继承（成为孤儿条目）。
-//!   仍建议删除元素时调用 [`remove_vertex_all_props`](MeshProperties::remove_vertex_all_props)
-//!   等方法清理，以释放孤儿条目占用的内存。
+//! - 属性键为 slotmap key 的 **32 位 index** 部分。
+//!   slot 被复用时旧属性会残留在同一 index，**务必在删除元素时调用**
+//!   [`remove_vertex_all_props`](MeshProperties::remove_vertex_all_props)
+//!   等方法清理，否则新元素可能继承旧属性值。
 //!
 //! ## 使用示例
 //!
@@ -33,7 +41,7 @@
 //!
 //! let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
 //! let faces = vec![[0, 1, 2]];
-//! let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+//! let mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
 //!
 //! let mut props = MeshProperties::new();
 //! let w = props.add_vertex_prop::<f64>();
@@ -52,83 +60,91 @@ use crate::ids::{FaceId, HalfEdgeId, VertexId};
 use crate::storage::{Face, HalfEdge, MeshStorage, Vertex};
 
 // ============================================================
-// 内部辅助：从 slotmap key 提取唯一键
+// 内部辅助：从 slotmap key 提取索引
 // ============================================================
 
-/// 从 slotmap key 提取**含 version 的完整键**作为 `usize`。
+/// 从 slotmap key 提取 32 位 index 部分作为 `usize`。
 ///
-/// slotmap 1.1.1 的 `KeyData` 字段为私有，公开 API 仅 `as_ffi() -> u64`。
-/// `as_ffi()` 编码为 `((version) << 32) | idx`。
+/// slotmap 的 `as_ffi()` 编码为 `((version) << 32) | idx`，
+/// 此函数仅取低 32 位 idx，用于 `Vec` 直接索引。
 ///
-/// **关键设计**：使用完整 64 位键（idx + version）而非仅低 32 位 idx，
-/// 保证 slot 被复用时（version 递增）旧属性*不会*被新元素继承。
-/// 旧属性条目成为孤儿（永远不会被匹配），但不会造成正确性问题，
-/// 仅占用少量内存。如需清理孤儿，可调用 `PropertyStore::clear()`。
-///
-/// **平台假设**：依赖 `usize` 为 64 位（64-bit 平台）。32-bit 平台上
-/// version 会被截断，回退到旧行为（需手动清理）。
+/// **注意**：使用 index 而非完整 64 位键意味着 slot 被复用时
+/// 旧属性会残留在同一 index。务必在删除元素时调用
+/// `remove_*_all_props` 清理属性。
 #[inline]
 fn idx_of<K: Key>(id: K) -> usize {
-    // 完整 64 位 ffi 值（idx + version）作为键
-    // 在 64-bit 平台上 usize = u64，无损转换
-    id.data().as_ffi() as usize
+    id.data().as_ffi() as u32 as usize
 }
 
 // ============================================================
 // PropertyStore：单个属性的存储容器
 // ============================================================
 
-/// 单个属性的存储容器，按键（slotmap key 的 idx 部分）索引。
+/// 单个属性的存储容器，按 slotmap key 的 32 位 index 直接索引。
 ///
-/// 使用 `HashMap<usize, T>` 而非 `Vec<Option<T>>`，原因：
-/// 1. 稀疏存储：并非所有顶点/半边/面都需要该属性；
-/// 2. 删除后不浪费空间；
-/// 3. 查找/插入/删除均为 O(1) 平均。
+/// 使用 `Vec<Option<T>>` 而非 `HashMap<usize, T>`，优势：
+/// 1. **O(1) 直接索引**：无需哈希计算，`data[idx]` 直接访问；
+/// 2. **缓存友好**：连续内存布局，遍历和随机访问都受益于 CPU 缓存；
+/// 3. **低开销**：`Option<T>` 的 None 变体仅占少量空间（取决于 T 的对齐）。
+///
+/// 稀疏场景（大部分元素未设置属性）下，Vec 会浪费一些空间存储 `None`，
+/// 但在现代 CPU 上连续访问的速度优势通常超过空间开销。
 pub struct PropertyStore<T> {
-    data: HashMap<usize, T>,
+    data: Vec<Option<T>>,
 }
 
 impl<T> PropertyStore<T> {
     /// 创建空的属性存储。
     pub fn new() -> Self {
-        Self {
-            data: HashMap::new(),
+        Self { data: Vec::new() }
+    }
+
+    /// 确保 Vec 容量足够容纳 `idx`，不足则扩容并填充 `None`。
+    #[inline]
+    fn ensure_capacity(&mut self, idx: usize) {
+        if idx >= self.data.len() {
+            self.data.resize_with(idx + 1, || None);
         }
     }
 
     /// 获取指定索引的属性引用。
     pub fn get(&self, idx: usize) -> Option<&T> {
-        self.data.get(&idx)
+        self.data.get(idx).and_then(|opt| opt.as_ref())
     }
 
     /// 获取指定索引的属性可变引用。
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
-        self.data.get_mut(&idx)
+        self.data.get_mut(idx).and_then(|opt| opt.as_mut())
     }
 
     /// 设置指定索引的属性值。若已存在则覆盖。
     pub fn set(&mut self, idx: usize, val: T) {
-        self.data.insert(idx, val);
+        self.ensure_capacity(idx);
+        self.data[idx] = Some(val);
     }
 
     /// 删除指定索引的属性值，返回被删除的值。
     pub fn remove(&mut self, idx: usize) -> Option<T> {
-        self.data.remove(&idx)
+        if idx < self.data.len() {
+            self.data[idx].take()
+        } else {
+            None
+        }
     }
 
     /// 是否包含指定索引的属性。
     pub fn contains(&self, idx: usize) -> bool {
-        self.data.contains_key(&idx)
+        self.get(idx).is_some()
     }
 
-    /// 当前存储的属性数量。
+    /// 当前存储的属性数量（非 None 条目数）。
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.data.iter().filter(|opt| opt.is_some()).count()
     }
 
     /// 是否为空。
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len() == 0
     }
 
     /// 清空所有属性。
@@ -138,7 +154,10 @@ impl<T> PropertyStore<T> {
 
     /// 迭代所有 `(index, &value)` 对。
     pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
-        self.data.iter().map(|(&k, v)| (k, v))
+        self.data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.as_ref().map(|v| (i, v)))
     }
 }
 
@@ -173,7 +192,9 @@ impl<T: 'static> ErasedProperty for PropertyStore<T> {
     }
 
     fn remove_by_index(&mut self, idx: usize) {
-        self.data.remove(&idx);
+        if idx < self.data.len() {
+            self.data[idx] = None;
+        }
     }
 
     fn clear_all(&mut self) {
@@ -902,12 +923,431 @@ mod tests {
         assert!(props.has_vertex_prop::<i32>());
     }
 
+    #[test]
+    fn remove_then_reuse_slot_cleans_up_with_remove_all() {
+        // 验证 Vec 存储下，remove_*_all_props 正确清理属性
+        let (mut mesh, vids) = build_triangle_mesh();
+        let mut props = MeshProperties::new();
+
+        let h = props.add_vertex_prop::<f64>();
+        props.set_vertex_prop(h, vids[0], 42.0);
+        assert_eq!(props.get_vertex_prop(h, vids[0]), Some(&42.0));
+
+        // 删除顶点并清理属性
+        remove_vertex_with_props(&mut mesh, &mut props, vids[0]);
+
+        // 属性应已清除
+        assert_eq!(props.get_vertex_prop(h, vids[0]), None);
+
+        // 插入新顶点（可能复用 slot）
+        let new_v = mesh.add_vertex(crate::storage::Vertex::new([5.0, 5.0, 5.0]));
+
+        // 新顶点不应继承旧属性
+        assert_eq!(props.get_vertex_prop(h, new_v), None);
+
+        // 设置新属性应正常工作
+        props.set_vertex_prop(h, new_v, 99.0);
+        assert_eq!(props.get_vertex_prop(h, new_v), Some(&99.0));
+    }
+
+    // ---------- PropertyStore 进阶测试 ----------
+
+    #[test]
+    fn property_store_default_is_empty() {
+        let store = PropertyStore::<f64>::default();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn property_store_sparse_indices() {
+        // 稀疏索引：设置 idx 0 和 idx 100，中间全为 None
+        let mut store = PropertyStore::<i32>::new();
+        store.set(0, 1);
+        store.set(100, 2);
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get(0), Some(&1));
+        assert_eq!(store.get(100), Some(&2));
+        assert_eq!(store.get(50), None);
+        assert!(store.contains(0));
+        assert!(store.contains(100));
+        assert!(!store.contains(50));
+    }
+
+    #[test]
+    fn property_store_overwrite_value() {
+        let mut store = PropertyStore::<f64>::new();
+        store.set(3, 1.0);
+        store.set(3, 2.0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(3), Some(&2.0));
+    }
+
+    #[test]
+    fn property_store_remove_out_of_bounds_returns_none() {
+        let mut store = PropertyStore::<f64>::new();
+        store.set(0, 1.0);
+        // 删除超出范围的索引不 panic，返回 None
+        assert_eq!(store.remove(999), None);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn property_store_get_mut_none_for_unset() {
+        let mut store = PropertyStore::<f64>::new();
+        store.set(0, 1.0);
+        assert!(store.get_mut(1).is_none());
+        assert!(store.get_mut(99).is_none());
+    }
+
+    #[test]
+    fn property_store_array_type() {
+        let mut store = PropertyStore::<[f64; 3]>::new();
+        store.set(0, [1.0, 2.0, 3.0]);
+        store.set(1, [4.0, 5.0, 6.0]);
+
+        assert_eq!(store.get(0), Some(&[1.0, 2.0, 3.0]));
+        assert_eq!(store.get(1), Some(&[4.0, 5.0, 6.0]));
+
+        // 可变修改数组元素
+        if let Some(v) = store.get_mut(0) {
+            v[1] = 99.0;
+        }
+        assert_eq!(store.get(0), Some(&[1.0, 99.0, 3.0]));
+    }
+
+    #[test]
+    fn property_store_bool_type() {
+        let mut store = PropertyStore::<bool>::new();
+        store.set(0, true);
+        store.set(1, false);
+        assert_eq!(store.get(0), Some(&true));
+        assert_eq!(store.get(1), Some(&false));
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn property_store_iter_empty() {
+        let store = PropertyStore::<f64>::new();
+        assert_eq!(store.iter().count(), 0);
+    }
+
+    #[test]
+    fn property_store_iter_after_remove() {
+        let mut store = PropertyStore::<i32>::new();
+        store.set(0, 10);
+        store.set(1, 20);
+        store.set(2, 30);
+
+        store.remove(1);
+
+        let entries: Vec<(usize, i32)> = store.iter().map(|(i, &v)| (i, v)).collect();
+        assert_eq!(entries, vec![(0, 10), (2, 30)]);
+    }
+
+    #[test]
+    fn property_store_large_sparse_index() {
+        let mut store = PropertyStore::<u32>::new();
+        store.set(10_000, 42);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(10_000), Some(&42));
+        assert!(store.contains(10_000));
+        assert_eq!(store.get(9_999), None);
+    }
+
+    // ---------- MeshProperties 多类型 / 多类别测试 ----------
+
+    #[test]
+    fn multiple_property_types_on_same_mesh() {
+        // 同一网格上注册 f64 / i32 / bool / [f64;3] 四种顶点属性
+        let (_, vids) = build_triangle_mesh();
+        let mut props = MeshProperties::new();
+
+        let h_f64 = props.add_vertex_prop::<f64>();
+        let h_i32 = props.add_vertex_prop::<i32>();
+        let h_bool = props.add_vertex_prop::<bool>();
+        let h_arr = props.add_vertex_prop::<[f64; 3]>();
+
+        props.set_vertex_prop(h_f64, vids[0], 1.5);
+        props.set_vertex_prop(h_i32, vids[0], -7);
+        props.set_vertex_prop(h_bool, vids[0], true);
+        props.set_vertex_prop(h_arr, vids[0], [1.0, 2.0, 3.0]);
+
+        assert_eq!(props.get_vertex_prop(h_f64, vids[0]), Some(&1.5));
+        assert_eq!(props.get_vertex_prop(h_i32, vids[0]), Some(&-7));
+        assert_eq!(props.get_vertex_prop(h_bool, vids[0]), Some(&true));
+        assert_eq!(
+            props.get_vertex_prop(h_arr, vids[0]),
+            Some(&[1.0, 2.0, 3.0])
+        );
+        assert_eq!(props.vertex_prop_type_count(), 4);
+    }
+
+    #[test]
+    fn property_detach_and_reattach() {
+        // 注册 → 清空 → 重新设置，验证数据独立
+        let (_, vids) = build_triangle_mesh();
+        let mut props = MeshProperties::new();
+
+        let h = props.add_vertex_prop::<f64>();
+        props.set_vertex_prop(h, vids[0], 1.0);
+        props.set_vertex_prop(h, vids[1], 2.0);
+        assert_eq!(props.vertex_prop_type_count(), 1);
+
+        // 清空数据（保留类型注册）
+        props.clear_vertex_props();
+        assert_eq!(props.get_vertex_prop(h, vids[0]), None);
+        assert_eq!(props.get_vertex_prop(h, vids[1]), None);
+        assert!(props.has_vertex_prop::<f64>());
+
+        // 重新设置数据
+        props.set_vertex_prop(h, vids[0], 99.0);
+        assert_eq!(props.get_vertex_prop(h, vids[0]), Some(&99.0));
+        assert_eq!(props.get_vertex_prop(h, vids[1]), None);
+    }
+
+    #[test]
+    fn clear_halfedge_and_face_props() {
+        let (mesh, _vids) = build_triangle_mesh();
+        let heids: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
+        let fids: Vec<FaceId> = mesh.face_ids().collect();
+
+        let mut props = MeshProperties::new();
+        let hh = props.add_halfedge_prop::<i32>();
+        let hf = props.add_face_prop::<f64>();
+
+        for (i, &he) in heids.iter().enumerate() {
+            props.set_halfedge_prop(hh, he, i as i32);
+        }
+        props.set_face_prop(hf, fids[0], 2.71);
+
+        // 清空
+        props.clear_halfedge_props();
+        props.clear_face_props();
+
+        for he in &heids {
+            assert_eq!(props.get_halfedge_prop(hh, *he), None);
+        }
+        assert_eq!(props.get_face_prop(hf, fids[0]), None);
+
+        // 类型注册仍保留
+        assert!(props.has_halfedge_prop::<i32>());
+        assert!(props.has_face_prop::<f64>());
+    }
+
+    #[test]
+    fn remove_halfedge_with_props_wrapper() {
+        let (mesh, _vids) = build_triangle_mesh();
+        let heids: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
+        let mut mesh = mesh;
+        let mut props = MeshProperties::new();
+
+        let hh = props.add_halfedge_prop::<f64>();
+        props.set_halfedge_prop(hh, heids[0], 1.0);
+        props.set_halfedge_prop(hh, heids[1], 2.0);
+
+        let removed = remove_halfedge_with_props(&mut mesh, &mut props, heids[0]);
+        assert!(removed.is_some());
+        assert!(!mesh.contains_halfedge(heids[0]));
+        assert_eq!(props.get_halfedge_prop(hh, heids[0]), None);
+        assert_eq!(props.get_halfedge_prop(hh, heids[1]), Some(&2.0));
+    }
+
+    #[test]
+    fn remove_face_with_props_wrapper() {
+        let (mesh, _vids) = build_triangle_mesh();
+        let fids: Vec<FaceId> = mesh.face_ids().collect();
+        let mut mesh = mesh;
+        let mut props = MeshProperties::new();
+
+        let hf = props.add_face_prop::<u32>();
+        props.set_face_prop(hf, fids[0], 42);
+
+        let removed = remove_face_with_props(&mut mesh, &mut props, fids[0]);
+        assert!(removed.is_some());
+        assert!(!mesh.contains_face(fids[0]));
+        assert_eq!(props.get_face_prop(hf, fids[0]), None);
+    }
+
+    #[test]
+    fn halfedge_prop_mut_works() {
+        let (mesh, _) = build_triangle_mesh();
+        let heids: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
+        let mut props = MeshProperties::new();
+
+        let hh = props.add_halfedge_prop::<f64>();
+        props.set_halfedge_prop(hh, heids[0], 1.0);
+
+        if let Some(val) = props.get_halfedge_prop_mut(hh, heids[0]) {
+            *val = 10.0;
+        }
+        assert_eq!(props.get_halfedge_prop(hh, heids[0]), Some(&10.0));
+    }
+
+    #[test]
+    fn face_prop_mut_works() {
+        let (mesh, _) = build_triangle_mesh();
+        let fids: Vec<FaceId> = mesh.face_ids().collect();
+        let mut props = MeshProperties::new();
+
+        let hf = props.add_face_prop::<f64>();
+        props.set_face_prop(hf, fids[0], 1.0);
+
+        if let Some(val) = props.get_face_prop_mut(hf, fids[0]) {
+            *val = 20.0;
+        }
+        assert_eq!(props.get_face_prop(hf, fids[0]), Some(&20.0));
+    }
+
+    #[test]
+    fn has_halfedge_and_face_prop_queries() {
+        let mut props = MeshProperties::new();
+        assert!(!props.has_halfedge_prop::<f64>());
+        assert!(!props.has_face_prop::<i32>());
+        assert_eq!(props.halfedge_prop_type_count(), 0);
+        assert_eq!(props.face_prop_type_count(), 0);
+
+        let _ = props.add_halfedge_prop::<f64>();
+        let _ = props.add_face_prop::<i32>();
+
+        assert!(props.has_halfedge_prop::<f64>());
+        assert!(props.has_face_prop::<i32>());
+        assert_eq!(props.halfedge_prop_type_count(), 1);
+        assert_eq!(props.face_prop_type_count(), 1);
+    }
+
+    #[test]
+    fn unset_property_returns_none_as_default() {
+        // 已注册但未设置的属性返回 None（无隐式默认值）
+        let (_, vids) = build_triangle_mesh();
+        let mut props = MeshProperties::new();
+        let h = props.add_vertex_prop::<f64>();
+
+        assert_eq!(props.get_vertex_prop(h, vids[0]), None);
+        assert_eq!(props.get_vertex_prop(h, vids[1]), None);
+    }
+
+    #[test]
+    fn add_prop_overwrites_existing_store() {
+        // 同类型重复 add 会覆盖旧存储（已有数据丢失）
+        let (_, vids) = build_triangle_mesh();
+        let mut props = MeshProperties::new();
+
+        let h = props.add_vertex_prop::<f64>();
+        props.set_vertex_prop(h, vids[0], 1.0);
+        assert_eq!(props.get_vertex_prop(h, vids[0]), Some(&1.0));
+
+        // 重新注册，数据丢失
+        let _ = props.add_vertex_prop::<f64>();
+        assert_eq!(props.get_vertex_prop(h, vids[0]), None);
+        assert_eq!(props.vertex_prop_type_count(), 1);
+    }
+
+    #[test]
+    fn property_handle_default() {
+        let h: PropertyHandle<i32> = PropertyHandle::default();
+        let debug = format!("{:?}", h);
+        assert!(debug.contains("i32"));
+    }
+
+    #[test]
+    fn mesh_properties_debug() {
+        let mut props = MeshProperties::new();
+        let _ = props.add_vertex_prop::<f64>();
+        let _ = props.add_face_prop::<i32>();
+
+        let debug = format!("{:?}", props);
+        assert!(debug.contains("vertex_prop_types"));
+        assert!(debug.contains("face_prop_types"));
+    }
+
+    #[test]
+    fn empty_mesh_properties() {
+        let props = MeshProperties::new();
+        assert_eq!(props.vertex_prop_type_count(), 0);
+        assert_eq!(props.halfedge_prop_type_count(), 0);
+        assert_eq!(props.face_prop_type_count(), 0);
+        assert!(!props.has_vertex_prop::<f64>());
+        assert!(!props.has_halfedge_prop::<bool>());
+        assert!(!props.has_face_prop::<i32>());
+    }
+
+    #[test]
+    fn single_vertex_property() {
+        // 单顶点网格（无面）的属性操作
+        let mut mesh = MeshStorage::new();
+        let v = mesh.add_vertex(Vertex::new([1.0, 2.0, 3.0]));
+
+        let mut props = MeshProperties::new();
+        let h = props.add_vertex_prop::<f64>();
+        props.set_vertex_prop(h, v, 42.0);
+
+        assert_eq!(props.get_vertex_prop(h, v), Some(&42.0));
+        assert!(props.get_vertex_prop_mut(h, v).is_some());
+    }
+
+    #[test]
+    fn all_vertices_deleted_props_cleared() {
+        let (mut mesh, vids) = build_triangle_mesh();
+        let mut props = MeshProperties::new();
+
+        let h = props.add_vertex_prop::<f64>();
+        for v in &vids {
+            props.set_vertex_prop(h, *v, 1.0);
+        }
+
+        // 删除所有顶点并清理属性
+        for v in &vids {
+            remove_vertex_with_props(&mut mesh, &mut props, *v);
+        }
+
+        for v in &vids {
+            assert_eq!(props.get_vertex_prop(h, *v), None);
+        }
+        assert_eq!(mesh.vertex_count(), 0);
+    }
+
+    #[test]
+    fn large_mesh_property_correctness() {
+        // 在较大网格上验证属性正确性（非性能测试）
+        let mesh = crate::test_util::build_icosphere(1);
+        let vids: Vec<VertexId> = mesh.vertex_ids().collect();
+        let fids: Vec<FaceId> = mesh.face_ids().collect();
+
+        let mut props = MeshProperties::new();
+        let hv = props.add_vertex_prop::<f64>();
+        let hf = props.add_face_prop::<u32>();
+
+        // 为每个顶点/面设置属性（值为索引）
+        for (i, &v) in vids.iter().enumerate() {
+            props.set_vertex_prop(hv, v, i as f64);
+        }
+        for (i, &f) in fids.iter().enumerate() {
+            props.set_face_prop(hf, f, i as u32);
+        }
+
+        // 验证所有值正确
+        for (i, &v) in vids.iter().enumerate() {
+            assert_eq!(props.get_vertex_prop(hv, v), Some(&(i as f64)));
+        }
+        for (i, &f) in fids.iter().enumerate() {
+            assert_eq!(props.get_face_prop(hf, f), Some(&(i as u32)));
+        }
+
+        // 批量删除部分顶点属性
+        for &v in vids.iter().step_by(3) {
+            props.remove_vertex_all_props(v);
+            assert_eq!(props.get_vertex_prop(hv, v), None);
+        }
+    }
+
     // ---------- 测试夹具 ----------
 
     fn build_triangle_mesh() -> (MeshStorage, [VertexId; 3]) {
         let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = vec![[0, 1, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
         let vids: Vec<VertexId> = mesh.vertex_ids().collect();
         (mesh, [vids[0], vids[1], vids[2]])
     }

@@ -3,12 +3,13 @@
 //! 测试跨模块协作：构建 → 校验 → 几何计算 → 拓扑操作 → 导出
 
 use halfedge::{
-    build_cube, build_icosphere, validate_mesh, validate_topology,
-    geometry::{mesh_volume, surface_area, edge_length_stats},
+    build_cube, build_icosphere,
+    geometry::{edge_length_stats, mesh_volume, surface_area},
+    io::{format_obj, format_stl_binary, parse_obj, parse_stl_binary},
     isotropic_remesh,
-    topology_ops::{split_edge, flip_edge},
+    topology_ops::{flip_edge, split_edge},
     traversal::is_closed,
-    io::{format_obj, parse_obj, format_stl_binary, parse_stl_binary},
+    validate_mesh, validate_topology,
 };
 
 /// 完整工作流：构建 icosphere → 校验 → 几何统计 → 导出 → 重新导入
@@ -88,16 +89,24 @@ fn workflow_cube_geometry_correctness() {
     assert!(validate_mesh(&cube).is_ok());
 
     let volume = mesh_volume(&cube);
-    assert!((volume.abs() - 1.0).abs() < 0.01, "立方体体积应 ≈ 1.0，实际 {}", volume);
+    assert!(
+        (volume.abs() - 1.0).abs() < 0.01,
+        "立方体体积应 ≈ 1.0，实际 {}",
+        volume
+    );
 
     let area = surface_area(&cube);
-    assert!((area - 6.0).abs() < 0.01, "立方体表面积应 ≈ 6.0，实际 {}", area);
+    assert!(
+        (area - 6.0).abs() < 0.01,
+        "立方体表面积应 ≈ 6.0，实际 {}",
+        area
+    );
 }
 
 /// 多格式 IO roundtrip：OBJ → PLY → STL → OFF 顶点/面数一致
 #[test]
 fn workflow_multi_format_roundtrip() {
-    use halfedge::io::{format_ply, parse_ply, format_off, parse_off};
+    use halfedge::io::{format_off, format_ply, parse_off, parse_ply};
 
     let mesh = build_icosphere(0);
     let v_count = mesh.vertex_count();

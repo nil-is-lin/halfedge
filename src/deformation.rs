@@ -20,10 +20,12 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use crate::geometry::cotan_edge_weight;
 use crate::ids::VertexId;
+use crate::linalg::vec3::{Vec3, add, scale, sub};
 use crate::linalg::{SparseSystem, conjugate_gradient, regularize_diagonal};
-use crate::linalg::vec3::{Vec3, sub, add, scale};
 use crate::storage::MeshStorage;
 use crate::traversal::VertexRing;
 
@@ -216,20 +218,21 @@ pub fn laplacian_deformation(
         .map(|v| mesh.get_vertex(v).map(|x| x.position).unwrap_or([0.0; 3]))
         .collect();
 
-    // 计算原始拉普拉斯坐标 δ_i = p_i - Σ w_ij p_j
+    // 计算原始拉普拉斯坐标 δ_i = p_i - Σ w_ij p_j（并行：每顶点独立）
     let neighbors = build_neighbors_and_weights(mesh, &v_idx);
-    let mut delta = vec![[0.0; 3]; n];
-    for i in 0..n {
-        let p_i = original[i];
-        let mut sum = [0.0; 3];
-        for &(j, w) in &neighbors[i] {
-            let p_j = original[j];
-            sum = add(sum, scale(p_j, w));
-        }
-        // δ_i = w_ii * p_i - Σ w_ij p_j = (Σ w_ij) * p_i - Σ w_ij p_j
-        let w_sum: f64 = neighbors[i].iter().map(|&(_, w)| w).sum();
-        delta[i] = sub(scale(p_i, w_sum), sum);
-    }
+    let delta: Vec<[f64; 3]> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let p_i = original[i];
+            let mut sum = [0.0; 3];
+            for &(j, w) in &neighbors[i] {
+                let p_j = original[j];
+                sum = add(sum, scale(p_j, w));
+            }
+            let w_sum: f64 = neighbors[i].iter().map(|&(_, w)| w).sum();
+            sub(scale(p_i, w_sum), sum)
+        })
+        .collect();
 
     // 构建约束集合
     let mut constraint_map: HashMap<usize, Vec3> = HashMap::new();
@@ -406,67 +409,63 @@ pub fn arap_deformation(
 }
 
 /// 计算每个顶点 cell 的最佳旋转 R_i（极分解）。
+///
+/// 并行版本：每个顶点的协方差矩阵构建与极分解相互独立，
+/// 使用 `par_iter()` 并行计算后收集到 Vec。
 fn compute_cell_rotations(
     original: &[Vec3],
     current: &[Vec3],
     neighbors: &[Vec<(usize, f64)>],
     _constraint_map: &HashMap<usize, Vec3>,
 ) -> Vec<Mat3> {
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let n = original.len();
-    let mut rotations = vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; n];
 
-    for i in 0..n {
-        // 构建协方差矩阵 S_i = Σ_j w_ij * e_ij * e'_ij^T
-        // e_ij = p_i - p_j (原始), e'_ij = p'_i - p'_j (当前)
-        let mut s = [[0.0; 3]; 3];
-        let p_i = original[i];
-        let p_i_cur = current[i];
-        for &(j, w) in &neighbors[i] {
-            let e_orig = sub(p_i, original[j]);
-            let e_cur = sub(p_i_cur, current[j]);
-            // S += w * outer(e_orig, e_cur)
-            // outer(a, b) = a * b^T，元素 S[r][c] += w * a[r] * b[c]
-            for r in 0..3 {
-                for c in 0..3 {
-                    s[r][c] += w * e_orig[r] * e_cur[c];
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            // 构建协方差矩阵 S_i = Σ_j w_ij * e_ij * e'_ij^T
+            let mut s = [[0.0; 3]; 3];
+            let p_i = original[i];
+            let p_i_cur = current[i];
+            for &(j, w) in &neighbors[i] {
+                let e_orig = sub(p_i, original[j]);
+                let e_cur = sub(p_i_cur, current[j]);
+                for r in 0..3 {
+                    for c in 0..3 {
+                        s[r][c] += w * e_orig[r] * e_cur[c];
+                    }
                 }
             }
-        }
 
-        // 极分解得到最佳旋转
-        let s_norm = (s[0][0].powi(2)
-            + s[0][1].powi(2)
-            + s[0][2].powi(2)
-            + s[1][0].powi(2)
-            + s[1][1].powi(2)
-            + s[1][2].powi(2)
-            + s[2][0].powi(2)
-            + s[2][1].powi(2)
-            + s[2][2].powi(2))
-        .sqrt();
-        if s_norm < 1e-14 {
-            // 退化：使用单位旋转
-            rotations[i] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        } else {
-            let r = polar_rotation(s);
-            // 校验：det(R) 应为 +1（旋转），若为 -1（反射）则修正
-            let det = mat3_det(r);
-            if det < 0.0 {
-                // 反射：通过翻转最后一个奇异向量修正
-                // 简化处理：使用 SVD 修正太复杂，这里直接取 R 的负对角元
-                // 更稳健的方法是 SVD，但极分解 + 反射检查已足够大部分场景
-                let mut r_corrected = r;
-                r_corrected[2][0] = -r_corrected[2][0];
-                r_corrected[2][1] = -r_corrected[2][1];
-                r_corrected[2][2] = -r_corrected[2][2];
-                rotations[i] = r_corrected;
+            // 极分解得到最佳旋转
+            let s_norm = (s[0][0].powi(2)
+                + s[0][1].powi(2)
+                + s[0][2].powi(2)
+                + s[1][0].powi(2)
+                + s[1][1].powi(2)
+                + s[1][2].powi(2)
+                + s[2][0].powi(2)
+                + s[2][1].powi(2)
+                + s[2][2].powi(2))
+            .sqrt();
+            if s_norm < 1e-14 {
+                identity
             } else {
-                rotations[i] = r;
+                let r = polar_rotation(s);
+                let det = mat3_det(r);
+                if det < 0.0 {
+                    let mut r_corrected = r;
+                    r_corrected[2][0] = -r_corrected[2][0];
+                    r_corrected[2][1] = -r_corrected[2][1];
+                    r_corrected[2][2] = -r_corrected[2][2];
+                    r_corrected
+                } else {
+                    r
+                }
             }
-        }
-    }
-
-    rotations
+        })
+        .collect()
 }
 
 /// 构建 ARAP 全局步骤的右端向量。
@@ -475,6 +474,9 @@ fn compute_cell_rotations(
 /// 对约束顶点 $i$：$\text{rhs}_i = c_i$（约束目标位置）
 ///
 /// 其中 $p^0$ 是原始位置，$R$ 是当前迭代的旋转。
+///
+/// 并行版本：每个顶点的 RHS 累加相互独立（写入不同索引），
+/// 使用 `par_iter()` 并行计算后收集到 (rhs_x, rhs_y, rhs_z)。
 fn build_arap_rhs(
     original: &[Vec3],
     neighbors: &[Vec<(usize, f64)>],
@@ -482,45 +484,40 @@ fn build_arap_rhs(
     constraint_map: &HashMap<usize, Vec3>,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = neighbors.len();
-    let mut rhs_x = vec![0.0; n];
-    let mut rhs_y = vec![0.0; n];
-    let mut rhs_z = vec![0.0; n];
 
-    // 对每个顶点 i 累加其所有邻居的贡献
-    // 注意：每条无向边 (i, j) 在 neighbors[i] 和 neighbors[j] 中各出现一次
-    // 公式 rhs_i = (1/2) Σ_j w_ij (R_i + R_j) (p_i - p_j) 已包含每条边一次
-    for i in 0..n {
-        if let Some(&target) = constraint_map.get(&i) {
-            rhs_x[i] = target[0];
-            rhs_y[i] = target[1];
-            rhs_z[i] = target[2];
-            continue;
-        }
-
-        let r_i = rotations[i];
-        let p_i = original[i];
-        let mut acc = [0.0; 3];
-        for &(j, w) in &neighbors[i] {
-            let r_j = rotations[j];
-            let p_j = original[j];
-            // e = p_i - p_j
-            let e = sub(p_i, p_j);
-            // (R_i + R_j) * e
-            let r_i_e = mat3_vec(r_i, e);
-            let r_j_e = mat3_vec(r_j, e);
-            let combined = add(r_i_e, r_j_e);
-            // (1/2) * w_orig * (R_i + R_j) * e = w * (R_i + R_j) * e
-            // （neighbors 中 w = w_orig/2，故 w 即为 (1/2) w_orig）
-            acc = add(acc, scale(combined, w));
-            // 约束邻居：矩阵中跳过了 (i,j)，需将 -w_orig * c_j 移到 RHS 得 +w_orig * c_j = +2w * c_j
-            if let Some(&c) = constraint_map.get(&j) {
-                acc = add(acc, scale(c, 2.0 * w));
+    let rhs: Vec<[f64; 3]> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            if let Some(&target) = constraint_map.get(&i) {
+                return target;
             }
-        }
-        rhs_x[i] = acc[0];
-        rhs_y[i] = acc[1];
-        rhs_z[i] = acc[2];
-    }
+
+            let r_i = rotations[i];
+            let p_i = original[i];
+            let mut acc = [0.0; 3];
+            for &(j, w) in &neighbors[i] {
+                let r_j = rotations[j];
+                let p_j = original[j];
+                // e = p_i - p_j
+                let e = sub(p_i, p_j);
+                // (R_i + R_j) * e
+                let r_i_e = mat3_vec(r_i, e);
+                let r_j_e = mat3_vec(r_j, e);
+                let combined = add(r_i_e, r_j_e);
+                // (1/2) * w_orig * (R_i + R_j) * e = w * (R_i + R_j) * e
+                acc = add(acc, scale(combined, w));
+                // 约束邻居：矩阵中跳过了 (i,j)，需将 -w_orig * c_j 移到 RHS 得 +w_orig * c_j = +2w * c_j
+                if let Some(&c) = constraint_map.get(&j) {
+                    acc = add(acc, scale(c, 2.0 * w));
+                }
+            }
+            acc
+        })
+        .collect();
+
+    let rhs_x: Vec<f64> = rhs.iter().map(|r| r[0]).collect();
+    let rhs_y: Vec<f64> = rhs.iter().map(|r| r[1]).collect();
+    let rhs_z: Vec<f64> = rhs.iter().map(|r| r[2]).collect();
 
     (rhs_x, rhs_y, rhs_z)
 }

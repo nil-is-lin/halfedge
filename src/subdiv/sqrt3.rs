@@ -57,7 +57,7 @@ use crate::traversal::{FaceHalfEdges, VertexRing, is_boundary_vertex};
 /// - 所有查询通过 `mesh.get_*` + `Option` 链式调用，无效 ID 跳过；
 /// - 边界顶点保持原位置；
 /// - 内部顶点 valence=0 时保持原位置（孤立顶点）；
-/// - 非三角面被跳过并通过 `eprintln!` 输出警告到 stderr。
+/// - 非三角面被跳过并通过 `log::warn!` 输出警告。
 ///   若需处理任意多边形网格，请使用
 ///   [`crate::subdiv::catmull_clark::catmull_clark_subdivide`]。
 pub fn sqrt3_subdivide(mesh: &MeshStorage) -> MeshStorage {
@@ -91,7 +91,7 @@ pub fn sqrt3_subdivide(mesh: &MeshStorage) -> MeshStorage {
         }
     }
     if skipped_non_triangle > 0 {
-        eprintln!(
+        log::warn!(
             "[halfedge::sqrt3_subdivide] 警告：输入网格含 {} 个非三角面，已跳过（√3 细分仅支持三角形）。\
              若需处理任意多边形，请使用 catmull_clark_subdivide。",
             skipped_non_triangle
@@ -105,7 +105,8 @@ pub fn sqrt3_subdivide(mesh: &MeshStorage) -> MeshStorage {
             .filter_map(|&v| mesh.get_vertex(v))
             .map(|vt| vt.position)
             .collect();
-        return build_mesh_from_vertices_and_faces(&positions, &[]);
+        return build_mesh_from_vertices_and_faces(&positions, &[])
+            .expect("empty faces is always valid");
     }
 
     // ---------- 3. 计算面点（重心）----------
@@ -256,6 +257,7 @@ pub fn sqrt3_subdivide(mesh: &MeshStorage) -> MeshStorage {
 
     // ---------- 7. 构建新网格 ----------
     build_mesh_from_vertices_and_faces(&new_positions, &new_faces)
+        .expect("sqrt3 subdivision output is always valid")
 }
 
 // ============================================================
@@ -451,7 +453,7 @@ mod tests {
         // V=3, F=1 → V'=3+1=4, F'=3（3 条边界边各 1 个 fan 三角形）
         let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = [[0, 1, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = sqrt3_subdivide(&mesh);
         assert_eq!(refined.vertex_count(), 4, "单三角形 V'=3+1=4");
         assert_eq!(refined.face_count(), 3, "单三角形 F'=3");
@@ -471,7 +473,7 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let faces = [[0, 1, 2], [0, 2, 3]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = sqrt3_subdivide(&mesh);
         assert_eq!(refined.vertex_count(), 6, "开四边形 V'=4+2=6");
         assert_eq!(refined.face_count(), 6, "开四边形 F'=2+4=6");
@@ -485,7 +487,7 @@ mod tests {
         // 单三角形面点应在重心 (1/3, 1/3, 0)
         let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = [[0, 1, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = sqrt3_subdivide(&mesh);
 
         let target = [1.0 / 3.0, 1.0 / 3.0, 0.0];
@@ -555,7 +557,7 @@ mod tests {
             [0.0, 0.0, 1.0],
         ];
         let faces = [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = sqrt3_subdivide(&mesh);
 
         // 顶点 v0=(0,0,0) 的 3 个邻居：v1=(1,0,0), v2=(0,1,0), v3=(0,0,1)

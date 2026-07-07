@@ -14,10 +14,15 @@
 
 use std::collections::HashMap;
 
-use crate::geometry::{cotan_edge_weight, face_area};
+use rayon::prelude::*;
+
+use crate::geometry::face_area;
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
-use crate::linalg::{SparseSystem, conjugate_gradient, regularize_diagonal};
 use crate::linalg::vec3::{self, Vec3};
+use crate::linalg::{
+    SparseSystem, build_cotan_laplacian, build_vertex_index, conjugate_gradient,
+    regularize_diagonal,
+};
 use crate::storage::MeshStorage;
 use crate::traversal::{FaceHalfEdges, VertexAdjacentFaces, VertexRing};
 
@@ -25,17 +30,13 @@ use crate::traversal::{FaceHalfEdges, VertexAdjacentFaces, VertexRing};
 // 顶点 → 索引映射
 // ============================================================
 
-fn build_vertex_index(mesh: &MeshStorage) -> HashMap<VertexId, usize> {
-    mesh.vertex_ids().enumerate().map(|(i, v)| (v, i)).collect()
-}
+// build_vertex_index 已移至 linalg 模块作为公共函数
 
 /// 同时构建顶点列表（O(1) 反查索引→VertexId）与索引映射（VertexId→索引）。
 ///
 /// 单次遍历，避免在 Dijkstra 主循环中反复调用
 /// `mesh.vertex_ids().nth(u)`（每次 O(u)，整体退化为 O(n^2)）。
-fn build_vertex_index_and_list(
-    mesh: &MeshStorage,
-) -> (Vec<VertexId>, HashMap<VertexId, usize>) {
+fn build_vertex_index_and_list(mesh: &MeshStorage) -> (Vec<VertexId>, HashMap<VertexId, usize>) {
     let list: Vec<VertexId> = mesh.vertex_ids().collect();
     let map = list.iter().enumerate().map(|(i, &v)| (v, i)).collect();
     (list, map)
@@ -48,30 +49,14 @@ fn build_vertex_index_and_list(
 /// 构建余切拉普拉斯矩阵（N×N）和顶点质量（lumped mass，对角）。
 ///
 /// 返回 `(laplacian, mass_vec)`，其中 `mass_vec[i]` = 每个顶点的 Voronoi 面积。
+/// 拉普拉斯部分委托 [`crate::linalg::build_cotan_laplacian`]。
 fn build_laplacian_and_mass(
     mesh: &MeshStorage,
     v_idx: &HashMap<VertexId, usize>,
 ) -> (SparseSystem, Vec<f64>) {
     let n = v_idx.len();
-    let mut lap = SparseSystem::new(n);
+    let lap = build_cotan_laplacian(mesh, v_idx);
     let mut mass = vec![0.0; n];
-
-    // 计算每个顶点的邻接余切权重（Laplacian）和顶点面积（mass）
-    // 拉普拉斯：对每个顶点遍历邻域，每边权重减半（因每边被遍历两次）
-    for (v, &i) in v_idx {
-        let mut diag = 0.0;
-        for he in VertexRing::new(mesh, *v) {
-            let neighbor = mesh.get_halfedge(he).unwrap().vertex;
-            if let Some(&j) = v_idx.get(&neighbor) {
-                let w = cotan_edge_weight(mesh, he).unwrap_or(0.0) / 2.0;
-                if w > 0.0 {
-                    lap.add(i, j, -w);
-                    diag += w;
-                }
-            }
-        }
-        lap.add_diag(i, diag);
-    }
 
     // 顶点面积：遍历面，每个面分配 1/3 面积给各顶点
     for f in mesh.face_ids() {
@@ -79,9 +64,18 @@ fn build_laplacian_and_mass(
         if halfedges.len() != 3 {
             continue;
         }
-        let v0 = mesh.get_halfedge(halfedges[0]).unwrap().vertex;
-        let v1 = mesh.get_halfedge(halfedges[1]).unwrap().vertex;
-        let v2 = mesh.get_halfedge(halfedges[2]).unwrap().vertex;
+        let v0 = mesh
+            .get_halfedge(halfedges[0])
+            .expect("halfedge exists in mesh")
+            .vertex;
+        let v1 = mesh
+            .get_halfedge(halfedges[1])
+            .expect("halfedge exists in mesh")
+            .vertex;
+        let v2 = mesh
+            .get_halfedge(halfedges[2])
+            .expect("halfedge exists in mesh")
+            .vertex;
         let Some(&i0) = v_idx.get(&v0) else { continue };
         let Some(&i1) = v_idx.get(&v1) else { continue };
         let Some(&i2) = v_idx.get(&v2) else { continue };
@@ -125,16 +119,25 @@ fn build_divergence_from_gradient(
             continue;
         }
 
-        let v0 = mesh.get_halfedge(halfedges[0]).unwrap().vertex;
-        let v1 = mesh.get_halfedge(halfedges[1]).unwrap().vertex;
-        let v2 = mesh.get_halfedge(halfedges[2]).unwrap().vertex;
+        let v0 = mesh
+            .get_halfedge(halfedges[0])
+            .expect("halfedge exists in mesh")
+            .vertex;
+        let v1 = mesh
+            .get_halfedge(halfedges[1])
+            .expect("halfedge exists in mesh")
+            .vertex;
+        let v2 = mesh
+            .get_halfedge(halfedges[2])
+            .expect("halfedge exists in mesh")
+            .vertex;
         let Some(&i0) = v_idx.get(&v0) else { continue };
         let Some(&i1) = v_idx.get(&v1) else { continue };
         let Some(&i2) = v_idx.get(&v2) else { continue };
 
-        let p0 = mesh.get_vertex(v0).unwrap().position;
-        let p1 = mesh.get_vertex(v1).unwrap().position;
-        let p2 = mesh.get_vertex(v2).unwrap().position;
+        let p0 = mesh.get_vertex(v0).expect("vertex exists in mesh").position;
+        let p1 = mesh.get_vertex(v1).expect("vertex exists in mesh").position;
+        let p2 = mesh.get_vertex(v2).expect("vertex exists in mesh").position;
 
         let area = vec3::triangle_area(p0, p1, p2);
         if area < 1e-14 {
@@ -202,15 +205,13 @@ pub fn geodesic_distance_from_vertex(mesh: &MeshStorage, source: VertexId) -> Op
     let v_idx = build_vertex_index(mesh);
     let source_idx = *v_idx.get(&source)?;
 
-    // 计算平均边长以确定时间步
-    let mut total_len = 0.0;
-    let mut edge_count = 0;
-    for he in mesh.halfedge_ids() {
-        if let Some(len) = crate::geometry::edge_length(mesh, he) {
-            total_len += len;
-            edge_count += 1;
-        }
-    }
+    // 计算平均边长以确定时间步（并行归约）
+    let he_ids: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
+    let (total_len, edge_count) = he_ids
+        .par_iter()
+        .filter_map(|&he| crate::geometry::edge_length(mesh, he))
+        .fold(|| (0.0f64, 0u64), |(sum, cnt), len| (sum + len, cnt + 1))
+        .reduce(|| (0.0f64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
     let h_sq = if edge_count > 0 {
         let h = total_len / (edge_count as f64);
         h * h
@@ -254,16 +255,19 @@ pub fn geodesic_distance_from_vertex(mesh: &MeshStorage, source: VertexId) -> Op
     // ── 步骤 3: 计算面梯度 ──
     let face_grad = compute_face_gradients(mesh, &v_idx, &u);
 
-    // ── 步骤 4: 归一化梯度 ──
-    let mut face_grad_norm: HashMap<FaceId, [f64; 3]> = HashMap::new();
-    for (&f, &g) in &face_grad {
-        let len = vec3::length(g);
-        if len > 1e-10 {
-            face_grad_norm.insert(f, vec3::scale(g, -1.0 / len));
-        } else {
-            face_grad_norm.insert(f, [0.0, 0.0, 0.0]);
-        }
-    }
+    // ── 步骤 4: 归一化梯度（并行） ──
+    let grad_entries: Vec<(FaceId, [f64; 3])> = face_grad.into_iter().collect();
+    let face_grad_norm: HashMap<FaceId, [f64; 3]> = grad_entries
+        .par_iter()
+        .map(|(f, g)| {
+            let len = vec3::length(*g);
+            if len > 1e-10 {
+                (*f, vec3::scale(*g, -1.0 / len))
+            } else {
+                (*f, [0.0, 0.0, 0.0])
+            }
+        })
+        .collect();
 
     // ── 步骤 5: 求解 Poisson Δφ = ∇·X ──
     // 复用步骤 1 已构建的 cot_lap，避免重复构建拉普拉斯矩阵
@@ -281,49 +285,71 @@ pub fn geodesic_distance_from_vertex(mesh: &MeshStorage, source: VertexId) -> Op
 }
 
 /// 计算每个面上的分段线性函数梯度。
+///
+/// 并行版本：每个面的梯度计算相互独立，使用 `par_iter()` 并行计算，
+/// 收集后再顺序写入 HashMap。
 fn compute_face_gradients(
     mesh: &MeshStorage,
     v_idx: &HashMap<VertexId, usize>,
     u: &[f64],
 ) -> HashMap<FaceId, [f64; 3]> {
-    let mut grad = HashMap::new();
+    let face_ids: Vec<FaceId> = mesh.face_ids().collect();
 
-    for f in mesh.face_ids() {
-        let halfedges: Vec<HalfEdgeId> = FaceHalfEdges::new(mesh, f).collect();
-        if halfedges.len() != 3 {
-            continue;
-        }
+    let results: Vec<(FaceId, [f64; 3])> = face_ids
+        .par_iter()
+        .filter_map(|&f| {
+            let halfedges: Vec<HalfEdgeId> = FaceHalfEdges::new(mesh, f).collect();
+            if halfedges.len() != 3 {
+                return None;
+            }
 
-        let v0 = mesh.get_halfedge(halfedges[0]).unwrap().vertex;
-        let v1 = mesh.get_halfedge(halfedges[1]).unwrap().vertex;
-        let v2 = mesh.get_halfedge(halfedges[2]).unwrap().vertex;
-        let Some(&i0) = v_idx.get(&v0) else { continue };
-        let Some(&i1) = v_idx.get(&v1) else { continue };
-        let Some(&i2) = v_idx.get(&v2) else { continue };
+            let v0 = mesh
+                .get_halfedge(halfedges[0])
+                .expect("halfedge exists in mesh")
+                .vertex;
+            let v1 = mesh
+                .get_halfedge(halfedges[1])
+                .expect("halfedge exists in mesh")
+                .vertex;
+            let v2 = mesh
+                .get_halfedge(halfedges[2])
+                .expect("halfedge exists in mesh")
+                .vertex;
+            let &i0 = v_idx.get(&v0)?;
+            let &i1 = v_idx.get(&v1)?;
+            let &i2 = v_idx.get(&v2)?;
 
-        let p0 = mesh.get_vertex(v0).unwrap().position;
-        let p1 = mesh.get_vertex(v1).unwrap().position;
-        let p2 = mesh.get_vertex(v2).unwrap().position;
+            let p0 = mesh.get_vertex(v0).expect("vertex exists in mesh").position;
+            let p1 = mesh.get_vertex(v1).expect("vertex exists in mesh").position;
+            let p2 = mesh.get_vertex(v2).expect("vertex exists in mesh").position;
 
-        let area = vec3::triangle_area(p0, p1, p2);
-        if area < 1e-14 {
-            continue;
-        }
+            let area = vec3::triangle_area(p0, p1, p2);
+            if area < 1e-14 {
+                return None;
+            }
 
-        let n = vec3::triangle_normal(p0, p1, p2);
+            let n = vec3::triangle_normal(p0, p1, p2);
 
-        // ∇u = (1/(2|f|)) * n × Σ u_i * e_i
-        // 其中 e_i 是顶点 i 所对的边向量
-        let e0 = vec3::sub(p2, p1);
-        let e1 = vec3::sub(p0, p2);
-        let e2 = vec3::sub(p1, p0);
+            // ∇u = (1/(2|f|)) * n × Σ u_i * e_i
+            // 其中 e_i 是顶点 i 所对的边向量
+            let e0 = vec3::sub(p2, p1);
+            let e1 = vec3::sub(p0, p2);
+            let e2 = vec3::sub(p1, p0);
 
-        let sum = vec3::add(vec3::add(vec3::scale(e0, u[i0]), vec3::scale(e1, u[i1])), vec3::scale(e2, u[i2]));
+            let sum = vec3::add(
+                vec3::add(vec3::scale(e0, u[i0]), vec3::scale(e1, u[i1])),
+                vec3::scale(e2, u[i2]),
+            );
 
-        let g = vec3::scale(vec3::cross(n, sum), 1.0 / (2.0 * area));
+            let g = vec3::scale(vec3::cross(n, sum), 1.0 / (2.0 * area));
+            Some((f, g))
+        })
+        .collect();
+
+    let mut grad = HashMap::with_capacity(results.len());
+    for (f, g) in results {
         grad.insert(f, g);
     }
-
     grad
 }
 
@@ -366,7 +392,10 @@ pub fn shortest_path(mesh: &MeshStorage, distance: &[f64], target: VertexId) -> 
         let mut best_dist = current_dist;
 
         for he in VertexRing::new(mesh, current) {
-            let neighbor = mesh.get_halfedge(he).unwrap().vertex;
+            let neighbor = mesh
+                .get_halfedge(he)
+                .expect("halfedge exists in mesh")
+                .vertex;
             if let Some(&ni) = v_idx.get(&neighbor)
                 && ni < distance.len()
             {
@@ -569,7 +598,7 @@ pub fn dijkstra_with_parent(mesh: &MeshStorage, source: VertexId) -> (Vec<f64>, 
     if n == 0 || !v_idx.contains_key(&source) {
         return (Vec::new(), Vec::new());
     }
-    let source_idx = *v_idx.get(&source).unwrap();
+    let source_idx = *v_idx.get(&source).expect("source vertex must be in index");
 
     let mut dist = vec![f64::INFINITY; n];
     let mut parent = vec![usize::MAX; n];
@@ -696,15 +725,13 @@ pub fn multi_source_geodesic(mesh: &MeshStorage, sources: &[VertexId]) -> Option
     }
     let v_idx = build_vertex_index(mesh);
 
-    // 计算平均边长
-    let mut total_len = 0.0;
-    let mut edge_count = 0usize;
-    for he in mesh.halfedge_ids() {
-        if let Some(len) = crate::geometry::edge_length(mesh, he) {
-            total_len += len;
-            edge_count += 1;
-        }
-    }
+    // 计算平均边长（并行归约）
+    let he_ids: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
+    let (total_len, edge_count) = he_ids
+        .par_iter()
+        .filter_map(|&he| crate::geometry::edge_length(mesh, he))
+        .fold(|| (0.0f64, 0u64), |(sum, cnt), len| (sum + len, cnt + 1))
+        .reduce(|| (0.0f64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
     let h_sq = if edge_count > 0 {
         let h = total_len / (edge_count as f64);
         h * h
@@ -746,16 +773,19 @@ pub fn multi_source_geodesic(mesh: &MeshStorage, sources: &[VertexId]) -> Option
     // ── 步骤 3: 计算面梯度 ──
     let face_grad = compute_face_gradients(mesh, &v_idx, &u);
 
-    // ── 步骤 4: 归一化梯度 ──
-    let mut face_grad_norm: HashMap<FaceId, [f64; 3]> = HashMap::new();
-    for (&f, &g) in &face_grad {
-        let len = vec3::length(g);
-        if len > 1e-10 {
-            face_grad_norm.insert(f, vec3::scale(g, -1.0 / len));
-        } else {
-            face_grad_norm.insert(f, [0.0, 0.0, 0.0]);
-        }
-    }
+    // ── 步骤 4: 归一化梯度（并行） ──
+    let grad_entries: Vec<(FaceId, [f64; 3])> = face_grad.into_iter().collect();
+    let face_grad_norm: HashMap<FaceId, [f64; 3]> = grad_entries
+        .par_iter()
+        .map(|(f, g)| {
+            let len = vec3::length(*g);
+            if len > 1e-10 {
+                (*f, vec3::scale(*g, -1.0 / len))
+            } else {
+                (*f, [0.0, 0.0, 0.0])
+            }
+        })
+        .collect();
 
     // ── 步骤 5: 求解 Poisson Δφ = ∇·X ──
     // 复用步骤 1 已构建的 cot_lap，避免重复构建拉普拉斯矩阵
@@ -919,7 +949,10 @@ fn unfold_pseudo_source(
     let sy = vec3::dot(v, ey1);
 
     // 映射到目标面坐标系
-    vec3::add(vec3::add(edge_start, vec3::scale(ex, sx)), vec3::scale(ey2, sy))
+    vec3::add(
+        vec3::add(edge_start, vec3::scale(ex, sx)),
+        vec3::scale(ey2, sy),
+    )
 }
 
 /// 将 3D 点投影到面局部 2D 坐标系。
@@ -1753,7 +1786,11 @@ mod tests {
         // 统一传播（一次 PQ）应与「逐源运行取最小」数值一致
         let mesh = build_icosphere(2);
         let vertices: Vec<VertexId> = mesh.vertex_ids().collect();
-        let sources = vec![vertices[0], vertices[vertices.len() / 2], vertices[vertices.len() - 1]];
+        let sources = vec![
+            vertices[0],
+            vertices[vertices.len() / 2],
+            vertices[vertices.len() - 1],
+        ];
 
         // 统一传播
         let d_unified = mmp_multi_source_geodesic(&mesh, &sources);
@@ -1858,11 +1895,10 @@ mod tests {
             if mesh.get_halfedge(he_i).unwrap().twin.is_some() {
                 continue;
             }
-            for j in 0..he_list.len() {
+            for (j, &(he_j, src_j, dst_j)) in he_list.iter().enumerate() {
                 if i == j {
                     continue;
                 }
-                let (he_j, src_j, dst_j) = he_list[j];
                 if src_j == dst_i && dst_j == src_i {
                     mesh.get_halfedge_mut(he_i).unwrap().twin = Some(he_j);
                     mesh.get_halfedge_mut(he_j).unwrap().twin = Some(he_i);
@@ -1875,8 +1911,8 @@ mod tests {
         // 设置顶点 halfedge 入口
         for (he, _src, _dst) in &he_list {
             let h = mesh.get_halfedge(*he).unwrap();
-            if h.twin.is_some() {
-                let origin = mesh.get_halfedge(h.twin.unwrap()).unwrap().vertex;
+            if let Some(twin) = h.twin {
+                let origin = mesh.get_halfedge(twin).unwrap().vertex;
                 if mesh.get_vertex(origin).unwrap().halfedge.is_none() {
                     mesh.get_vertex_mut(origin).unwrap().halfedge = Some(*he);
                 }

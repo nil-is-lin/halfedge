@@ -107,7 +107,7 @@ fn main() {
     // 构造一个单三角形（全是边界边）
     let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
     let faces = [[0, 1, 2]];
-    let mut mesh = halfedge::build_mesh_from_vertices_and_faces(&vertices, &faces);
+    let mut mesh = halfedge::build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
     let boundary_he = mesh
         .halfedge_ids()
         .find(|h| {

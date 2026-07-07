@@ -1,4 +1,6 @@
 /target
 .DS_Store
 .arts/
+.codeartsdoer/
+.workbuddy/
 book/book/

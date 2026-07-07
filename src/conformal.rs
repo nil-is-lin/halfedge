@@ -11,53 +11,26 @@
 //! - [`compute_vertex_scale_factors`]：从高斯曲率目标计算共形比例因子
 //!   （离散 Yamabe 流 / Circle Pattern 的前置步骤）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::geometry::cotan_edge_weight;
 use crate::ids::VertexId;
-use crate::linalg::{SparseSystem, conjugate_gradient, regularize_diagonal};
+use crate::linalg::{
+    SparseSystem, build_cotan_laplacian, build_vertex_index, conjugate_gradient,
+    regularize_diagonal,
+};
 use crate::storage::MeshStorage;
-use crate::traversal::VertexRing;
 
 // ============================================================
 // 顶点索引
 // ============================================================
 
-fn build_vertex_index(mesh: &MeshStorage) -> HashMap<VertexId, usize> {
-    mesh.vertex_ids().enumerate().map(|(i, v)| (v, i)).collect()
-}
+// build_vertex_index 已移至 linalg 模块作为公共函数
 
 // ============================================================
 // 余切拉普拉斯
 // ============================================================
 
-/// 构建完整的 N×N 余切拉普拉斯矩阵。
-fn build_full_cotan_laplacian(
-    mesh: &MeshStorage,
-    v_idx: &HashMap<VertexId, usize>,
-) -> SparseSystem {
-    let n = v_idx.len();
-    let mut sys = SparseSystem::new(n);
-    for i in 0..n {
-        sys.add_diag(i, 0.0);
-    }
-
-    for &idx in v_idx.values() {
-        let v = mesh.vertex_ids().nth(idx).unwrap();
-        let mut diag = 0.0;
-        for he in VertexRing::new(mesh, v) {
-            let neighbor = mesh.get_halfedge(he).unwrap().vertex;
-            if let Some(&j) = v_idx.get(&neighbor) {
-                let w = cotan_edge_weight(mesh, he).unwrap_or(0.0) / 2.0;
-                sys.add(idx, j, -w);
-                diag += w;
-            }
-        }
-        sys.add_diag(idx, diag);
-    }
-
-    sys
-}
+// build_full_cotan_laplacian 已移至 linalg 模块作为 build_cotan_laplacian
 
 // ============================================================
 // 调和映射
@@ -94,7 +67,7 @@ pub fn harmonic_map(
         .collect();
     let _free: Vec<usize> = (0..n).filter(|i| !pinned_set.contains(i)).collect();
 
-    let laplacian = build_full_cotan_laplacian(mesh, &v_idx);
+    let laplacian = build_cotan_laplacian(mesh, &v_idx);
     let mut a = laplacian.finish();
     regularize_diagonal(&mut a, 1e-8);
 
@@ -219,7 +192,7 @@ pub fn compute_vertex_scale_factors(
     }
 
     let v_idx = build_vertex_index(mesh);
-    let laplacian = build_full_cotan_laplacian(mesh, &v_idx);
+    let laplacian = build_cotan_laplacian(mesh, &v_idx);
     let lap = laplacian.finish();
 
     // Pin vertex 0 to eliminate the constant null-space

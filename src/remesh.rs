@@ -23,12 +23,27 @@ use crate::traversal::{FaceHalfEdges, VertexAdjacentVerts, VertexRing, is_bounda
 // ============================================================
 
 /// 切向拉普拉斯平滑：将顶点沿切平面移动至邻居平均位置。
+///
+/// 便利包装函数，在测试中使用。生产代码通过 `compute_tangential_smooth`
+/// + `smooth_vertices` 的 gather-scatter 模式实现并行。
+#[allow(dead_code)]
 fn tangential_smooth(mesh: &mut MeshStorage, v: VertexId) {
+    if let Some(new_pos) = compute_tangential_smooth(mesh, v) {
+        // 使用 set_position 同步 SOA 位置缓存
+        mesh.set_position(v, new_pos);
+    }
+}
+
+/// 计算切向拉普拉斯平滑后的新位置（纯函数，不修改网格）。
+///
+/// 将 `tangential_smooth` 的计算与写入分离，使并行版本可以
+/// 先并行计算所有新位置，再顺序写入。
+fn compute_tangential_smooth(mesh: &MeshStorage, v: VertexId) -> Option<[f64; 3]> {
     let neighbors: Vec<[f64; 3]> = VertexAdjacentVerts::new(mesh, v)
         .filter_map(|n| mesh.get_vertex(n).map(|vt| vt.position))
         .collect();
     if neighbors.is_empty() {
-        return;
+        return None;
     }
 
     let n = neighbors.len() as f64;
@@ -42,12 +57,8 @@ fn tangential_smooth(mesh: &mut MeshStorage, v: VertexId) {
     avg[1] /= n;
     avg[2] /= n;
 
-    let pos = match mesh.get_vertex(v) {
-        Some(vt) => vt.position,
-        None => return,
-    };
+    let pos = mesh.get_vertex(v)?.position;
 
-    // 取第一个邻接面的法向作为切线方向参考
     let normal = vertex_normal(mesh, v).unwrap_or([0.0, 1.0, 0.0]);
     let diff = [avg[0] - pos[0], avg[1] - pos[1], avg[2] - pos[2]];
     let dot_n = diff[0] * normal[0] + diff[1] * normal[1] + diff[2] * normal[2];
@@ -57,15 +68,12 @@ fn tangential_smooth(mesh: &mut MeshStorage, v: VertexId) {
         diff[2] - normal[2] * dot_n,
     ];
 
-    let lambda = 0.5; // 松弛因子
-    let new_pos = [
+    let lambda = 0.5;
+    Some([
         pos[0] + lambda * tangent[0],
         pos[1] + lambda * tangent[1],
         pos[2] + lambda * tangent[2],
-    ];
-    if let Some(vt) = mesh.get_vertex_mut(v) {
-        vt.position = new_pos;
-    }
+    ])
 }
 
 // ============================================================
@@ -287,7 +295,7 @@ fn flip_for_valence(mesh: &mut MeshStorage) -> usize {
             _ => continue,
         };
 
-        let twin = h.twin.unwrap();
+        let twin = h.twin.expect("twin must be set at this point");
         // 避免重复处理
         if he > twin {
             continue;
@@ -305,7 +313,7 @@ fn flip_for_valence(mesh: &mut MeshStorage) -> usize {
             None => continue,
         };
         let v1 = h.vertex; // c
-        let face = h.face.unwrap();
+        let face = h.face.expect("halfedge must have a face");
         // 需要三角形另外两个顶点
         let face_hes: Vec<_> = FaceHalfEdges::new(mesh, face).collect();
         if face_hes.len() != 3 {
@@ -365,15 +373,28 @@ fn target_valence(v: VertexId, mesh: &MeshStorage) -> usize {
     if is_boundary_vertex(mesh, v) { 4 } else { 6 }
 }
 
-/// 对所有顶点执行一次切向拉普拉斯平滑。
+/// 对所有顶点执行一次切向拉普拉斯平滑（rayon 并行计算）。
+///
+/// 采用 gather-scatter 模式：
+/// 1. **Gather**（并行）：对每个非边界顶点，读取邻居位置计算新位置；
+/// 2. **Scatter**（顺序）：将新位置写入网格。
+///
+/// 这样避免了并行写入冲突，同时利用多核加速计算密集的平滑步骤。
 fn smooth_vertices(mesh: &mut MeshStorage) {
+    use rayon::prelude::*;
+
     let verts: Vec<VertexId> = mesh.vertex_ids().collect();
-    for v in verts {
-        // 边界顶点不移动
-        if is_boundary_vertex(mesh, v) {
-            continue;
-        }
-        tangential_smooth(mesh, v);
+
+    // Phase 1: 并行计算所有非边界顶点的新位置
+    let new_positions: Vec<(VertexId, [f64; 3])> = verts
+        .par_iter()
+        .filter(|&&v| !is_boundary_vertex(mesh, v))
+        .filter_map(|&v| compute_tangential_smooth(mesh, v).map(|pos| (v, pos)))
+        .collect();
+
+    // Phase 2: 顺序写入新位置（使用 set_position 同步 SOA 缓存）
+    for (v, pos) in new_positions {
+        mesh.set_position(v, pos);
     }
 }
 

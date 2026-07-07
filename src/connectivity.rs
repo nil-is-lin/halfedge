@@ -143,9 +143,11 @@ pub fn extract_faces(mesh: &MeshStorage, faces: &[FaceId]) -> Option<MeshStorage
 
     // 补全半边字段
     for &old_he in &he_set {
-        let old = mesh.get_halfedge(old_he).unwrap();
+        let old = mesh.get_halfedge(old_he).expect("halfedge exists in mesh");
         let new_he = he_map[&old_he];
-        let new_h = new_mesh.get_halfedge_mut(new_he).unwrap();
+        let new_h = new_mesh
+            .get_halfedge_mut(new_he)
+            .expect("halfedge just created or known to exist");
         new_h.twin = old.twin.and_then(|t| he_map.get(&t).copied());
         new_h.next = old.next.and_then(|n| he_map.get(&n).copied());
         new_h.prev = old.prev.and_then(|p| he_map.get(&p).copied());
@@ -163,14 +165,20 @@ pub fn extract_faces(mesh: &MeshStorage, faces: &[FaceId]) -> Option<MeshStorage
         let new_f = f_map[&old_f];
         let old_f_he = mesh.get_face(old_f)?.halfedge;
         if let Some(mapped_he) = old_f_he.and_then(|he| he_map.get(&he).copied()) {
-            new_mesh.get_face_mut(new_f).unwrap().halfedge = Some(mapped_he);
+            new_mesh
+                .get_face_mut(new_f)
+                .expect("face just created")
+                .halfedge = Some(mapped_he);
         }
     }
     for &old_he in &he_set {
         let new_he = he_map[&old_he];
         let old_face = mesh.get_halfedge(old_he)?.face;
         if let Some(mapped_f) = old_face.and_then(|f| f_map.get(&f).copied()) {
-            new_mesh.get_halfedge_mut(new_he).unwrap().face = Some(mapped_f);
+            new_mesh
+                .get_halfedge_mut(new_he)
+                .expect("halfedge just created or known to exist")
+                .face = Some(mapped_f);
         }
     }
 
@@ -179,7 +187,10 @@ pub fn extract_faces(mesh: &MeshStorage, faces: &[FaceId]) -> Option<MeshStorage
         let new_v = v_map[&old_v];
         let old_he = mesh.get_vertex(old_v)?.halfedge;
         if let Some(mapped) = old_he.and_then(|he| he_map.get(&he).copied()) {
-            new_mesh.get_vertex_mut(new_v).unwrap().halfedge = Some(mapped);
+            new_mesh
+                .get_vertex_mut(new_v)
+                .expect("vertex exists in mesh")
+                .halfedge = Some(mapped);
         }
     }
 
@@ -235,20 +246,29 @@ fn copy_mesh_into(
     f_map: &mut HashMap<FaceId, FaceId>,
 ) {
     for v_id in src.vertex_ids() {
-        let pos = src.get_vertex(v_id).unwrap().position;
+        let pos = src
+            .get_vertex(v_id)
+            .expect("vertex exists in source mesh")
+            .position;
         let new_v = dst.add_vertex(Vertex::new(pos));
         v_map.insert(v_id, new_v);
     }
     for he_id in src.halfedge_ids() {
-        let h = src.get_halfedge(he_id).unwrap();
+        let h = src
+            .get_halfedge(he_id)
+            .expect("halfedge exists in source mesh");
         let new_vertex = v_map[&h.vertex];
         let new_he = dst.add_halfedge(HalfEdge::new(new_vertex));
         he_map.insert(he_id, new_he);
     }
     for he_id in src.halfedge_ids() {
-        let old = src.get_halfedge(he_id).unwrap();
+        let old = src
+            .get_halfedge(he_id)
+            .expect("halfedge exists in source mesh");
         let new_he = he_map[&he_id];
-        let new_h = dst.get_halfedge_mut(new_he).unwrap();
+        let new_h = dst
+            .get_halfedge_mut(new_he)
+            .expect("halfedge exists in dest mesh");
         new_h.twin = old.twin.and_then(|t| he_map.get(&t).copied());
         new_h.next = old.next.and_then(|n| he_map.get(&n).copied());
         new_h.prev = old.prev.and_then(|p| he_map.get(&p).copied());
@@ -259,23 +279,38 @@ fn copy_mesh_into(
     }
     for f_id in src.face_ids() {
         let new_f = f_map[&f_id];
-        let old_f_he = src.get_face(f_id).unwrap().halfedge;
+        let old_f_he = src
+            .get_face(f_id)
+            .expect("face exists in source mesh")
+            .halfedge;
         if let Some(mapped) = old_f_he.and_then(|he| he_map.get(&he).copied()) {
-            dst.get_face_mut(new_f).unwrap().halfedge = Some(mapped);
+            dst.get_face_mut(new_f)
+                .expect("face exists in dest mesh")
+                .halfedge = Some(mapped);
         }
     }
     for he_id in src.halfedge_ids() {
         let new_he = he_map[&he_id];
-        let old_face = src.get_halfedge(he_id).unwrap().face;
+        let old_face = src
+            .get_halfedge(he_id)
+            .expect("halfedge exists in source mesh")
+            .face;
         if let Some(mapped) = old_face.and_then(|f| f_map.get(&f).copied()) {
-            dst.get_halfedge_mut(new_he).unwrap().face = Some(mapped);
+            dst.get_halfedge_mut(new_he)
+                .expect("halfedge exists in dest mesh")
+                .face = Some(mapped);
         }
     }
     for v_id in src.vertex_ids() {
         let new_v = v_map[&v_id];
-        let old_he = src.get_vertex(v_id).unwrap().halfedge;
+        let old_he = src
+            .get_vertex(v_id)
+            .expect("vertex exists in source mesh")
+            .halfedge;
         if let Some(mapped) = old_he.and_then(|he| he_map.get(&he).copied()) {
-            dst.get_vertex_mut(new_v).unwrap().halfedge = Some(mapped);
+            dst.get_vertex_mut(new_v)
+                .expect("vertex exists in dest mesh")
+                .halfedge = Some(mapped);
         }
     }
 }

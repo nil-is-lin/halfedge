@@ -305,9 +305,7 @@ pub fn remove_degenerate_faces(mesh: &mut MeshStorage) -> usize {
         }
     }
     if failed > 0 {
-        eprintln!(
-            "[halfedge::remove_degenerate_faces] 警告：{failed} 个退化面删除失败"
-        );
+        log::warn!("[halfedge::remove_degenerate_faces] 警告：{failed} 个退化面删除失败");
     }
     count
 }

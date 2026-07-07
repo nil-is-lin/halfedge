@@ -32,8 +32,8 @@
 //! $$V' = V + F, \quad F' = 3F$$
 //!
 //! ## 示例
-//! ```ignore
-//! use halfedge::{build_icosphere, subdiv::loop_subdivide};
+//! ```
+//! use halfedge::{build_icosphere, loop_subdivide};
 //!
 //! let mesh = build_icosphere(1);      // V=42, F=80
 //! let refined = loop_subdivide(&mesh); // V=162, F=320
@@ -72,9 +72,17 @@ use crate::traversal::{FaceHalfEdges, VertexRing, is_boundary_edge, is_boundary_
 ///
 /// # 非三角面
 /// Loop 细分仅支持三角形。若输入网格包含非三角面（如四边形），
-/// 这些面会被跳过并通过 `eprintln!` 输出警告到 stderr。
+/// 这些面会被跳过并通过 `log::warn!` 输出警告。
 /// 若需处理任意多边形网格，请使用
 /// [`catmull_clark::catmull_clark_subdivide`]。
+///
+/// ```
+/// use halfedge::{build_icosphere, loop_subdivide};
+///
+/// let mesh = build_icosphere(1); // V=42, F=80
+/// let refined = loop_subdivide(&mesh);
+/// assert_eq!(refined.face_count(), mesh.face_count() * 4);
+/// ```
 pub fn loop_subdivide(mesh: &MeshStorage) -> MeshStorage {
     // 1. 收集原始顶点 ID 并建立 VertexId → u32 索引映射
     let orig_v_ids: Vec<VertexId> = mesh.vertex_ids().collect();
@@ -100,7 +108,7 @@ pub fn loop_subdivide(mesh: &MeshStorage) -> MeshStorage {
         }
     }
     if skipped_non_triangle > 0 {
-        eprintln!(
+        log::warn!(
             "[halfedge::loop_subdivide] 警告：输入网格含 {} 个非三角面，已跳过（Loop 细分仅支持三角形）。\
              若需处理任意多边形，请使用 catmull_clark_subdivide。",
             skipped_non_triangle
@@ -286,6 +294,7 @@ pub fn loop_subdivide(mesh: &MeshStorage) -> MeshStorage {
 
     // 6. 构建新网格
     build_mesh_from_vertices_and_faces(&new_positions, &new_faces)
+        .expect("Loop subdivision output is always valid")
 }
 
 // ============================================================
@@ -362,16 +371,12 @@ mod tests {
     fn loop_subdivide_skips_non_triangle_with_warning() {
         // 输入：1 个四边形面（无三角面）
         // 期望：跳过四边形，输出为 0 面（顶点保留）；
-        //      警告通过 eprintln! 输出到 stderr，测试只验证行为不变化。
+        //      警告通过 log::warn! 输出，测试只验证行为不变化。
         let mesh = build_single_quad_mesh();
         assert_eq!(mesh.face_count(), 1, "输入应含 1 个四边形面");
 
         let refined = loop_subdivide(&mesh);
-        assert_eq!(
-            refined.face_count(),
-            0,
-            "非三角面应被跳过，输出 0 面"
-        );
+        assert_eq!(refined.face_count(), 0, "非三角面应被跳过，输出 0 面");
         assert_eq!(
             refined.vertex_count(),
             4,
@@ -385,7 +390,7 @@ mod tests {
         // 期望：仅三角形被细分 → 4 个三角面；四边形被跳过
         let tri_verts = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let tri_faces = [[0, 1, 2]];
-        let mut mesh = build_mesh_from_vertices_and_faces(&tri_verts, &tri_faces);
+        let mut mesh = build_mesh_from_vertices_and_faces(&tri_verts, &tri_faces).unwrap();
 
         // 追加独立四边形面（无 twin）
         let qv0 = mesh.add_vertex(Vertex::new([10.0, 0.0, 0.0]));
@@ -396,7 +401,12 @@ mod tests {
         let qh1 = mesh.add_halfedge(HalfEdge::new(qv2));
         let qh2 = mesh.add_halfedge(HalfEdge::new(qv3));
         let qh3 = mesh.add_halfedge(HalfEdge::new(qv0));
-        for (he, next, prev) in [(qh0, qh1, qh3), (qh1, qh2, qh0), (qh2, qh3, qh1), (qh3, qh0, qh2)] {
+        for (he, next, prev) in [
+            (qh0, qh1, qh3),
+            (qh1, qh2, qh0),
+            (qh2, qh3, qh1),
+            (qh3, qh0, qh2),
+        ] {
             let h = mesh.get_halfedge_mut(he).unwrap();
             h.next = Some(next);
             h.prev = Some(prev);
@@ -506,7 +516,7 @@ mod tests {
         // V=3, F=1, E=3 → V'=6, F'=4
         let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let faces = [[0, 1, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = loop_subdivide(&mesh);
         assert_eq!(refined.vertex_count(), 6);
         assert_eq!(refined.face_count(), 4);
@@ -524,7 +534,7 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let faces = [[0, 1, 2], [0, 2, 3]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = loop_subdivide(&mesh);
         assert_eq!(refined.vertex_count(), 9); // 4 + 5
         assert_eq!(refined.face_count(), 8); // 4 * 2
@@ -538,7 +548,7 @@ mod tests {
         // 单三角形：所有边都是边界边，中点 = 1/2*(v0+v1)
         let vertices = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]];
         let faces = [[0, 1, 2]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = loop_subdivide(&mesh);
 
         // 细分后应有 6 个顶点：3 原始 + 3 边中点
@@ -598,7 +608,7 @@ mod tests {
             [0.0, 1.0, 0.0],
         ];
         let faces = [[0, 1, 2], [0, 2, 3]];
-        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces);
+        let mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         let refined = loop_subdivide(&mesh);
 
         // 找到位置最接近 (0.5, 0.5, 0) 的顶点

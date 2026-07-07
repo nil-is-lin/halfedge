@@ -476,7 +476,7 @@ pub fn march_field(
     }
 
     if failed_tris > 0 {
-        eprintln!(
+        log::warn!(
             "[halfedge::march_field] 警告：{failed_tris} 个三角形创建失败（拓扑冲突），已跳过"
         );
     }

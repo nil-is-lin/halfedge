@@ -320,10 +320,10 @@ impl Bvh {
         if node.is_leaf() {
             for &f in &node.faces {
                 // 进一步精筛：面 AABB 与 query 相交才返回
-                if let Some(face_aabb) = face_aabb(mesh, f) {
-                    if aabb_overlap(&face_aabb, query) {
-                        out.push(f);
-                    }
+                if let Some(face_aabb) = face_aabb(mesh, f)
+                    && aabb_overlap(&face_aabb, query)
+                {
+                    out.push(f);
                 }
             }
         } else {
@@ -340,12 +340,7 @@ impl Bvh {
     ///
     /// 与 [`Bvh::ray_intersection`] 不同，本方法不返回最近交点而是**统计所有命中**，
     /// 因为射线奇偶法需要交点总数的奇偶性。
-    pub fn ray_count_hits(
-        &self,
-        origin: [f64; 3],
-        direction: [f64; 3],
-        mesh: &MeshStorage,
-    ) -> u32 {
+    pub fn ray_count_hits(&self, origin: [f64; 3], direction: [f64; 3], mesh: &MeshStorage) -> u32 {
         let mut count = 0u32;
         if let Some(root) = self.root {
             self.ray_count_hits_recursive(root, origin, direction, mesh, &mut count);
@@ -610,7 +605,7 @@ mod tests {
             [10.0, 1.0, 0.0],
         ];
         let faces = vec![[0, 1, 2], [3, 4, 5]];
-        build_mesh_from_vertices_and_faces(&verts, &faces)
+        build_mesh_from_vertices_and_faces(&verts, &faces).unwrap()
     }
 
     #[test]
@@ -933,10 +928,10 @@ mod tests {
         // 暴力扫描
         let mut brute_faces = Vec::new();
         for f in mesh.face_ids() {
-            if let Some(fa) = face_aabb(&mesh, f) {
-                if aabb_overlap(&fa, &query) {
-                    brute_faces.push(f);
-                }
+            if let Some(fa) = face_aabb(&mesh, f)
+                && aabb_overlap(&fa, &query)
+            {
+                brute_faces.push(f);
             }
         }
         // BVH 应返回 brute 的子集（AABB 候选），且包含所有 brute 面

@@ -9,6 +9,7 @@
 \usepackage{tikz}
 \usepackage{booktabs}
 \usepackage{multirow}
+\usepackage{longtable}
 \usepackage{hyperref}
 \usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc, decorations.pathreplacing}
 
@@ -86,44 +87,90 @@ pub struct VertexUv(pub [f64; 2]);
 pub struct FaceNormal(pub [f64; 3]);
 \end{lstlisting}
 
+\begin{sloppypar}
 \texttt{VertexNormal} 与 \texttt{VertexColor} 现在是\textbf{不同类型}，
 \texttt{TypeId::of::<VertexNormal>()} $\ne$ \texttt{TypeId::of::<VertexColor>()}，
 可以共存于同一 \texttt{MeshProperties} 容器。
+\end{sloppypar}
 
 \section{API 表}
+
+\subsection{Newtype 列表}
 
 \begin{center}
 \renewcommand{\arraystretch}{1.18}
 \begin{tabular}{@{}lll@{}}
   \toprule
-  \textbf{类别} & \textbf{API} & \textbf{语义} \\
+  \textbf{Newtype} & \textbf{底层类型} & \textbf{语义} \\
   \midrule
-  \multirow{4}{*}{Newtype}
-    & \texttt{VertexNormal([f64;3])} & 顶点法向（单位向量） \\
-    & \texttt{VertexColor([f64;3])}  & 顶点颜色 RGB，每通道 $\in [0, 1]$ \\
-    & \texttt{VertexUv([f64;2])}     & 顶点 UV 纹理坐标 \\
-    & \texttt{FaceNormal([f64;3])}   & 面法向（单位向量） \\
+  \texttt{VertexNormal([f64;3])}    & \texttt{[f64;3]} & 顶点法向（单位向量） \\
+  \texttt{VertexColor([f64;3])}     & \texttt{[f64;3]} & 顶点颜色 RGB，每通道 $\in [0, 1]$ \\
+  \texttt{VertexUv([f64;2])}        & \texttt{[f64;2]} & 顶点 UV 纹理坐标 \\
+  \texttt{FaceNormal([f64;3])}      & \texttt{[f64;3]} & 面法向（单位向量） \\
+  \texttt{VertexSelected(bool)}     & \texttt{bool}    & 顶点选择态 \\
+  \texttt{HalfEdgeSelected(bool)}   & \texttt{bool}    & 半边选择态 \\
+  \texttt{FaceSelected(bool)}       & \texttt{bool}    & 面选择态 \\
+  \texttt{HalfEdgeColor([f64;3])}   & \texttt{[f64;3]} & 半边/边颜色 RGB \\
+  \texttt{FaceColor([f64;3])}       & \texttt{[f64;3]} & 面颜色 RGB \\
+  \texttt{VertexSize(f64)}          & \texttt{f64}     & 顶点显示半径 \\
+  \texttt{HalfEdgeThickness(f64)}   & \texttt{f64}     & 半边粗细（twin 同步） \\
+  \texttt{FaceOpacity(f64)}         & \texttt{f64}     & 面透明度 $\in [0, 1]$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{注册函数}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{注册函数} & \textbf{返回类型} \\
   \midrule
-  \multirow{4}{*}{注册}
-    & \texttt{add\_vertex\_normal(\&mut props)}    & 注册顶点法向属性，返回句柄 \\
-    & \texttt{add\_vertex\_colors(\&mut props)}    & 注册顶点颜色属性 \\
-    & \texttt{add\_vertex\_uvs(\&mut props)}       & 注册顶点 UV 属性 \\
-    & \texttt{add\_face\_normal(\&mut props)}      & 注册面法向属性 \\
+  \texttt{add\_vertex\_normal(\&mut props)}    & \texttt{PropHandle<VertexNormal>} \\
+  \texttt{add\_vertex\_colors(\&mut props)}    & \texttt{PropHandle<VertexColor>} \\
+  \texttt{add\_vertex\_uvs(\&mut props)}       & \texttt{PropHandle<VertexUv>} \\
+  \texttt{add\_face\_normal(\&mut props)}      & \texttt{PropHandle<FaceNormal>} \\
+  \texttt{add\_vertex\_selection(\&mut props)}  & \texttt{PropHandle<VertexSelected>} \\
+  \texttt{add\_halfedge\_selection(\&mut props)} & \texttt{PropHandle<HalfEdgeSelected>} \\
+  \texttt{add\_face\_selection(\&mut props)}    & \texttt{PropHandle<FaceSelected>} \\
+  \texttt{add\_halfedge\_colors(\&mut props)}   & \texttt{PropHandle<HalfEdgeColor>} \\
+  \texttt{add\_face\_colors(\&mut props)}       & \texttt{PropHandle<FaceColor>} \\
+  \texttt{add\_vertex\_sizes(\&mut props)}       & \texttt{PropHandle<VertexSize>} \\
+  \texttt{add\_halfedge\_thickness(\&mut props)} & \texttt{PropHandle<HalfEdgeThickness>} \\
+  \texttt{add\_face\_opacity(\&mut props)}      & \texttt{PropHandle<FaceOpacity>} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{批量计算与收集}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{函数} & \textbf{语义} \\
   \midrule
-  \multirow{2}{*}{批量计算}
-    & \texttt{populate\_vertex\_normal(mesh, props, h)} & 用 \texttt{vertex\_normal} 填充所有顶点 \\
-    & \texttt{populate\_face\_normal(mesh, props, h)}   & 用 \texttt{face\_normal} 填充所有面 \\
+  \texttt{populate\_vertex\_normal(...)} & 用 \texttt{vertex\_normal} 填充所有顶点 \\
+  \texttt{populate\_face\_normal(...)}   & 用 \texttt{face\_normal} 填充所有面 \\
+  \texttt{collect\_vertex\_normal(...)}  & 按顶点顺序提取法向 \\
+  \texttt{collect\_vertex\_uvs(...)}     & 按顶点顺序提取 UV \\
+  \texttt{collect\_vertex\_colors(...)}  & 按顶点顺序提取颜色 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{OBJ 属性感知}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{函数} & \textbf{语义} \\
   \midrule
-  \multirow{3}{*}{收集}
-    & \texttt{collect\_vertex\_normal(mesh, props, h) $\to$ Vec<[f64;3]>} & 按顶点顺序提取法向 \\
-    & \texttt{collect\_vertex\_uvs(mesh, props, h) $\to$ Vec<[f64;2]>}    & 按顶点顺序提取 UV \\
-    & \texttt{collect\_vertex\_colors(mesh, props, h) $\to$ Vec<[f64;3]>} & 按顶点顺序提取颜色 \\
-  \midrule
-  批量安装 & \texttt{install\_vertex\_attrs(props, normals, uvs, colors, ids)} & 一次性注册并填充 \\
-  \midrule
-  \multirow{2}{*}{OBJ 属性感知}
-    & \texttt{parse\_obj\_with\_attrs(text) $\to$ (Mesh, Props)} & 解析 OBJ 并提取 \texttt{vt}/\texttt{vn} \\
-    & \texttt{format\_obj\_with\_attrs(mesh, props, n\_h, uv\_h) $\to$ String} & 序列化带 \texttt{vt}/\texttt{vn} 的 OBJ \\
+  \texttt{parse\_obj\_with\_attrs(text)}   & 解析 OBJ 并提取 \texttt{vt}/\texttt{vn} \\
+  \texttt{format\_obj\_with\_attrs(...)}   & 序列化带 \texttt{vt}/\texttt{vn} 的 OBJ \\
+  \texttt{install\_vertex\_attrs(...)}     & 一次性注册并填充 \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -138,9 +185,9 @@ pub struct FaceNormal(pub [f64; 3]);
   store/.style={draw, cylinder, shape border rotate=90, aspect=0.3, minimum height=1.5cm, minimum width=3cm, font=\small, fill=blue!8}
 ]
   \node[store] (obj) {OBJ 文本};
-  \node[proc, right=1.6cm of obj, fill=yellow!15] (parser) {\texttt{parse\_obj\_with\_attrs} \\ 解析 v / vt / vn / f};
+  \node[proc, right=1.6cm of obj, fill=yellow!15] (parser) {\texttt{\scriptsize parse\_obj\_with\_attrs} \\ 解析 v / vt / vn / f};
   \node[proc, right=1.6cm of parser, fill=green!12] (mesh) {\texttt{MeshStorage} \\ + \texttt{MeshProperties}};
-  \node[proc, below=1.2cm of mesh, fill=red!10] (writer) {\texttt{format\_obj\_with\_attrs} \\ 写出 v / vt / vn / f};
+  \node[proc, below=1.2cm of mesh, fill=red!10] (writer) {\texttt{\scriptsize format\_obj\_with\_attrs} \\ 写出 v / vt / vn / f};
   \node[store, left=1.6cm of writer] (out) {OBJ 文本};
 
   \draw[op] (obj) -- (parser);
@@ -170,8 +217,8 @@ pub struct FaceNormal(pub [f64; 3]);
 \begin{enumerate}
   \item 收集所有 \texttt{vt} 行到 \texttt{texcoords: Vec<[f64;2]>}；
   \item 收集所有 \texttt{vn} 行到 \texttt{normals: Vec<[f64;3]>}；
-  \item 遍历每个面顶点 \texttt{(v\_idx, vt\_idx, vn\_idx)}：
-        \texttt{vert\_normal[v\_idx] = normals[vn\_idx - 1]}；
+  \item 遍历每个面顶点 {\scriptsize\texttt{(v\_idx, vt\_idx, vn\_idx)}}：
+        {\scriptsize\texttt{vert\_normal[v\_idx] = normals[vn\_idx - 1]}}；
   \item 按顶点顺序注册属性并填充 \texttt{MeshProperties}。
 \end{enumerate}
 
@@ -313,14 +360,251 @@ assert!(props.has_vertex_prop::<VertexUv>());
 assert!(!props.has_vertex_prop::<VertexColor>());
 \end{lstlisting}
 
-\section{测试覆盖}
+\section{选择态与边/面色}
+\label{sec:selection-color}
+
+本节描述为顶点 / 半边 / 面三类元素提供的「选择态」与「边/面颜色」便捷 API。
+所有 API 都建立在 \texttt{MeshProperties} 之上，复用 Newtype 模式：
+
+\subsection{Newtype 列表}
 
 \begin{center}
 \renewcommand{\arraystretch}{1.18}
-\begin{tabular}{@{}ll@{}}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{Newtype} & \textbf{底层类型} & \textbf{语义} \\
+  \midrule
+  \texttt{VertexSelected}   & \texttt{bool}    & 顶点是否被选中 \\
+  \texttt{HalfEdgeSelected} & \texttt{bool}    & 半边是否被选中 \\
+  \texttt{FaceSelected}     & \texttt{bool}    & 面是否被选中 \\
+  \texttt{HalfEdgeColor}    & \texttt{[f64;3]} & 半边/边颜色 RGB \\
+  \texttt{FaceColor}        & \texttt{[f64;3]} & 面颜色 RGB \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{语义约定}
+
+\begin{itemize}
+  \item \textbf{未注册 $\equiv$ false/None}：未注册属性时，\texttt{is\_*\_selected}
+        返回 \texttt{false}，\texttt{edge\_color}/\texttt{face\_color} 返回 \texttt{None}，
+        避免强制初始化。
+  \item \textbf{按类型清理}：\texttt{clear\_*\_selection} 与 \texttt{clear\_face\_colors}
+        仅删除当前 Newtype 类型的属性，\textbf{不影响其他类型}（如 \texttt{VertexNormal}）。
+  \item \textbf{懒迭代}：\texttt{selected\_*\_ids} 返回的迭代器按需过滤，
+        不预收集。
+\end{itemize}
+
+\subsection{边级（twin 对）同步}
+
+\begin{sloppypar}
+无向边由两条互为 \texttt{twin} 的半边组成。从语义上，边的选择/颜色应一致。
+\texttt{select\_edge} / \texttt{deselect\_edge} / \texttt{set\_edge\_color}
+\textbf{同时写入} \texttt{he} 与其 \texttt{twin}；\texttt{is\_edge\_selected}
+\textbf{任一}半边被选中即返回 \texttt{true}；\texttt{selected\_edge\_ids}
+按 canonical half（\texttt{he $\le$ twin}）去重，每个无向边只返回一次。
+\end{sloppypar}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=1.0cm,
+  vert/.style={circle, draw=blue!70!black, fill=blue!10, minimum size=7mm, inner sep=0pt, font=\small},
+  he/.style={-Stealth, thick, draw=red!70!black},
+  lab/.style={font=\footnotesize, sloped, above}
+]
+  \node[vert] (v0) {$v_0$};
+  \node[vert, right=3.2cm of v0] (v1) {$v_1$};
+  \draw[he] (v0) -- node[lab] {$h$（选中）} (v1);
+  \draw[he, bend left=35] (v1) -- node[lab, below] {$h.\mathrm{twin}$（自动同步）} (v0);
+\end{tikzpicture}
+\end{center}
+
+\subsection{API 表}
+
+\begin{longtable}{@{}ll@{}}
+  \toprule
+  \textbf{API} & \textbf{语义} \\
+  \midrule
+  \endhead
+  \multicolumn{2}{l}{\textit{顶点选择}} \\
+  \texttt{select\_vertex(props, h, id)}                       & 选中顶点 \\
+  \texttt{deselect\_vertex(props, h, id)}                    & 取消选中 \\
+  \texttt{toggle\_vertex\_selection(props, h, id) $\to$ bool} & 切换并返回新状态 \\
+  \texttt{is\_vertex\_selected(props, h, id) $\to$ bool}     & 查询 \\
+  \texttt{clear\_vertex\_selection(mesh, props, h)}          & 清空所有顶点选择 \\
+  \texttt{selected\_vertex\_ids(mesh, props, h) $\to$ Iterator} & 懒迭代选中顶点 \\
+  \texttt{select\_all\_vertices(mesh, props, h)}             & 全选 \\
+  \texttt{invert\_vertex\_selection(mesh, props, h)}        & 反选 \\
+  \texttt{count\_selected\_vertices(mesh, props, h) $\to$ usize} & 统计 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{半边选择}} \\
+  \texttt{select\_halfedge / deselect\_halfedge}             & 同半边 \\
+  \texttt{toggle\_halfedge\_selection}                       & 同半边 \\
+  \texttt{is\_halfedge\_selected}                            & 同半边 \\
+  \texttt{clear\_halfedge\_selection(mesh, props, h)}        & 清空 \\
+  \texttt{selected\_halfedge\_ids(mesh, props, h) $\to$ Iterator} & 懒迭代 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{面选择}} \\
+  \texttt{select\_face / deselect\_face}                     & 同面 \\
+  \texttt{toggle\_face\_selection}                           & 同面 \\
+  \texttt{is\_face\_selected}                                & 同面 \\
+  \texttt{clear\_face\_selection(mesh, props, h)}           & 清空 \\
+  \texttt{selected\_face\_ids(mesh, props, h) $\to$ Iterator} & 懒迭代 \\
+  \texttt{select\_all\_faces(mesh, props, h)}                & 全选 \\
+  \texttt{count\_selected\_faces(mesh, props, h) $\to$ usize} & 统计 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{边级（twin 同步）}} \\
+  \texttt{select\_edge(mesh, props, h, he)}                  & 选中 \texttt{he} 与 \texttt{twin} \\
+  \texttt{deselect\_edge(mesh, props, h, he)}                & 取消 \texttt{he} 与 \texttt{twin} \\
+  \texttt{toggle\_edge\_selection(mesh, props, h, he) $\to$ bool} & 切换 \\
+  \texttt{is\_edge\_selected(mesh, props, h, he) $\to$ bool} & 任一 half 选中即 true \\
+  \texttt{selected\_edge\_ids(mesh, props, h) $\to$ Iterator} & canonical 去重 \\
+  \texttt{set\_edge\_color(mesh, props, h, he, color)}       & 同步设置 \texttt{he} 与 \texttt{twin} 颜色 \\
+  \texttt{edge\_color(mesh, props, h, he) $\to$ Option<[f64;3]>} & 优先 \texttt{he}，未设置则尝试 \texttt{twin} \\
+  \midrule
+  \multicolumn{2}{l}{\textit{面颜色}} \\
+  \texttt{set\_face\_color(props, h, id, color)}              & 设置面颜色 \\
+  \texttt{face\_color(props, h, id) $\to$ Option<[f64;3]>}    & 查询 \\
+  \texttt{clear\_face\_colors(mesh, props, h)}                & 清空 \\
+  \bottomrule
+\end{longtable}
+
+\subsection{使用示例}
+
+\begin{lstlisting}
+use halfedge::*;
+let mesh = build_icosphere(1);
+let mut props = MeshProperties::new();
+
+// 选中所有边界顶点
+let hv = add_vertex_selection(&mut props);
+for v in mesh.vertex_ids() {
+    if is_boundary_vertex(&mesh, v) {
+        select_vertex(&mut props, hv, v);
+    }
+}
+let n_boundary = count_selected_vertices(&mesh, &props, hv);
+
+// 选中所有内部边（仅示例：取代表性边）
+let he = add_halfedge_selection(&mut props);
+let some_edge = mesh.halfedge_ids().next().unwrap();
+select_edge(&mesh, &mut props, he, some_edge);
+assert!(is_edge_selected(&mesh, &props, he, some_edge));
+
+// 为每个面着色
+let fc = add_face_colors(&mut props);
+for (i, f) in mesh.face_ids().enumerate() {
+    let c = if i % 2 == 0 { [0.8, 0.2, 0.2] } else { [0.2, 0.8, 0.2] };
+    set_face_color(&mut props, fc, f, c);
+}
+\end{lstlisting}
+
+\section{可视化尺寸 / 粗细 / 透明度}
+\label{sec:size-thickness-opacity}
+
+本节描述为顶点 / 半边 / 面三类元素提供的「可视化尺寸」属性，用于控制渲染时
+的几何外观。所有 API 与颜色 API 形态一致，建立在 \texttt{MeshProperties} 之上。
+
+\subsection{Newtype 列表}
+
+\begin{longtable}{@{}llp{5.2cm}@{}}
+  \toprule
+  \textbf{Newtype} & \textbf{底层类型} & \textbf{语义} \\
+  \midrule
+  \endhead
+  \texttt{VertexSize}        & \texttt{f64} & 顶点显示半径（单位与 \texttt{position} 一致），默认 0 = 不渲染标记 \\
+  \texttt{HalfEdgeThickness} & \texttt{f64} & 半边/边线宽（twin 同步） \\
+  \texttt{FaceOpacity}       & \texttt{f64} & 面透明度 $\in [0, 1]$：0 = 完全透明，1 = 完全不透明 \\
+  \bottomrule
+\end{longtable}
+
+\subsection{语义约定}
+
+\begin{sloppypar}
+\begin{itemize}
+  \item \textbf{未注册 $\equiv$ None}：未注册属性时，\texttt{vertex\_size} / \texttt{edge\_thickness} / \texttt{face\_opacity} 返回 \texttt{None}，避免强制初始化。
+  \item \textbf{clamp 透明度}：\texttt{set\_face\_opacity} 与 \texttt{set\_uniform\_face\_opacity} 自动将输入 clamp 到 $[0, 1]$，杜绝越界。
+  \item \textbf{按类型清理}：\texttt{clear\_*} 仅删除当前 Newtype 类型的属性，不影响其他类型。
+  \item \textbf{批量统一}：\texttt{set\_uniform\_*} 一行代码为所有元素设置同一值。
+\end{itemize}
+\end{sloppypar}
+
+\subsection{边级（twin 对）粗细同步}
+
+与边颜色 API 一致，\texttt{set\_edge\_thickness} 同时写入 \texttt{he} 与其 \texttt{twin}；
+\texttt{edge\_thickness} 优先读 \texttt{he}，未设置则 fallback 到 \texttt{twin}；
+\texttt{set\_uniform\_edge\_thickness} 仅处理 canonical half（\texttt{he $\le$ twin}），
+避免重复设置。
+
+\begin{sloppypar}
+若需非对称渲染（两条半边不同粗细），可使用 \texttt{set\_halfedge\_thickness} /
+\texttt{halfedge\_thickness} 单半边版本。
+\end{sloppypar}
+
+\subsection{API 表}
+
+\begin{longtable}{@{}ll@{}}
+  \toprule
+  \textbf{API} & \textbf{语义} \\
+  \midrule
+  \endhead
+  \multicolumn{2}{l}{\textit{顶点大小}} \\
+  \texttt{set\_vertex\_size(props, h, id, size)}                & 设置顶点显示半径 \\
+  \texttt{vertex\_size(props, h, id) $\to$ Option<f64>}        & 查询 \\
+  \texttt{clear\_vertex\_sizes(mesh, props, h)}                & 清空 \\
+  \texttt{set\_uniform\_vertex\_size(mesh, props, h, size)}    & 批量统一 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{边粗细（twin 同步）}} \\
+  \texttt{set\_edge\_thickness(mesh, props, h, he, t)}          & 同步设置 \texttt{he} 与 \texttt{twin} \\
+  \texttt{edge\_thickness(mesh, props, h, he) $\to$ Option<f64>} & 优先 \texttt{he}，未设置则尝试 \texttt{twin} \\
+  \texttt{set\_halfedge\_thickness(props, h, he, t)}             & 单半边设置（不同步 twin） \\
+  \texttt{halfedge\_thickness(props, h, he) $\to$ Option<f64>}  & 单半边查询 \\
+  \texttt{clear\_halfedge\_thickness(mesh, props, h)}           & 清空 \\
+  \texttt{set\_uniform\_edge\_thickness(mesh, props, h, t)}    & 批量统一（canonical 去重） \\
+  \midrule
+  \multicolumn{2}{l}{\textit{面透明度}} \\
+  \texttt{set\_face\_opacity(props, h, id, op)}                & 设置面透明度（自动 clamp） \\
+  \texttt{face\_opacity(props, h, id) $\to$ Option<f64>}       & 查询 \\
+  \texttt{clear\_face\_opacity(mesh, props, h)}                & 清空 \\
+  \texttt{set\_uniform\_face\_opacity(mesh, props, h, op)}     & 批量统一（自动 clamp） \\
+  \bottomrule
+\end{longtable}
+
+\subsection{使用示例}
+
+\begin{lstlisting}
+use halfedge::*;
+let mesh = build_icosphere(1);
+let mut props = MeshProperties::new();
+
+// 统一设置顶点大小、边粗细、面透明度
+let hv = add_vertex_sizes(&mut props);
+set_uniform_vertex_size(&mesh, &mut props, hv, 0.02);
+
+let he = add_halfedge_thickness(&mut props);
+set_uniform_edge_thickness(&mesh, &mut props, he, 0.005);
+
+let hf = add_face_opacity(&mut props);
+set_uniform_face_opacity(&mesh, &mut props, hf, 0.85);
+
+// 单独调整一个面为半透明高亮
+let f0 = mesh.face_ids().next().unwrap();
+set_face_opacity(&mut props, hf, f0, 0.5);
+assert_eq!(face_opacity(&props, hf, f0), Some(0.5));
+
+// 越界输入自动 clamp
+set_face_opacity(&mut props, hf, f0, 1.5);
+assert_eq!(face_opacity(&props, hf, f0), Some(1.0));
+\end{lstlisting}
+
+\section{测试覆盖}
+
+\begin{longtable}{@{}ll@{}}
   \toprule
   \textbf{测试名} & \textbf{验证点} \\
   \midrule
+  \endhead
+  \multicolumn{2}{l}{\textit{基础属性}} \\
   \texttt{vertex\_normal\_roundtrip}        & icosphere 顶点法向为单位向量 \\
   \texttt{face\_normal\_roundtrip}          & 所有面法向已写入 \\
   \texttt{vertex\_color\_default\_is\_white} & 未设置颜色返回默认白 \\
@@ -330,10 +614,37 @@ assert!(!props.has_vertex_prop::<VertexColor>());
   \texttt{newtype\_default\_is\_zero}       & Newtype 默认值为零 \\
   \texttt{missing\_handle\_returns\_none}   & 未注册句柄读取返回 \texttt{None} \\
   \texttt{populate\_face\_normal\_skips\_invalid} & 空网格不 panic \\
+  \midrule
+  \multicolumn{2}{l}{\textit{选择态与边/面色}} \\
+  \texttt{vertex\_selection\_basic}                     & select / toggle / is / count \\
+  \texttt{vertex\_select\_all\_and\_invert}             & 全选 + 反选 \\
+  \texttt{vertex\_clear\_selection\_keeps\_registration} & 清空后类型注册保留 \\
+  \texttt{selected\_vertex\_ids\_iterator\_correct}     & 懒迭代器返回选中顶点 \\
+  \texttt{face\_selection\_basic}                      & 面 select / select\_all / clear \\
+  \texttt{halfedge\_selection\_basic}                   & 半边 select / toggle / clear \\
+  \texttt{edge\_selection\_syncs\_twin\_pair}           & 选中半边时 twin 同步 \\
+  \texttt{selected\_edge\_ids\_returns\_canonical\_only} & canonical half 去重 \\
+  \texttt{edge\_color\_syncs\_twin\_pair}               & 颜色同步到 twin \\
+  \texttt{face\_color\_basic}                           & 面颜色 set/get/clear \\
+  \texttt{selection\_newtype\_default\_is\_false}       & 选择态默认 false \\
+  \texttt{color\_newtype\_default\_is\_zero}            & 颜色默认 $[0,0,0]$ \\
+  \texttt{unregistered\_selection\_safe\_no\_panic}    & 未注册查询不 panic \\
+  \texttt{unregistered\_edge\_safe\_no\_panic}          & 未注册边查询不 panic \\
+  \texttt{empty\_mesh\_selection\_no\_panic}           & 空网格调用全选/反选不 panic \\
+  \midrule
+  \multicolumn{2}{l}{\textit{可视化尺寸 / 粗细 / 透明度}} \\
+  \texttt{vertex\_size\_basic}                              & set / uniform / clear + 类型注册保留 \\
+  \texttt{vertex\_size\_default\_is\_zero}                  & Newtype 默认值为 0 \\
+  \texttt{edge\_thickness\_syncs\_twin\_pair}              & twin 同步 + fallback 读取 \\
+  \texttt{edge\_thickness\_uniform\_sets\_all}             & 批量统一设置所有边 \\
+  \texttt{halfedge\_thickness\_independent\_set}          & 单半边设置不影响 twin \\
+  \texttt{face\_opacity\_basic}                            & set / clamp / uniform / clear \\
+  \texttt{face\_opacity\_default\_is\_zero}                & Newtype 默认值为 0 \\
+  \texttt{unregistered\_size\_thickness\_opacity\_safe} & 未注册查询不 panic \\
+  \texttt{empty\_mesh\_size\_thickness\_opacity} & 空网格批量操作不 panic \\
   \bottomrule
-\end{tabular}
-\end{center}
+\end{longtable}
 
-\texttt{src/builtin\_attrs.rs} 共 \textbf{9 个}单元测试，全库共 \textbf{371 个}。
+\texttt{src/builtin\_attrs.rs} 共 \textbf{33 个}单元测试，全库共 \textbf{708 个}。
 
 \end{document}

@@ -242,7 +242,7 @@ fn main() {
     // 构造一个单三角形，删除其中一个顶点并验证属性同步清理
     let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
     let faces = vec![[0, 1, 2]];
-    let mut mesh = build_mesh_from_vertices_and_faces(&verts, &faces);
+    let mut mesh = build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
     let mut props = MeshProperties::new();
     let w: PropertyHandle<f64> = props.add_vertex_prop();
 

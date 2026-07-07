@@ -1,0 +1,88 @@
+name: Bug report
+description: Report something that works incorrectly
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in the sections below.
+
+  - type: input
+    id: version
+    attributes:
+      label: halfedge version
+      description: Output of `cargo tree -p halfedge | head -1` or the version in Cargo.toml
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`
+      placeholder: "rustc 1.85.0 (..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Windows
+        - WebAssembly
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. Include a minimal reproducer if possible.
+      placeholder: |
+        I expected X, but got Y.
+
+        ```rust
+        // minimal repro
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened. Include backtraces or panic output if applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: mesh
+    attributes:
+      label: Mesh / input data (optional)
+      description: If the bug depends on specific geometry, attach a small OBJ/PLY file or describe the mesh.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for a duplicate report.
+          required: true
+        - label: I can reproduce this with the latest version on `main`.
+          required: true

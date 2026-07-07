@@ -147,12 +147,74 @@ pub struct MeshStorage {
     vertices:  SlotMap<VertexId,   Vertex>,
     halfedges: SlotMap<HalfEdgeId, HalfEdge>,
     faces:     SlotMap<FaceId,     Face>,
+    // SOA 位置缓存（2026-07 新增，提升缓存命中率）
+    positions:  Vec<[f64; 3]>,
+    pos_index:  SecondaryMap<VertexId, u32>,
 }
 \end{lstlisting}
 
 三类元素分别放在独立的 \texttt{SlotMap} 中，互不干扰。三组 \texttt{Id} 在编译期
 已被 \texttt{new\_key\_type!} 区分（详见 \texttt{ids.tex}），即使误把
 \texttt{HalfEdgeId} 传给 \texttt{get\_vertex} 也会编译失败。
+
+\subsection{SOA 位置缓存}
+
+\texttt{Vertex} 结构体内含 \texttt{position}（24 B）与 \texttt{halfedge}（8 B）
+两个字段，加上 SlotMap 槽位元数据（4 B 版本号），单槽步长约 36 B。
+几何热路径（\texttt{mesh\_volume}、\texttt{mesh\_aabb}、\texttt{ray\_mesh\_intersects}
+等）仅访问 \texttt{position}，24 B 有效数据在 36 B 槽位中仅占 67\%，造成缓存浪费。
+
+为提升缓存命中率，\texttt{MeshStorage} 内部并行维护一份稠密的
+\texttt{positions: Vec<[f64; 3]>} 缓存，步长 24 B，利用率 100\%。
+\texttt{pos\_index: SecondaryMap<VertexId, u32>} 提供
+\texttt{VertexId $\to$ u32} 的稠密索引映射（SecondaryMap 由 Vec 支持，$O(1)$ 查找）。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.6cm and 1.0cm,
+  blk/.style={draw, rounded corners=2pt, minimum width=3.4cm, minimum height=0.9cm, align=center, font=\small},
+  arr/.style={-Stealth, thick}
+]
+  \node[blk, fill=blue!10] (slotmap) {SlotMap<VertexId, Vertex>\\36 B/槽};
+  \node[blk, fill=green!10, right=of slotmap] (vec) {Vec<[f64;3]>\\24 B/槽};
+  \node[blk, fill=orange!10, below=of vec] (idx) {SecondaryMap<VertexId, u32>\\8 B/槽};
+  \draw[arr] (slotmap.east) -- node[above, font=\scriptsize] {同步} (vec.west);
+  \draw[arr, dashed] (slotmap.south) |- (idx.west);
+  \draw[arr, dashed] (idx.north) -- node[right, font=\scriptsize] {索引} (vec.south);
+\end{tikzpicture}
+\end{center}
+
+\textbf{同步策略}：
+\begin{sloppypar}
+\begin{itemize}
+  \item \texttt{add\_vertex}：同时推入 \texttt{positions} 与 \texttt{pos\_index}；
+  \item \texttt{remove\_vertex}：swap-remove 位置并更新填补元素的索引；
+  \item \texttt{set\_position}：同时更新主存与缓存（推荐的位置修改入口）；
+  \item \texttt{get\_vertex\_mut}：若直接修改 \texttt{position}，缓存会暂时失效，需调用 \texttt{sync\_position} 或 \texttt{rebuild\_position\_cache} 修复。
+\end{itemize}
+\end{sloppypar}
+
+\textbf{公开 API}：
+\begin{center}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  \textbf{方法} & \textbf{返回} & \textbf{用途} \\
+  \midrule
+  \texttt{get\_position(id)}        & \texttt{Option<[f64;3]>} & 读 SOA 缓存取单点位置 \\
+  \texttt{positions\_dense()}        & \texttt{\&[[f64;3]]}    & 批量遍历稠密切片 \\
+  \texttt{position\_index(id)}        & \texttt{Option<u32>}    & VertexId $\to$ 稠密索引 \\
+  \texttt{set\_position(id, pos)}    & \texttt{Option<()>}     & 同步更新主存与缓存 \\
+  \texttt{sync\_position(id)}        & \texttt{()}             & 单点同步（修复 get\_vertex\_mut 的副作用） \\
+  \texttt{rebuild\_position\_cache()} & \texttt{()}             & 全量重建缓存（反序列化后） \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{收益预期}：顺序遍历顶点位置时（如 \texttt{mesh\_aabb}、\texttt{mesh\_centroid}），
+缓存利用率从 67\% 提升至 100\%，缓存行覆盖顶点数从 $\lfloor 64/36 \rfloor = 1$ 提升至
+$\lfloor 64/24 \rfloor = 2$。随机访问（如 \texttt{mesh\_volume} 按面取顶点）的改善
+取决于顶点 ID 空间局部性，通常 10\%--30\%。
 
 \section{核心 API 流程}
 
@@ -293,7 +355,7 @@ pub struct MeshStorage {
 
 \section{单元测试覆盖}
 
-\texttt{src/storage.rs} 末尾的 \texttt{\#[cfg(test)] mod tests} 共 20 个测试，
+\texttt{src/storage.rs} 末尾的 \texttt{\#[cfg(test)] mod tests} 共 54 个测试，
 按需求点对应如下：
 
 \begin{center}
@@ -302,31 +364,55 @@ pub struct MeshStorage {
   \toprule
   \textbf{测试名} & \textbf{覆盖点} \\
   \midrule
+  \multicolumn{2}{l}{\textit{基础 CRUD（3 个）}} \\
   \texttt{add\_and\_get\_vertex}     & 新增 + \texttt{get} + \texttt{contains} + 计数 \\
   \texttt{add\_and\_get\_halfedge}   & 半边新增 + 关联顶点 outgoing \\
   \texttt{add\_and\_get\_face}       & 面新增 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{删除与 ABA 安全（4 个）}} \\
   \texttt{remove\_vertex\_invalidates\_id}    & 删除后 ID 失效 + 重复删除返回 \texttt{None} \\
   \texttt{remove\_halfedge\_invalidates\_id}  & 半边删除失效 \\
   \texttt{remove\_face\_invalidates\_id}      & 面删除失效 \\
   \texttt{slot\_reuse\_does\_not\_resurrect\_old\_id} & ABA 安全：槽位复用不复活旧句柄 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{可变访问与无效句柄（2 个）}} \\
   \texttt{get\_mut\_allows\_in\_place\_update} & 可变访问就地修改拓扑字段 \\
   \texttt{accessing\_invalid\_id\_never\_panics} & 已删除 ID 访问绝不 panic \\
+  \midrule
+  \multicolumn{2}{l}{\textit{容量管理（5 个）}} \\
   \texttt{clear\_empties\_all\_three\_slotmaps} & \texttt{clear} 清空三类元素 + 迭代器为空 \\
   \texttt{clear\_equivalent\_to\_new} & \texttt{clear} 后与 \texttt{new()} 等价 \\
   \texttt{clear\_allows\_reuse\_after} & \texttt{clear} 后仍可继续添加元素 \\
   \texttt{reserve\_does\_not\_change\_counts} & \texttt{reserve} 仅预分配，不改变计数 \\
   \texttt{reserve\_zero\_is\_noop}    & \texttt{reserve(0,0,0)} 不 panic \\
+  \midrule
+  \multicolumn{2}{l}{\textit{迭代与空判断（5 个）}} \\
   \texttt{is\_empty\_on\_new\_mesh}   & 新建网格 \texttt{is\_empty()} 返回 true \\
   \texttt{is\_empty\_after\_clear}    & \texttt{clear} 后 \texttt{is\_empty()} 返回 true \\
   \texttt{vertices\_iter\_yields\_all\_data} & \texttt{vertices()} 迭代所有顶点数据 \\
   \texttt{vertices\_mut\_allows\_modification} & \texttt{vertices\_mut()} 允许就地修改 \\
-  \texttt{halfedges\_faces\_iters\_match\_id\_counts} & 半边/面迭代数与 ID 数一致 \\
   \texttt{empty\_iterators\_yield\_nothing} & 空网格所有数据迭代器不产出 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{SOA 位置缓存（9 个，2026-07 新增）}} \\
+  \texttt{soa\_cache\_get\_position\_matches\_vertex} & \texttt{get\_position} 与主存一致 \\
+  \texttt{soa\_cache\_positions\_dense\_length\_matches} & 稠密切片长度与顶点数一致 \\
+  \texttt{soa\_cache\_position\_index\_round\_trip} & VertexId $\to$ 索引 $\to$ 位置往返 \\
+  \texttt{soa\_cache\_set\_position\_syncs\_both} & \texttt{set\_position} 同步主存与缓存 \\
+  \texttt{soa\_cache\_remove\_preserves\_dense\_layout} & 删除后稠密布局保持正确 \\
+  \texttt{soa\_cache\_sync\_position\_after\_get\_vertex\_mut} & \texttt{sync\_position} 修复缓存失效 \\
+  \texttt{soa\_cache\_rebuild\_from\_master} & \texttt{rebuild\_position\_cache} 全量重建 \\
+  \texttt{soa\_cache\_clear\_empties\_cache} & \texttt{clear} 同步清空缓存 \\
+  \texttt{soa\_cache\_empty\_mesh\_no\_panic} & 空网格访问缓存不 panic \\
+  \texttt{soa\_cache\_icosphere\_consistency} & icosphere 全顶点缓存一致性 \\
+  \midrule
+  \multicolumn{2}{l}{\textit{其他（含 Serde、拓扑诊断等，26 个）}} \\
+  \multicolumn{2}{l}{含 \texttt{slot\_reuse\_after\_clear\_works}、\texttt{large\_icosphere\_counts\_correct}、} \\
+  \multicolumn{2}{l}{\texttt{twin\_relationship\_is\_symmetric}、\texttt{serde\_roundtrip\_preserves\_topology} 等。} \\
   \bottomrule
 \end{tabular}
 \end{center}
 
-加上 \texttt{ids.rs} 的 2 个测试，\texttt{cargo test} 当前共 371 个用例，全部通过。
+全库 \texttt{cargo test} 当前共 669 个单元测试 + 24 个集成测试，全部通过。
 
 \section{后续扩展}
 
