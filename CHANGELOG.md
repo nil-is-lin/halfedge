@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-07
 
 ### Added
 - **MSRV metadata**: `rust-version = "1.87"` declared in `Cargo.toml` (`is_multiple_of` used in `io/gltf.rs` requires >= 1.87).
@@ -53,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - Nothing.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-05
 
-Initial pre-release. See [Unreleased] for full feature set.
+Initial pre-release (minimal surface). See [0.2.0] for the full feature set.
 
-[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/nil-is-lin/halfedge/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.2.0...HEAD
