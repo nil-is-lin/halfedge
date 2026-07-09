@@ -1,0 +1,25 @@
+[package]
+name = "engvis-renderer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "GPU rendering for engineering visualization"
+keywords = ["3d", "visualization", "wgpu", "pbr", "engineering"]
+categories = ["graphics", "rendering"]
+homepage = "https://github.com/nil-is-lin/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
+
+[dependencies]
+engvis-core = { path = "../engvis-core", version = "0.1.5" }
+glam.workspace = true
+bytemuck.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+pollster.workspace = true
+log.workspace = true
+gltf.workspace = true
+image.workspace = true

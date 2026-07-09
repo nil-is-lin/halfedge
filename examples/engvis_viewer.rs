@@ -25,7 +25,7 @@ use engvis_core::{
     scene::{Scene, SceneNode},
 };
 use engvis_renderer::{AppCtx, EngvisApp, EventHandling, FrameCtx, RunConfig};
-use glam::{Affine3A, Quat, Vec3};
+use glam::Affine3A;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::Key;
 
@@ -313,13 +313,6 @@ struct ViewerApp {
     message: String,
     /// 是否已初始化 CJK 字体
     fonts_initialized: bool,
-    /// 四元数跟踪的相机朝向（用于解除 pitch 限制）
-    orbit_quat: Quat,
-    /// 上一帧光标位置（计算鼠标 delta）
-    prev_cursor_x: f64,
-    prev_cursor_y: f64,
-    /// 左键是否正在拖拽旋转
-    orbit_dragging: bool,
 }
 
 impl ViewerApp {
@@ -347,10 +340,6 @@ impl ViewerApp {
             stats: String::new(),
             message: "左键点击网格进行选择".into(),
             fonts_initialized: false,
-            orbit_quat: Quat::IDENTITY,
-            prev_cursor_x: 0.0,
-            prev_cursor_y: 0.0,
-            orbit_dragging: false,
         };
         app.update_stats();
         app
@@ -713,6 +702,10 @@ impl ViewerApp {
                 mesh_index: Some(mi),
                 children: Vec::new(),
                 visible: true,
+                render_surface: true,
+                render_edges: true,
+                edge_color_override: None,
+                edge_width_override: None,
             });
         };
 
@@ -979,8 +972,36 @@ impl EngvisApp for ViewerApp {
                 ui.heading("渲染选项");
                 ui.checkbox(&mut frame.render_state.show_surface, "显示曲面");
                 ui.checkbox(&mut frame.render_state.show_grid, "显示网格");
+
+                ui.separator();
+                ui.label("线框");
                 ui.checkbox(&mut frame.render_state.edge_opts.enabled, "显示线框");
+                if frame.render_state.edge_opts.enabled {
+                    ui.add(egui::Slider::new(&mut frame.render_state.edge_opts.line_width, 1.0..=15.0).text("粗细"));
+                    ui.horizontal(|ui| {
+                        ui.label("颜色");
+                        ui.color_edit_button_rgb(&mut frame.render_state.edge_opts.color);
+                    });
+                }
+
+                ui.separator();
+                ui.label("顶点");
                 ui.checkbox(&mut frame.render_state.vertex_opts.enabled, "显示顶点");
+                if frame.render_state.vertex_opts.enabled {
+                    ui.add(egui::Slider::new(&mut frame.render_state.vertex_opts.point_size, 1.0..=20.0).text("大小"));
+                    ui.horizontal(|ui| {
+                        ui.label("颜色");
+                        ui.color_edit_button_rgb(&mut frame.render_state.vertex_opts.color);
+                    });
+                }
+
+                ui.separator();
+                ui.label("表面");
+                ui.add(egui::Slider::new(&mut frame.render_state.opacity, 0.0..=1.0).text("透明度"));
+                ui.horizontal(|ui| {
+                    ui.label("背景色");
+                    ui.color_edit_button_rgb(&mut frame.render_state.background_color);
+                });
 
                 ui.separator();
                 ui.label(format!("FPS: {:.1}", frame.fps));
@@ -1021,52 +1042,6 @@ impl EngvisApp for ViewerApp {
             self.rebuild_engvis(frame);
             self.dirty = false;
         }
-
-        // ── 解除 pitch 限制的四元数轨道旋转 ──
-        // engvis-core 的 OrbitCamera 使用 yaw/pitch 且强制 clamp pitch
-        // 到 ±89.4°。这里用四元数跟踪真实朝向，直接覆写 camera.yaw/pitch。
-        //
-        // 注意：InputState.apply_to_camera() 在 on_frame 之后也会 orbit，
-        // 因此 yaw 需扣减同样的 delta 避免双倍旋转。pitch 直接覆写（即使
-        // InputState 随后 clamp，下一帧会重新从四元数推导，等效无 clamp）。
-        let dx = (frame.cursor_x - self.prev_cursor_x) as f32;
-        let dy = (frame.cursor_y - self.prev_cursor_y) as f32;
-        self.prev_cursor_x = frame.cursor_x;
-        self.prev_cursor_y = frame.cursor_y;
-
-        if self.orbit_dragging
-            && !frame.egui_wants_pointer
-            && frame.viewport.contains(frame.cursor_x, frame.cursor_y)
-        {
-            let sens = 0.005;
-            let delta_yaw = -dx * sens;
-            let delta_pitch = -dy * sens;
-
-            // 用四元数累积旋转（无万向节死锁，无 pitch 限制）
-            let rot_yaw = Quat::from_rotation_y(delta_yaw);
-            let rot_pitch = Quat::from_rotation_x(delta_pitch);
-            self.orbit_quat = (rot_yaw * self.orbit_quat * rot_pitch).normalize();
-
-            // 从四元数推导 yaw/pitch
-            let forward = self.orbit_quat * Vec3::Z;
-            let derived_pitch = forward.y.asin();
-            let derived_yaw = forward.x.atan2(forward.z);
-
-            // yaw: 扣减 delta_yaw 因为 InputState 即将再 orbit(delta_yaw, …)
-            frame.camera.yaw = derived_yaw - delta_yaw;
-            // pitch: 直接覆写；InputState 随后 clamp，但下次 frame 重新从
-            // 四元数推导，所以持续拖拽期间 pitch 始终不受 clamp 影响。
-            frame.camera.pitch = derived_pitch;
-        } else {
-            // 未拖拽时从 camera 同步四元数（响应 fit_to_scene 等操作）
-            let forward = Vec3::new(
-                frame.camera.pitch.cos() * frame.camera.yaw.sin(),
-                frame.camera.pitch.sin(),
-                frame.camera.pitch.cos() * frame.camera.yaw.cos(),
-            )
-            .normalize();
-            self.orbit_quat = Quat::from_rotation_arc(Vec3::Z, forward);
-        }
     }
 
     fn on_event(&mut self, event: &WindowEvent) -> EventHandling {
@@ -1077,12 +1052,9 @@ impl EngvisApp for ViewerApp {
                 ..
             } => match state {
                 ElementState::Pressed => {
-                    self.orbit_dragging = true;
                     self.pending_pick = true;
                 }
-                ElementState::Released => {
-                    self.orbit_dragging = false;
-                }
+                ElementState::Released => {}
             },
             WindowEvent::KeyboardInput { event: k, .. }
                 if k.state == ElementState::Pressed
