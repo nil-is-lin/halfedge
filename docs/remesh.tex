@@ -114,6 +114,12 @@ Modeling''（2004）。
 折叠目标位置 = 边中点（无 twin 的边界边折叠到 \texttt{tip} 当前位置），
 调用 \texttt{collapse\_edge\_at}（保留 QEM 接口的可定制位置）。
 
+\paragraph{非流形端点防护}
+折叠前先扫描网格得到非流形顶点集合（判定依据：outgoing 环绕长度 $\neq$
+真实入射半边数）。若边的任一端点属于该集合（例如两个扇区共享一个顶点），
+则\textbf{跳过该边}，避免 \texttt{VertexRing} 只遍历一个扇区导致链接条件
+误判、残留悬空引用、破坏拓扑。
+
 \subsection{步骤 3：翻转均衡度数 \texttt{flip\_for\_valence}}
 
 对每个内部边，相邻两三角形四顶点 $a, b, c, d$，目标度数：
@@ -253,12 +259,14 @@ $\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏�
   \texttt{tangential\_smooth\_on\_isolated\_vertex\_is\_noop} & 孤立顶点切向平滑不 panic，位置不变 \\
   \texttt{isotropic\_remesh\_zero\_iterations\_is\_noop} & \texttt{iter=0} 所有计数为 0 \\
   \texttt{remesh\_preserves\_euler\_characteristic} & icosphere 重网格化前后 $\chi = 2$ 不变 \\
+  \texttt{nonmanifold\_vertices\_detects\_pinch} & 共享顶点的两个四面体：识别 pinch 顶点为非流形 \\
+  \texttt{remesh\_collapse\_skips\_nonmanifold\_endpoints} & 折叠跳过非流形端点后，不引入非流形边/悬空引用 \\
   \bottomrule
 \end{tabular}%
 }
 \end{center}
 
-全模块共 \textbf{13 个}单元测试，全库共 \textbf{552 个}。
+全模块共 \textbf{15 个}单元测试，全库共 \textbf{552 个}。
 
 \section{设计取舍}
 
@@ -277,6 +285,9 @@ $\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏�
         再投影留作未来扩展占位。
   \item \textbf{为何规范半边用 ID 比较？} Twin 对 $(h, t)$ 中只处理一个，
         $\min(h, t)$ 是确定的、无需额外状态。依赖 SlotMap 的 ID 唯一性不变量。
+  \item \textbf{为何折叠前跳过非流形顶点？} \texttt{VertexRing} 只能遍历
+        非流形顶点的其中一个扇区，会令链接条件误判并残留悬空引用；跳过涉及
+        非流形端点的边即可保证折叠不破坏拓扑。
 \end{itemize}
 
 \end{document}

@@ -18,6 +18,8 @@ use crate::storage::MeshStorage;
 use crate::topology_ops::{collapse_edge_at, flip_edge, split_edge};
 use crate::traversal::{FaceHalfEdges, VertexAdjacentVerts, VertexRing, is_boundary_vertex};
 
+use std::collections::{HashMap, HashSet};
+
 // ============================================================
 // 内部工具
 // ============================================================
@@ -181,6 +183,31 @@ fn compute_target_length(mesh: &MeshStorage) -> f64 {
     slice.iter().sum::<f64>() / slice.len() as f64
 }
 
+/// 找出网格中的非流形顶点（outgoing 环长度 ≠ 真实入射半边数）。
+///
+/// [`VertexRing`] 在非流形顶点（例如两个扇区共享一个顶点）上只会遍历其中一个
+/// 扇区，导致后续边折叠的链接条件误判，并可能残留悬空引用、破坏拓扑。此函数
+/// 通过比较真实入射半边数与环绕长度来识别这类顶点，供 collapse 阶段跳过。
+fn nonmanifold_vertices(mesh: &MeshStorage) -> HashSet<VertexId> {
+    let mut incoming: HashMap<VertexId, usize> = HashMap::new();
+    for he in mesh.halfedge_ids() {
+        if let Some(h) = mesh.get_halfedge(he) {
+            *incoming.entry(h.vertex).or_insert(0) += 1;
+        }
+    }
+
+    let mut result = HashSet::new();
+    for (v, deg) in incoming {
+        if deg == 0 {
+            continue; // 孤立顶点：无入射半边
+        }
+        if VertexRing::new(mesh, v).count() != deg {
+            result.insert(v);
+        }
+    }
+    result
+}
+
 /// 分裂所有过长的边。返回分裂次数。
 fn split_long_edges(mesh: &mut MeshStorage, max_len: f64) -> usize {
     let mut count = 0;
@@ -216,6 +243,10 @@ fn split_long_edges(mesh: &mut MeshStorage, max_len: f64) -> usize {
 /// 折叠所有过短的边。返回折叠次数。
 fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
     let mut count = 0;
+    // 非流形顶点上的边折叠会破坏拓扑：VertexRing 只遍历一个扇区，链接条件会
+    // 误判并残留悬空引用。整轮跳过涉及非流形端点的边。
+    let nonmanifold = nonmanifold_vertices(mesh);
+
     let to_collapse: Vec<HalfEdgeId> = mesh
         .halfedge_ids()
         .filter(|&he| {
@@ -236,43 +267,47 @@ fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
         if !mesh.contains_halfedge(he) {
             continue;
         }
-        if let Some(len) = edge_length(mesh, he)
-            && len < min_len
-            && len > 1e-10
-        {
-            // 在中点折叠
-            let h = match mesh.get_halfedge(he) {
-                Some(h) => h,
+        if !edge_length(mesh, he).is_some_and(|l| l < min_len && l > 1e-10) {
+            continue;
+        }
+        // 在中点折叠
+        let h = match mesh.get_halfedge(he) {
+            Some(h) => h,
+            None => continue,
+        };
+        let v_dst = h.vertex;
+        if nonmanifold.contains(&v_dst) {
+            continue;
+        }
+        let mid = if let Some(twin) = h.twin {
+            let v_src = match mesh.get_halfedge(twin) {
+                Some(t) => t.vertex,
                 None => continue,
             };
-            let v_dst = h.vertex;
-            let mid = if let Some(twin) = h.twin {
-                let v_src = match mesh.get_halfedge(twin) {
-                    Some(t) => t.vertex,
-                    None => continue,
-                };
-                let p0 = match mesh.get_vertex(v_src) {
-                    Some(vt) => vt.position,
-                    None => continue,
-                };
-                let p1 = match mesh.get_vertex(v_dst) {
-                    Some(vt) => vt.position,
-                    None => continue,
-                };
-                [
-                    (p0[0] + p1[0]) / 2.0,
-                    (p0[1] + p1[1]) / 2.0,
-                    (p0[2] + p1[2]) / 2.0,
-                ]
-            } else {
-                match mesh.get_vertex(v_dst) {
-                    Some(vt) => vt.position,
-                    None => continue,
-                }
-            };
-            if collapse_edge_at(mesh, he, mid).is_ok() {
-                count += 1;
+            if nonmanifold.contains(&v_src) {
+                continue;
             }
+            let p0 = match mesh.get_vertex(v_src) {
+                Some(vt) => vt.position,
+                None => continue,
+            };
+            let p1 = match mesh.get_vertex(v_dst) {
+                Some(vt) => vt.position,
+                None => continue,
+            };
+            [
+                (p0[0] + p1[0]) / 2.0,
+                (p0[1] + p1[1]) / 2.0,
+                (p0[2] + p1[2]) / 2.0,
+            ]
+        } else {
+            match mesh.get_vertex(v_dst) {
+                Some(vt) => vt.position,
+                None => continue,
+            }
+        };
+        if collapse_edge_at(mesh, he, mid).is_ok() {
+            count += 1;
         }
     }
     count
@@ -546,6 +581,65 @@ mod tests {
         assert_eq!(stats.splits, 0);
         assert_eq!(stats.collapses, 0);
         assert_eq!(stats.flips, 0);
+    }
+
+    #[test]
+    fn nonmanifold_vertices_detects_pinch() {
+        // 两个四面体共享一个顶点（pinch / 非流形顶点）
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0],
+        ];
+        let faces = vec![
+            [0u32, 1, 2],
+            [0, 2, 3],
+            [0, 3, 1],
+            [1, 3, 2],
+            [0, 4, 5],
+            [0, 5, 6],
+            [0, 6, 4],
+            [4, 6, 5],
+        ];
+        let mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        let pinch = mesh.vertex_ids().next().unwrap();
+        assert!(
+            nonmanifold_vertices(&mesh).contains(&pinch),
+            "pinch 顶点应被识别为非流形"
+        );
+    }
+
+    #[test]
+    fn remesh_collapse_skips_nonmanifold_endpoints() {
+        use crate::validate::check_topology;
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0],
+        ];
+        let faces = vec![
+            [0u32, 1, 2],
+            [0, 2, 3],
+            [0, 3, 1],
+            [1, 3, 2],
+            [0, 4, 5],
+            [0, 5, 6],
+            [0, 6, 4],
+            [4, 6, 5],
+        ];
+        let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        // target=1.5 只折叠长度为 1 的边；涉及 pinch 顶点的边应被跳过
+        let _ = isotropic_remesh(&mut mesh, Some(1.5), 3, false);
+        // 折叠后不应引入新的非流形边或悬空引用
+        check_topology(&mesh).unwrap();
     }
 
     #[test]
