@@ -977,7 +977,10 @@ impl EngvisApp for ViewerApp {
                 ui.label("线框");
                 ui.checkbox(&mut frame.render_state.edge_opts.enabled, "显示线框");
                 if frame.render_state.edge_opts.enabled {
-                    ui.add(egui::Slider::new(&mut frame.render_state.edge_opts.line_width, 1.0..=15.0).text("粗细"));
+                    ui.add(
+                        egui::Slider::new(&mut frame.render_state.edge_opts.line_width, 1.0..=15.0)
+                            .text("粗细"),
+                    );
                     ui.horizontal(|ui| {
                         ui.label("颜色");
                         ui.color_edit_button_rgb(&mut frame.render_state.edge_opts.color);
@@ -988,7 +991,13 @@ impl EngvisApp for ViewerApp {
                 ui.label("顶点");
                 ui.checkbox(&mut frame.render_state.vertex_opts.enabled, "显示顶点");
                 if frame.render_state.vertex_opts.enabled {
-                    ui.add(egui::Slider::new(&mut frame.render_state.vertex_opts.point_size, 1.0..=20.0).text("大小"));
+                    ui.add(
+                        egui::Slider::new(
+                            &mut frame.render_state.vertex_opts.point_size,
+                            1.0..=20.0,
+                        )
+                        .text("大小"),
+                    );
                     ui.horizontal(|ui| {
                         ui.label("颜色");
                         ui.color_edit_button_rgb(&mut frame.render_state.vertex_opts.color);
@@ -997,7 +1006,9 @@ impl EngvisApp for ViewerApp {
 
                 ui.separator();
                 ui.label("表面");
-                ui.add(egui::Slider::new(&mut frame.render_state.opacity, 0.0..=1.0).text("透明度"));
+                ui.add(
+                    egui::Slider::new(&mut frame.render_state.opacity, 0.0..=1.0).text("透明度"),
+                );
                 ui.horizontal(|ui| {
                     ui.label("背景色");
                     ui.color_edit_button_rgb(&mut frame.render_state.background_color);
