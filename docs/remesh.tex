@@ -135,6 +135,11 @@ Modeling''（2004）。
 \end{align}
 \textbf{仅当 \texttt{after < before}（严格改善）时翻转}，避免循环。
 
+\paragraph{翻转合法性：对角线已相连检测}
+翻转会把对角线 $(a,b)$ 换成 $(c,d)$。若 $c$、$d$ 已经相连，翻转后同一条边
+会被 $4$ 个面共享，产生非流形边。因此\textbf{翻转前}先检测 $c$、$d$ 之间是否
+已存在边（复杂度 $O(\deg)$），已相连则跳过该翻转。
+
 \paragraph{边界半边过滤}
 遍历半边时需过滤边界半边：仅当 $h.\mathrm{twin} \neq \texttt{None}$
 \emph{且} $h.\mathrm{face} \neq \texttt{None}$ \emph{且} $h.\mathrm{twin}.\mathrm{face} \neq \texttt{None}$
@@ -264,12 +269,13 @@ $\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏�
   \texttt{nonmanifold\_vertices\_detects\_pinch} & 共享顶点的两个四面体：识别 pinch 顶点为非流形 \\
   \texttt{remesh\_collapse\_skips\_nonmanifold\_endpoints} & 折叠跳过非流形端点后，不引入非流形边/悬空引用 \\
   \texttt{remesh\_split\_flip\_skip\_nonmanifold\_vertices} & split/flip 同样跳过非流形顶点，重网格化后拓扑保持 \\
+  \texttt{are\_vertices\_connected\_basic} & 两顶点间是否已存在边的判定正确 \\
   \bottomrule
 \end{tabular}%
 }
 \end{center}
 
-全模块共 \textbf{16 个}单元测试，全库共 \textbf{552 个}。
+全模块共 \textbf{17 个}单元测试，全库共 \textbf{552 个}。
 
 \section{设计取舍}
 

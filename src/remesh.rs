@@ -249,6 +249,11 @@ fn edge_touches_nonmanifold(
         .unwrap_or(false)
 }
 
+/// 判断两个顶点之间是否已存在一条边（O(degree)）。
+fn are_vertices_connected(mesh: &MeshStorage, a: VertexId, b: VertexId) -> bool {
+    VertexAdjacentVerts::new(mesh, a).any(|n| n == b)
+}
+
 /// 分裂所有过长的边。返回分裂次数。
 fn split_long_edges(
     mesh: &mut MeshStorage,
@@ -430,6 +435,12 @@ fn flip_for_valence(mesh: &mut MeshStorage, nonmanifold: &HashSet<VertexId>) -> 
 
         // 翻转涉及四个顶点 a/b/c/d，任一为非流形则跳过，避免破坏拓扑
         if [v0, v1, v2, v3].iter().any(|v| nonmanifold.contains(v)) {
+            continue;
+        }
+
+        // 翻转会把对角线 (v0,v1) 换成 (v2,v3)。若 (v2,v3) 已相连，翻转后
+        // 同一条边会被 4 个面共享，产生非流形边，因此翻转前先检测并跳过。
+        if are_vertices_connected(mesh, v2, v3) {
             continue;
         }
 
@@ -729,6 +740,24 @@ mod tests {
         // target=0.5 会触发 split + collapse + flip，均应跳过非流形顶点
         let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
         check_topology(&mesh).unwrap();
+    }
+
+    #[test]
+    fn are_vertices_connected_basic() {
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let faces = vec![[0u32, 1, 2], [0, 2, 3]];
+        let mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        let v: Vec<_> = mesh.vertex_ids().collect();
+        // 边 0-1、0-2 存在
+        assert!(are_vertices_connected(&mesh, v[0], v[1]));
+        assert!(are_vertices_connected(&mesh, v[0], v[2]));
+        // 边 1-3 不存在
+        assert!(!are_vertices_connected(&mesh, v[1], v[3]));
     }
 
     #[test]
