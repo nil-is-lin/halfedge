@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-06
+
+### Fixed
+- **`isotropic_remesh` collapse on non-manifold vertices**: `collapse_short_edges` collapsed edges whose endpoints are non-manifold (e.g. a pinch vertex shared by two fans). `VertexRing` only walks one fan there, so the collapse link condition passed incorrectly and left dangling half-edge references, later panicking in `flip_edge` or producing non-manifold edges. Non-manifold vertices are now detected (ring length ≠ true incoming half-edge count) and collapses touching them are skipped.
+
+### Added
+- Regression tests `nonmanifold_vertices_detects_pinch` and `remesh_collapse_skips_nonmanifold_endpoints`.
+
+### Changed
+- `docs/remesh.tex` updated with the non-manifold collapse guard.
+
 ## [0.2.1] - 2026-09-06
 
 ### Fixed
@@ -70,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial pre-release (minimal surface). See [0.2.0] for the full feature set.
 
+[0.2.2]: https://github.com/nil-is-lin/halfedge/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/nil-is-lin/halfedge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nil-is-lin/halfedge/compare/v0.1.0...v0.2.0
-[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.2.2...HEAD
