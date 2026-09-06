@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-06
+
+### Fixed
+- **`mixed_area_at_vertex` origin/center confusion**: The Voronoi/mixed area for discrete curvature incorrectly used `h.twin.vertex` (the center vertex `v` itself) as the second triangle neighbor, degenerating every incident triangle (`|pb - pv|² = 0`) and forcing `mixed_area_at_vertex` to always return the `1e-14` clamp. Gaussian curvature therefore returned `≈ 2π/1e-14`. The second neighbor is now `h.next.vertex` (the tip of the next halfedge in the face), with the correct cotangent weights.
+- **`gaussian_curvature` angle sum**: The same `h.twin.vertex` misuse made the per-vertex angle sum always zero (the zero-length vector was skipped). Now uses `h.next.vertex`.
+- **`mean_curvature` factor-of-2**: The implementation returned `|Δv| / (2·A_mixed)` while the documented formula is `|Δv| / (4·A_mixed)`; corrected so the unit-sphere mean curvature is `≈ 1` instead of `≈ 2`.
+
+### Added
+- Regression tests `gaussian_curvature_unit_sphere`, `mean_curvature_unit_sphere`, `principal_curvatures_unit_sphere`, asserting unit-sphere curvatures ≈ 1.
+
+### Changed
+- `docs/geometry.tex` discrete-curvature section updated to reflect the corrected mixed-area and mean-curvature formulas.
+
 ## [0.2.0] - 2026-07-07
 
 ### Added
@@ -57,5 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial pre-release (minimal surface). See [0.2.0] for the full feature set.
 
+[0.2.1]: https://github.com/nil-is-lin/halfedge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nil-is-lin/halfedge/compare/v0.1.0...v0.2.0
-[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.2.1...HEAD

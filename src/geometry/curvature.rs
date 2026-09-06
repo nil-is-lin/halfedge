@@ -35,41 +35,41 @@ fn mixed_area_at_vertex(mesh: &MeshStorage, v: VertexId) -> f64 {
             Some(h) => h,
             None => continue,
         };
-        let a = h.vertex; // tip
-        let b = h.twin.and_then(|t| mesh.get_halfedge(t)).map(|t| t.vertex); // origin
-        let Some(b) = b else { continue };
+        // 每个入射三角形为 (v, a, b)：he 是 v→a 的出边，b 是该三角形中 v 的另一个邻居。
+        let a = h.vertex; // tip = 邻居 a
+        let b = match h.next.and_then(|n| mesh.get_halfedge(n)) {
+            Some(n) => n.vertex, // 邻居 b（he.next 的 tip）
+            None => continue,
+        };
 
-        let (pa, pb, pv) = match (mesh.get_vertex(a), mesh.get_vertex(b), mesh.get_vertex(v)) {
-            (Some(va), Some(vb), Some(vv)) => (va.position, vb.position, vv.position),
+        let (pv, pa, pb) = match (mesh.get_vertex(v), mesh.get_vertex(a), mesh.get_vertex(b)) {
+            (Some(vv), Some(va), Some(vb)) => (vv.position, va.position, vb.position),
             _ => continue,
         };
 
-        let a2 = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2);
-        let b2 = (pv[0] - pa[0]).powi(2) + (pv[1] - pa[1]).powi(2) + (pv[2] - pa[2]).powi(2);
-        let c2 = (pb[0] - pv[0]).powi(2) + (pb[1] - pv[1]).powi(2) + (pb[2] - pv[2]).powi(2);
+        // 三边平方长度：va = |a-v|²，vb = |b-v|²，ab = |a-b|²
+        let va2 = (pa[0] - pv[0]).powi(2) + (pa[1] - pv[1]).powi(2) + (pa[2] - pv[2]).powi(2);
+        let vb2 = (pb[0] - pv[0]).powi(2) + (pb[1] - pv[1]).powi(2) + (pb[2] - pv[2]).powi(2);
+        let ab2 = (pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2);
 
-        // 判断钝角
-        let obtuse_at_v = b2 + c2 < a2;
-        let obtuse_at_a = a2 + b2 < c2;
-        let obtuse_at_b = a2 + c2 < b2;
+        // 判断钝角：钝角在 v/a/b 处时，其对边分别为 ab/vb/va
+        let obtuse_at_v = ab2 > va2 + vb2;
+        let obtuse_at_a = vb2 > va2 + ab2;
+        let obtuse_at_b = va2 > vb2 + ab2;
 
+        let tri_area = crate::linalg::vec3::triangle_area(pv, pa, pb);
         if obtuse_at_v {
             // v 处钝角：用三角形面积的 1/2
-            let tri_area = crate::linalg::vec3::triangle_area(pv, pa, pb);
             area += tri_area / 2.0;
         } else if obtuse_at_a || obtuse_at_b {
             // 其他钝角：用三角形面积的 1/4
-            let tri_area = crate::linalg::vec3::triangle_area(pv, pa, pb);
             area += tri_area / 4.0;
         } else {
-            // Voronoi 面积
-            let cot_a = cotan_from_pos(pv, pa, pb); // angle at v in triangle pv-a-b... wait
-            let cot_b = cotan_from_pos(pa, pb, pv);
-            area += (b2 * cot_b + c2 * cot_a) / 8.0; // actually need cot at vertices a and b opposite to v
-            // Standard formula: A_voronoi = 1/8 Σ (cot α_ij + cot β_ij) * ||v_j - v_i||²
-            // Let me use a simpler approach: just use 1/3 of each incident triangle area
-            let tri_area = crate::linalg::vec3::triangle_area(pv, pa, pb);
-            area += tri_area / 3.0;
+            // Voronoi 面积：A_voronoi = 1/8 Σ (cot α_ij + cot β_ij) · ||v_j - v_i||²
+            // 对三角形 (v, a, b) 贡献 1/8 · (cot(∠b)·|a-v|² + cot(∠a)·|b-v|²)
+            let cot_a = cotan_from_pos(pa, pv, pb); // 角在 a
+            let cot_b = cotan_from_pos(pb, pv, pa); // 角在 b
+            area += (va2 * cot_b + vb2 * cot_a) / 8.0;
         }
     }
     if area < 1e-14 { 1e-14 } else { area }
@@ -111,8 +111,8 @@ pub fn gaussian_curvature(mesh: &MeshStorage, v: VertexId) -> Option<f64> {
     let mut angle_sum = 0.0;
     for he in VertexRing::new(mesh, v) {
         let h = mesh.get_halfedge(he)?;
-        let a = h.vertex;
-        let b = h.twin.and_then(|t| mesh.get_halfedge(t))?.vertex;
+        let a = h.vertex; // 邻居 a（he 的 tip）
+        let b = h.next.and_then(|n| mesh.get_halfedge(n))?.vertex; // 邻居 b（同三角形中 v 的另一个邻居）
 
         let pv = mesh.get_vertex(v)?.position;
         let pa = mesh.get_vertex(a)?.position;
@@ -157,7 +157,8 @@ pub fn mean_curvature(mesh: &MeshStorage, v: VertexId) -> Option<f64> {
         return Some(0.0);
     }
     let area = mixed_area_at_vertex(mesh, v);
-    Some(0.5 * len / area)
+    // H = |Δv| / (4 A_mixed)：|Δv| = Σ(cot α + cot β)(v_j - v) 的模。
+    Some(len / (4.0 * area))
 }
 
 /// 顶点主曲率 $\kappa_1, \kappa_2$。
@@ -222,6 +223,45 @@ pub fn all_mean_curvatures_par(mesh: &MeshStorage) -> Vec<Option<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaussian_curvature_unit_sphere() {
+        // 单位 icosphere 的理论高斯曲率 K = 1/r² = 1。
+        // 修复前 mixed_area_at_vertex 恒返回 1e-14，导致 K ≈ 2π/1e-14 异常巨大。
+        let mesh = crate::test_util::build_icosphere(3);
+        for v in mesh.vertex_ids() {
+            if let Some(k) = gaussian_curvature(&mesh, v) {
+                assert!(k.is_finite(), "高斯曲率非有限");
+                assert!(k > 0.1 && k < 10.0, "单位球高斯曲率应≈1，实际 {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn mean_curvature_unit_sphere() {
+        // 单位 icosphere 的理论平均曲率 H = 1/r = 1。
+        // 修复前少了 1/2 因子，返回约 2。
+        let mesh = crate::test_util::build_icosphere(3);
+        for v in mesh.vertex_ids() {
+            if let Some(h) = mean_curvature(&mesh, v) {
+                assert!(h.is_finite(), "平均曲率非有限");
+                assert!(h > 0.5 && h < 1.5, "单位球平均曲率应≈1，实际 {h}");
+            }
+        }
+    }
+
+    #[test]
+    fn principal_curvatures_unit_sphere() {
+        // 单位球主曲率 κ1 = κ2 = 1。
+        let mesh = crate::test_util::build_icosphere(3);
+        for v in mesh.vertex_ids() {
+            if let Some((k1, k2)) = principal_curvatures(&mesh, v) {
+                assert!(k1.is_finite() && k2.is_finite(), "主曲率非有限");
+                assert!(k1 > 0.5 && k1 < 1.5, "单位球 κ1 应≈1，实际 {k1}");
+                assert!(k2 > 0.5 && k2 < 1.5, "单位球 κ2 应≈1，实际 {k2}");
+            }
+        }
+    }
 
     #[test]
     fn gaussian_curvature_icosphere() {

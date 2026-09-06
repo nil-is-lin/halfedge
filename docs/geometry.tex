@@ -118,7 +118,7 @@
   \multirow{4}{*}{离散曲率}
     & \texttt{VertexCurvature}                        & 顶点曲率信息（$K, H, \kappa_1, \kappa_2$） \\
     & \texttt{gaussian\_curvature(mesh, v)}           & 高斯曲率 $K = (2\pi - \sum\theta)/A_\text{mixed}$ \\
-    & \texttt{mean\_curvature(mesh, v)}               & 平均曲率 $H = \|\Delta v\|/(2 A_\text{mixed})$ \\
+    & \texttt{mean\_curvature(mesh, v)}               & 平均曲率 $H = \|\Delta v\|/(4 A_\text{mixed})$ \\
     & \texttt{principal\_curvatures(mesh, v)}         & 主曲率 $\kappa_{1,2} = H \pm \sqrt{H^2-K}$ \\
     & \texttt{vertex\_curvature(mesh, v)}             & 一次调用返回上述四值 \\
   \bottomrule
@@ -441,16 +441,18 @@ Möller-Trumbore 算法求解：
 
 \subsection{混合面积}
 
-对顶点 $v$ 的邻接三角形，按角度分类：
+对顶点 $v$ 的每个入射三角形 $(v, a, b)$（其中 $he$ 是 $v \to a$ 的出边，
+$b$ 是 $he.\mathrm{next}$ 的 tip，即该三角形中 $v$ 的另一个邻居），
+按角度分类累加：
 
 \begin{itemize}
-  \item \textbf{非钝角}：使用 Voronoi 面积 $A_v = \frac{1}{8}\sum_j (\cot\alpha_j + \cot\beta_j)\|v_j - v\|^2$；
+  \item \textbf{非钝角}：使用 Voronoi 项
+        $\dfrac{1}{8}\bigl(\cot\angle b \cdot \|a-v\|^2 + \cot\angle a \cdot \|b-v\|^2\bigr)$；
   \item \textbf{$v$ 处钝角}：取三角形面积 $/ 2$；
-  \item \textbf{其他顶点处钝角}：取三角形面积 $/ 4$。
+  \item \textbf{$a$ 或 $b$ 处钝角}：取三角形面积 $/ 4$。
 \end{itemize}
 
-实现中若 Voronoi 项退化，回退为重心面积（三角形面积 $/ 3$）。
-最小面积阈值 $10^{-14}$ 防止除零。
+最终面积钳制在 $10^{-14}$ 防止除零。
 
 \subsection{高斯曲率}
 
@@ -465,7 +467,7 @@ Möller-Trumbore 算法求解：
 
 利用余切拉普拉斯 $\Delta v$：
 \[
-  H(v) = \frac{\|\Delta v\|}{2 \, A_{\text{mixed}}(v)}.
+  H(v) = \frac{\|\Delta v\|}{4 \, A_{\text{mixed}}(v)}.
 \]
 $\Delta v$ 由 \texttt{cotan\_laplacian} 计算。
 若 $\|\Delta v\| < 10^{-14}$，返回 $0$；\textbf{边界顶点返回 $0$}。
@@ -663,6 +665,9 @@ impl EdgeLengthStats {
   \texttt{volume\_icosphere}                        & icosphere 体积 $\approx \frac{4}{3}\pi$ \\
   \midrule
   \multicolumn{2}{l}{\textit{离散曲率}} \\
+  \texttt{gaussian\_curvature\_unit\_sphere}         & 单位球 $K \approx 1$（防 origin/中心混淆回归） \\
+  \texttt{mean\_curvature\_unit\_sphere}             & 单位球 $H \approx 1$（防 $1/2$ 因子回归） \\
+  \texttt{principal\_curvatures\_unit\_sphere}       & 单位球 $\kappa_1 \approx \kappa_2 \approx 1$ \\
   \texttt{gaussian\_curvature\_icosphere}           & 球面顶点 $K \approx 1/r^2$ \\
   \texttt{mean\_curvature\_icosphere}               & 球面顶点 $H \approx 1/r$ \\
   \texttt{principal\_curvatures\_nonzero}           & $\kappa_1, \kappa_2 > 0$ 且 $\kappa_1 \approx \kappa_2$ \\
