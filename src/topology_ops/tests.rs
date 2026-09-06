@@ -554,6 +554,41 @@ fn collapse_with_violated_link_condition_fails() {
 }
 
 #[test]
+fn collapse_with_both_boundary_vertices_fails() {
+    // 2×2 平面（两个三角形）：对角线 1-2 为内部边，两端点均为边界顶点
+    let vertices = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 0.0],
+    ];
+    let faces = [[0u32, 1, 2], [1, 3, 2]];
+    let mut mesh = crate::build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
+    let v: Vec<VertexId> = mesh.vertex_ids().collect();
+
+    // 找到对角线 1→2 的半边
+    let he = mesh
+        .halfedge_ids()
+        .find(|&h| {
+            let hh = mesh.get_halfedge(h).unwrap();
+            hh.vertex == v[2]
+                && hh
+                    .twin
+                    .and_then(|t| mesh.get_halfedge(t))
+                    .map(|t| t.vertex == v[1])
+                    .unwrap_or(false)
+        })
+        .expect("对角线 1→2 应存在");
+
+    let err = collapse_edge(&mut mesh, he).unwrap_err();
+    assert_eq!(
+        err,
+        TopologyError::CollapseOnBoundaryVertices { a: v[1], b: v[2] },
+        "两端点均为边界顶点 → 应拒绝折叠"
+    );
+}
+
+#[test]
 fn collapse_link_condition_check_function() {
     // 直接测试 check_link_condition 函数
     let (mesh, c, outer, _faces) = build_closed_fan();

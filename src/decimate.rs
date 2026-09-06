@@ -706,12 +706,11 @@ mod tests {
         let mut mesh = build_mesh_from_vertices_and_faces(&vertices, &faces).unwrap();
         assert_eq!(mesh.face_count(), 2);
 
-        // 简化到 0 面：所有代价为 0（共面），应正确折叠对角线
+        // 对角线 (1,2) 两端点均为边界顶点，折叠会破坏边界拓扑，应被拒绝
         let removed = decimate_qem(&mut mesh, 0).expect("简化应成功");
-        assert_eq!(removed, 2, "应移除 2 面");
-        assert_eq!(mesh.face_count(), 0, "面数应为 0");
-        // 4 顶点 → 折叠 1 次 → 3 顶点
-        assert_eq!(mesh.vertex_count(), 3, "顶点数应为 3");
+        assert_eq!(removed, 0, "对角线两端均为边界顶点，不应折叠");
+        assert_eq!(mesh.face_count(), 2, "面数不变");
+        assert_eq!(mesh.vertex_count(), 4, "顶点数不变");
     }
 
     #[test]

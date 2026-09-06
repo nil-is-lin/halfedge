@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::ids::{FaceId, HalfEdgeId, VertexId};
 use crate::storage::{Face, HalfEdge, MeshStorage, Vertex};
-use crate::traversal::{FaceHalfEdges, VertexAdjacentVerts, VertexRing};
+use crate::traversal::{FaceHalfEdges, VertexAdjacentVerts, VertexRing, is_boundary_vertex};
 
 use super::helpers::TopologyError;
 use super::validate::validate_mesh;
@@ -730,6 +730,11 @@ fn collect_collapse_data(
     // 链接条件：A、B 的公共邻居恰好为 {C, D}
     if !check_link_condition(mesh, a, b, c, d) {
         return Err(TopologyError::LinkConditionViolated { a, b });
+    }
+
+    // 拒绝两个端点均为边界顶点的折叠：合并两个边界顶点会破坏边界拓扑
+    if is_boundary_vertex(mesh, a) && is_boundary_vertex(mesh, b) {
+        return Err(TopologyError::CollapseOnBoundaryVertices { a, b });
     }
 
     // 获取 twin 的 twin ID（缝合用），注意这些 twin 不在 deleted_set 中

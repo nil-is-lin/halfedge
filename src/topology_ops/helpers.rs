@@ -25,6 +25,8 @@ pub enum TopologyError {
     DegenerateTriangle,
     /// 链接条件不满足，折叠会产生非流形。
     LinkConditionViolated { a: VertexId, b: VertexId },
+    /// 折叠边的两个端点均为边界顶点（会破坏边界拓扑）。
+    CollapseOnBoundaryVertices { a: VertexId, b: VertexId },
     /// 网格拓扑不一致（twin 不互指、next/prev 不闭合等）。
     Inconsistent(String),
 }
@@ -40,6 +42,9 @@ impl fmt::Display for TopologyError {
             Self::DegenerateTriangle => write!(f, "操作会产生退化三角形"),
             Self::LinkConditionViolated { a, b } => {
                 write!(f, "链接条件不满足：折叠 {:?}-{:?} 会产生非流形", a, b)
+            }
+            Self::CollapseOnBoundaryVertices { a, b } => {
+                write!(f, "禁止折叠：端点 {:?}、{:?} 均为边界顶点", a, b)
             }
             Self::Inconsistent(msg) => write!(f, "网格拓扑不一致：{}", msg),
         }

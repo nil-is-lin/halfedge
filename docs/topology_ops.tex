@@ -111,6 +111,7 @@
   \texttt{NoFace(he)}                & 两侧均无面 \\
   \texttt{DegenerateTriangle}        & $C = D$、offset 零向量或侧面退化 \\
   \texttt{LinkConditionViolated\{a, b\}} & 公共邻居 $\neq \{C, D\}$ \\
+  \texttt{CollapseOnBoundaryVertices\{a, b\}} & 折叠边两端点均为边界顶点 \\
   \texttt{Inconsistent(msg)}         & twin 不互指、next/prev 断裂、面含内部边等 \\
   \bottomrule
 \end{tabular}
@@ -392,11 +393,15 @@ $F_2 = \mathrm{twin}.\mathrm{face} = (B \to A \to D \to B)$。
 \end{tikzpicture}
 \end{center}
 
+\paragraph{边界顶点限制}
+即使链接条件满足，$A$、$B$ 同时为边界顶点时折叠仍被拒绝。合并两个边界顶点
+会让同一顶点在边界环中出现两次，破坏边界拓扑（产生非流形边界顶点）。
+
 \subsection{操作步骤}
 
 \begin{enumerate}
   \item \textbf{校验}：$h.\mathrm{face}, \mathrm{twin}.\mathrm{face}$ 均 $\mathrm{Some}$；
-        $C \neq D$；链接条件满足。
+        $C \neq D$；链接条件满足；$A$、$B$ 不同时为边界顶点。
   \item \textbf{收集}：遍历 $A$、$B$ 的 outgoing 环，收集所有 \texttt{vertex} $= A$ 或 $B$
         的存活半边（排除待删除的 $h, \mathrm{twin}, n_1, p_1, n_2, p_2$）。
   \item \textbf{创建} $K$（位置 $= \frac{A + B}{2}$）。
@@ -1065,6 +1070,7 @@ $\text{vert\_map}[v] = v'$。
   \texttt{collapse\_interior\_edge\_of\_closed\_fan} & 闭合扇形折叠：$-1V -2F -6$HE \\
   \texttt{collapse\_boundary\_edge\_fails}           & 边界边折叠返回错误 \\
   \texttt{collapse\_with\_violated\_link\_condition\_fails} & 5 顶点 4 面网格，公共邻居 3 个 \\
+  \texttt{collapse\_with\_both\_boundary\_vertices\_fails} & 对角线两端点均为边界顶点，拒绝折叠 \\
   \texttt{collapse\_link\_condition\_check\_function} & 直接测试 \texttt{check\_link\_condition} \\
   \texttt{collapse\_then\_remaining\_mesh\_valid}    & 折叠后 $K$ 为边界顶点，网格合法 \\
   \texttt{collapse\_edge\_uses\_midpoint\_position}  & \texttt{collapse\_edge} 新顶点 $= \frac{A+B}{2}$ \\
