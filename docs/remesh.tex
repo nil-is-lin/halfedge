@@ -104,6 +104,7 @@ Modeling''（2004）。
 
 阈值 $L_{\max} = \frac{4}{3} L$。遍历所有规范半边（twin 对中 ID 较小者），
 若 \texttt{edge\_length}$(h) > L_{\max}$，调用 \texttt{split\_edge}（在中点插入顶点）。
+涉及非流形端点的边\textbf{跳过}（见「非流形防护」）。
 
 \subsection{步骤 2：折叠短边 \texttt{collapse\_short\_edges}}
 
@@ -114,11 +115,12 @@ Modeling''（2004）。
 折叠目标位置 = 边中点（无 twin 的边界边折叠到 \texttt{tip} 当前位置），
 调用 \texttt{collapse\_edge\_at}（保留 QEM 接口的可定制位置）。
 
-\paragraph{非流形端点防护}
-折叠前先扫描网格得到非流形顶点集合（判定依据：outgoing 环绕长度 $\neq$
-真实入射半边数）。若边的任一端点属于该集合（例如两个扇区共享一个顶点），
-则\textbf{跳过该边}，避免 \texttt{VertexRing} 只遍历一个扇区导致链接条件
-误判、残留悬空引用、破坏拓扑。
+\paragraph{非流形防护}
+每轮迭代开始先扫描网格得到非流形顶点集合（判定依据：outgoing 环绕长度 $\neq$
+真实入射半边数）。\texttt{split} / \texttt{collapse} / \texttt{flip} 三个阶段
+对涉及非流形端点的边\textbf{统一跳过}，避免 \texttt{VertexRing} 只遍历一个扇区
+导致链接条件误判、残留悬空引用、破坏拓扑。\texttt{collapse} 阶段还会在每次折叠
+后重新校验合并出的新顶点，若其变为非流形则同步加入跳过集合。
 
 \subsection{步骤 3：翻转均衡度数 \texttt{flip\_for\_valence}}
 
@@ -261,12 +263,13 @@ $\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏�
   \texttt{remesh\_preserves\_euler\_characteristic} & icosphere 重网格化前后 $\chi = 2$ 不变 \\
   \texttt{nonmanifold\_vertices\_detects\_pinch} & 共享顶点的两个四面体：识别 pinch 顶点为非流形 \\
   \texttt{remesh\_collapse\_skips\_nonmanifold\_endpoints} & 折叠跳过非流形端点后，不引入非流形边/悬空引用 \\
+  \texttt{remesh\_split\_flip\_skip\_nonmanifold\_vertices} & split/flip 同样跳过非流形顶点，重网格化后拓扑保持 \\
   \bottomrule
 \end{tabular}%
 }
 \end{center}
 
-全模块共 \textbf{15 个}单元测试，全库共 \textbf{552 个}。
+全模块共 \textbf{16 个}单元测试，全库共 \textbf{552 个}。
 
 \section{设计取舍}
 
@@ -285,9 +288,10 @@ $\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏�
         再投影留作未来扩展占位。
   \item \textbf{为何规范半边用 ID 比较？} Twin 对 $(h, t)$ 中只处理一个，
         $\min(h, t)$ 是确定的、无需额外状态。依赖 SlotMap 的 ID 唯一性不变量。
-  \item \textbf{为何折叠前跳过非流形顶点？} \texttt{VertexRing} 只能遍历
-        非流形顶点的其中一个扇区，会令链接条件误判并残留悬空引用；跳过涉及
-        非流形端点的边即可保证折叠不破坏拓扑。
+  \item \textbf{为何 split/collapse/flip 都跳过非流形顶点？} \texttt{VertexRing}
+        只能遍历非流形顶点的其中一个扇区，会令链接条件误判并残留悬空引用；
+        三段统一跳过涉及非流形端点的操作，即可保证重网格化不破坏拓扑。collapse
+        还额外对合并出的新顶点做二次校验，覆盖折叠过程中新产生的非流形顶点。
 \end{itemize}
 
 \end{document}

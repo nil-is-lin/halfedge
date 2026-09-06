@@ -131,16 +131,20 @@ pub fn isotropic_remesh(
     };
 
     for _iter in 0..iterations {
+        // 每轮迭代重新识别非流形顶点，供 split / collapse / flip 统一跳过，
+        // 避免在非流形区域做拓扑操作而破坏拓扑。
+        let nonmanifold = nonmanifold_vertices(mesh);
+
         // 1. Split long edges
-        let split_count = split_long_edges(mesh, max_len);
+        let split_count = split_long_edges(mesh, max_len, &nonmanifold);
         stats.splits += split_count;
 
         // 2. Collapse short edges
-        let collapse_count = collapse_short_edges(mesh, min_len);
+        let collapse_count = collapse_short_edges(mesh, min_len, &nonmanifold);
         stats.collapses += collapse_count;
 
         // 3. Flip to improve valence
-        let flip_count = flip_for_valence(mesh);
+        let flip_count = flip_for_valence(mesh, &nonmanifold);
         stats.flips += flip_count;
 
         // 4. Tangential smoothing
@@ -208,8 +212,49 @@ fn nonmanifold_vertices(mesh: &MeshStorage) -> HashSet<VertexId> {
     result
 }
 
+/// 判断单个顶点是否为非流形（O(E) 全扫描）。
+///
+/// 用于折叠后重新校验合并出的新顶点是否变成了非流形顶点。
+fn is_nonmanifold_vertex(mesh: &MeshStorage, v: VertexId) -> bool {
+    let ring_len = VertexRing::new(mesh, v).count();
+    if ring_len == 0 {
+        return false; // 孤立顶点
+    }
+    let incoming = mesh
+        .halfedge_ids()
+        .filter(|he| {
+            mesh.get_halfedge(*he)
+                .map(|h| h.vertex == v)
+                .unwrap_or(false)
+        })
+        .count();
+    ring_len != incoming
+}
+
+/// 判断一条边的任一端点是否为非流形顶点。
+fn edge_touches_nonmanifold(
+    mesh: &MeshStorage,
+    he: HalfEdgeId,
+    nonmanifold: &HashSet<VertexId>,
+) -> bool {
+    let Some(h) = mesh.get_halfedge(he) else {
+        return false;
+    };
+    if nonmanifold.contains(&h.vertex) {
+        return true;
+    }
+    h.twin
+        .and_then(|t| mesh.get_halfedge(t))
+        .map(|t| nonmanifold.contains(&t.vertex))
+        .unwrap_or(false)
+}
+
 /// 分裂所有过长的边。返回分裂次数。
-fn split_long_edges(mesh: &mut MeshStorage, max_len: f64) -> usize {
+fn split_long_edges(
+    mesh: &mut MeshStorage,
+    max_len: f64,
+    nonmanifold: &HashSet<VertexId>,
+) -> usize {
     let mut count = 0;
     // 收集需要分裂的边（twin 对只取一个代表）
     let to_split: Vec<HalfEdgeId> = mesh
@@ -225,12 +270,19 @@ fn split_long_edges(mesh: &mut MeshStorage, max_len: f64) -> usize {
             {
                 return false;
             }
+            // 跳过涉及非流形端点的边，避免在非流形区域分裂破坏拓扑
+            if edge_touches_nonmanifold(mesh, he, nonmanifold) {
+                return false;
+            }
             edge_length(mesh, he).is_some_and(|l| l > max_len)
         })
         .collect();
 
     for he in to_split {
         if !mesh.contains_halfedge(he) {
+            continue;
+        }
+        if edge_touches_nonmanifold(mesh, he, nonmanifold) {
             continue;
         }
         if edge_length(mesh, he).is_some_and(|l| l > max_len) && split_edge(mesh, he).is_ok() {
@@ -241,11 +293,14 @@ fn split_long_edges(mesh: &mut MeshStorage, max_len: f64) -> usize {
 }
 
 /// 折叠所有过短的边。返回折叠次数。
-fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
+fn collapse_short_edges(
+    mesh: &mut MeshStorage,
+    min_len: f64,
+    nonmanifold: &HashSet<VertexId>,
+) -> usize {
     let mut count = 0;
-    // 非流形顶点上的边折叠会破坏拓扑：VertexRing 只遍历一个扇区，链接条件会
-    // 误判并残留悬空引用。整轮跳过涉及非流形端点的边。
-    let nonmanifold = nonmanifold_vertices(mesh);
+    // 用可变的本地副本：折叠过程中若合并出新的非流形顶点，也一并加入跳过集合。
+    let mut skip = nonmanifold.clone();
 
     let to_collapse: Vec<HalfEdgeId> = mesh
         .halfedge_ids()
@@ -270,23 +325,20 @@ fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
         if !edge_length(mesh, he).is_some_and(|l| l < min_len && l > 1e-10) {
             continue;
         }
+        if edge_touches_nonmanifold(mesh, he, &skip) {
+            continue;
+        }
         // 在中点折叠
         let h = match mesh.get_halfedge(he) {
             Some(h) => h,
             None => continue,
         };
         let v_dst = h.vertex;
-        if nonmanifold.contains(&v_dst) {
-            continue;
-        }
         let mid = if let Some(twin) = h.twin {
             let v_src = match mesh.get_halfedge(twin) {
                 Some(t) => t.vertex,
                 None => continue,
             };
-            if nonmanifold.contains(&v_src) {
-                continue;
-            }
             let p0 = match mesh.get_vertex(v_src) {
                 Some(vt) => vt.position,
                 None => continue,
@@ -306,15 +358,19 @@ fn collapse_short_edges(mesh: &mut MeshStorage, min_len: f64) -> usize {
                 None => continue,
             }
         };
-        if collapse_edge_at(mesh, he, mid).is_ok() {
+        if let Ok(k) = collapse_edge_at(mesh, he, mid) {
             count += 1;
+            // 若折叠产生了新的非流形顶点，后续折叠应继续跳过它
+            if !skip.is_empty() && is_nonmanifold_vertex(mesh, k) {
+                skip.insert(k);
+            }
         }
     }
     count
 }
 
 /// 翻转边以优化顶点度数。返回翻转次数。
-fn flip_for_valence(mesh: &mut MeshStorage) -> usize {
+fn flip_for_valence(mesh: &mut MeshStorage, nonmanifold: &HashSet<VertexId>) -> usize {
     let mut count = 0;
     let to_check: Vec<HalfEdgeId> = mesh.halfedge_ids().collect();
 
@@ -371,6 +427,11 @@ fn flip_for_valence(mesh: &mut MeshStorage) -> usize {
         let (Some(v2), Some(v3)) = (v2, v3) else {
             continue;
         };
+
+        // 翻转涉及四个顶点 a/b/c/d，任一为非流形则跳过，避免破坏拓扑
+        if [v0, v1, v2, v3].iter().any(|v| nonmanifold.contains(v)) {
+            continue;
+        }
 
         // 当前度数
         let val_a_before = VertexRing::new(mesh, v0).count();
@@ -639,6 +700,34 @@ mod tests {
         // target=1.5 只折叠长度为 1 的边；涉及 pinch 顶点的边应被跳过
         let _ = isotropic_remesh(&mut mesh, Some(1.5), 3, false);
         // 折叠后不应引入新的非流形边或悬空引用
+        check_topology(&mesh).unwrap();
+    }
+
+    #[test]
+    fn remesh_split_flip_skip_nonmanifold_vertices() {
+        use crate::validate::check_topology;
+        let verts = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0],
+        ];
+        let faces = vec![
+            [0u32, 1, 2],
+            [0, 2, 3],
+            [0, 3, 1],
+            [1, 3, 2],
+            [0, 4, 5],
+            [0, 5, 6],
+            [0, 6, 4],
+            [4, 6, 5],
+        ];
+        let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+        // target=0.5 会触发 split + collapse + flip，均应跳过非流形顶点
+        let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
         check_topology(&mesh).unwrap();
     }
 
