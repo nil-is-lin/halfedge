@@ -346,18 +346,42 @@ fn reconnect_split_twin_side(mesh: &mut MeshStorage, data: &SplitEdgeData, he: &
             .expect("f2 validated earlier")
             .halfedge = Some(he.b_to_m);
     } else {
-        // 边界情形：twin (B→A) 分裂为 b_to_m (B→M) + m_to_a (M→A)，均 face=None
+        // 边界情形：twin (B→A) 分裂为 b_to_m (B→M) + m_to_a (M→A)，均 face=None。
+        // 需维护边界环的 next/prev 链，否则边界环断裂、破坏拓扑。
+        let (twin_prev, twin_next) = {
+            let twin = mesh
+                .get_halfedge(data.twin_id)
+                .expect("twin validated earlier");
+            (twin.prev, twin.next)
+        };
+
         let bm = mesh
             .get_halfedge_mut(he.b_to_m)
             .expect("b_to_m just created");
         bm.twin = Some(he.m_to_b);
         bm.face = None;
+        bm.prev = twin_prev;
+        bm.next = Some(he.m_to_a);
 
         let ma = mesh
             .get_halfedge_mut(he.m_to_a)
             .expect("m_to_a just created");
         ma.twin = Some(he.a_to_m);
         ma.face = None;
+        ma.prev = Some(he.b_to_m);
+        ma.next = twin_next;
+
+        // 原边界环前后邻居改指向新半边
+        if let Some(prev) = twin_prev {
+            mesh.get_halfedge_mut(prev)
+                .expect("twin.prev validated earlier")
+                .next = Some(he.b_to_m);
+        }
+        if let Some(next) = twin_next {
+            mesh.get_halfedge_mut(next)
+                .expect("twin.next validated earlier")
+                .prev = Some(he.m_to_a);
+        }
     }
 }
 

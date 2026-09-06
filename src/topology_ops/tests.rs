@@ -294,6 +294,34 @@ fn split_boundary_edge_passed_as_boundary_halfedge() {
     assert!(validate_mesh(&mesh).is_ok());
 }
 
+#[test]
+fn split_boundary_edge_maintains_boundary_loop() {
+    // 使用真实 builder 构造单三角（边界半边带有 next/prev 环），分裂边界边后
+    // 边界环的 next/prev 链必须保持完整（否则 isotropic_remesh 分裂边界长边会破坏拓扑）。
+    let verts = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let faces = vec![[0u32, 1, 2]];
+    let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+    // 找一条内部半边（face=Some 且 twin.face=None 的边界边）
+    let he = mesh
+        .halfedge_ids()
+        .find(|&h| {
+            let hh = mesh.get_halfedge(h).unwrap();
+            hh.face.is_some()
+                && hh
+                    .twin
+                    .and_then(|t| mesh.get_halfedge(t))
+                    .map(|t| t.face.is_none())
+                    .unwrap_or(false)
+        })
+        .expect("单三角应有边界边");
+
+    split_edge(&mut mesh, he).expect("分裂边界边应成功");
+
+    // 完整校验（含 twin/next/prev 一致性与悬空引用检查）
+    crate::validate::check_topology(&mesh).expect("分裂后边界环应保持完整");
+}
+
 // ---------- flip_edge 测试 ----------
 
 #[test]

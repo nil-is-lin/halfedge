@@ -212,7 +212,12 @@ $n_2 = \mathrm{twin}.\mathrm{next}$（$A \to D$），$p_2 = \mathrm{twin}.\mathr
 
 $\mathrm{twin}.\mathrm{face} = \mathrm{None}$。新建 6 条半边（无 $m \to d, d \to m$），
 $\mathrm{twin}$（$B \to A$ 边界）分裂为 $b \to m$（$B \to M$ 边界）+ $m \to a$（$M \to A$ 边界），
-不创建 $F_{new2}$。
+不创建 $F_{new2}$。同时维护边界环的 \texttt{next/prev} 链：记 $\mathrm{twin}$ 的前后
+邻居为 $p, n$，则重链为
+\[
+  p \to (B \to M) \to (M \to A) \to n,
+\]
+并把 $p.\mathrm{next}$、$n.\mathrm{prev}$ 改指向新边界半边，否则边界环断裂、破坏拓扑。
 
 \subsection{数量变化}
 
@@ -1059,6 +1064,7 @@ $\text{vert\_map}[v] = v'$。
   \texttt{split\_boundary\_edge\_of\_single\_triangle} & 边界边分裂：+1V +1F +4HE，中点位置正确 \\
   \texttt{split\_interior\_edge\_of\_two\_triangles}   & 内部边分裂：+1V +2F +6HE \\
   \texttt{split\_boundary\_edge\_passed\_as\_boundary\_halfedge} & 传入边界半边自动转 twin \\
+  \texttt{split\_boundary\_edge\_maintains\_boundary\_loop} & 真实 builder 边界边分裂后，边界环 next/prev 完整 \\
   \midrule
   \multicolumn{2}{l}{\textit{flip\_edge}} \\
   \texttt{flip\_interior\_edge\_of\_two\_triangles} & 内部边翻转：数量不变，$h.\mathrm{vertex}=C$ \\
