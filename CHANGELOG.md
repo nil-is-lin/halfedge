@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-06
+
+### Breaking
+- **`isotropic_remesh` signature**: Added a fifth parameter `preserve_boundary: bool`. When `true` (default in `quick_remesh`/`remesh_to_length`), split skips boundary edges and collapse skips edges touching boundary vertices, preserving open-mesh boundaries.
+
+### Fixed
+- **`flip_edge` non-manifold guard**: `flip_edge` now rejects flips where the opposite vertices `c` and `d` are already connected (`FlipCreatesNonManifoldEdge`), which would otherwise create a duplicate edge.
+
+### Added
+- **`reproject` implementation**: `isotropic_remesh(..., reproject=true)` now snapshots the original surface and projects each vertex back to its closest point on that surface (point-to-triangle closest point, brute-force `O(V·F)`), instead of being a no-op.
+- Regression tests: `flip_edge_rejects_when_opposite_vertices_connected`, `collapse_interior_edge_with_one_boundary_vertex`, `remesh_preserve_boundary_false_allows_boundary_split`, `remesh_reproject_keeps_vertices_on_unit_sphere`.
+
+### Changed
+- `docs/remesh.tex` and `docs/topology_ops.tex` updated with the new API, `reproject`, `preserve_boundary`, and the `FlipCreatesNonManifoldEdge` error.
+
 ## [0.2.6] - 2026-09-06
 
 ### Fixed
@@ -125,6 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial pre-release (minimal surface). See [0.2.0] for the full feature set.
 
+[0.3.0]: https://github.com/nil-is-lin/halfedge/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/nil-is-lin/halfedge/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/nil-is-lin/halfedge/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/nil-is-lin/halfedge/compare/v0.2.3...v0.2.4
@@ -132,4 +148,4 @@ Initial pre-release (minimal surface). See [0.2.0] for the full feature set.
 [0.2.2]: https://github.com/nil-is-lin/halfedge/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/nil-is-lin/halfedge/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nil-is-lin/halfedge/compare/v0.1.0...v0.2.0
-[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/nil-is-lin/halfedge/compare/v0.3.0...HEAD

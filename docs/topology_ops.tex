@@ -110,6 +110,7 @@
   \texttt{NoTwin(he)}                & 半边没有 twin \\
   \texttt{NoFace(he)}                & 两侧均无面 \\
   \texttt{DegenerateTriangle}        & $C = D$、offset 零向量或侧面退化 \\
+  \texttt{FlipCreatesNonManifoldEdge\{c, d\}} & 翻转后对角线两端已相连（产生重复边）\\
   \texttt{LinkConditionViolated\{a, b\}} & 公共邻居 $\neq \{C, D\}$ \\
   \texttt{CollapseOnBoundaryVertices\{a, b\}} & 折叠边两端点均为边界顶点 \\
   \texttt{Inconsistent(msg)}         & twin 不互指、next/prev 断裂、面含内部边等 \\
@@ -307,7 +308,9 @@ $\mathrm{twin}$ 从 $B \to A$ 变为 $C \to D$（$\mathrm{vertex} = D$）。
 
 \begin{itemize}
   \item $h.\mathrm{face}$ 与 $\mathrm{twin}.\mathrm{face}$ 均须为 $\mathrm{Some}$（内部边）；
-  \item $C \neq D$（防退化）。
+  \item $C \neq D$（防退化）；
+  \item $C$ 与 $D$ 不相连（否则翻转会产生重复边/非流形，返回
+        \texttt{FlipCreatesNonManifoldEdge}）。
 \end{itemize}
 
 数量不变：$\Delta V = \Delta F = \Delta E_{\mathrm{he}} = 0$。
@@ -1071,12 +1074,14 @@ $\text{vert\_map}[v] = v'$。
   \texttt{flip\_boundary\_edge\_fails}              & 边界边翻转返回错误 \\
   \texttt{flip\_then\_flip\_restores\_topology}     & 双翻恢复拓扑 \\
   \texttt{flip\_preserves\_boundary\_vertices}      & 翻转后四角仍为边界顶点 \\
+  \texttt{flip\_edge\_rejects\_when\_opposite\_vertices\_connected} & 四面体中 $(c,d)$ 已相连，翻转被拒绝 \\
   \midrule
   \multicolumn{2}{l}{\textit{collapse\_edge}} \\
   \texttt{collapse\_interior\_edge\_of\_closed\_fan} & 闭合扇形折叠：$-1V -2F -6$HE \\
   \texttt{collapse\_boundary\_edge\_fails}           & 边界边折叠返回错误 \\
   \texttt{collapse\_with\_violated\_link\_condition\_fails} & 5 顶点 4 面网格，公共邻居 3 个 \\
   \texttt{collapse\_with\_both\_boundary\_vertices\_fails} & 对角线两端点均为边界顶点，拒绝折叠 \\
+  \texttt{collapse\_interior\_edge\_with\_one\_boundary\_vertex} & 折叠「一个边界 + 一个内部」，边界环保持完整 \\
   \texttt{collapse\_link\_condition\_check\_function} & 直接测试 \texttt{check\_link\_condition} \\
   \texttt{collapse\_then\_remaining\_mesh\_valid}    & 折叠后 $K$ 为边界顶点，网格合法 \\
   \texttt{collapse\_edge\_uses\_midpoint\_position}  & \texttt{collapse\_edge} 新顶点 $= \frac{A+B}{2}$ \\

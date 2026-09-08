@@ -71,10 +71,11 @@ Modeling''（2004）。
   \toprule
   \textbf{类别} & \textbf{API} & \textbf{语义} \\
   \midrule
-  核心   & \texttt{isotropic\_remesh(mesh, target, iter, reproject)} & 完整 4 步迭代流水线 \\
-  快捷   & \texttt{quick\_remesh(mesh)}                              & 自动目标长度 + 3 次迭代 \\
-  快捷   & \texttt{remesh\_to\_length(mesh, L)}                      & 指定目标长度 + 5 次迭代 \\
-  统计   & \texttt{RemeshStats}                                      & 返回迭代次数 / 分裂数 / 折叠数 / 翻转数 / 目标长度 \\
+  核心   & \texttt{isotropic\_remesh(mesh, target, iter,} & 4 步迭代流水线 \\
+         & \texttt{\quad reproject, preserve\_boundary)}  &               \\
+  快捷   & \texttt{quick\_remesh(mesh)}                    & 自动目标长度 + 3 次迭代 \\
+  快捷   & \texttt{remesh\_to\_length(mesh, L)}            & 指定目标长度 + 5 次迭代 \\
+  统计   & \texttt{RemeshStats}                            & 迭代/分裂/折叠/翻转次数与目标长度 \\
   \bottomrule
 \end{tabular}
 \end{center}
@@ -104,7 +105,8 @@ Modeling''（2004）。
 
 阈值 $L_{\max} = \frac{4}{3} L$。遍历所有规范半边（twin 对中 ID 较小者），
 若 \texttt{edge\_length}$(h) > L_{\max}$，调用 \texttt{split\_edge}（在中点插入顶点）。
-涉及非流形端点的边\textbf{跳过}（见「非流形防护」）。
+涉及非流形端点的边\textbf{跳过}（见「非流形防护」）。边界边\textbf{跳过}：分裂边界边
+会在边界环上插入中点、增加边界顶点，改变边界拓扑（见「边界保持」）。
 
 \subsection{步骤 2：折叠短边 \texttt{collapse\_short\_edges}}
 
@@ -114,6 +116,7 @@ Modeling''（2004）。
 \]
 折叠目标位置 = 边中点（无 twin 的边界边折叠到 \texttt{tip} 当前位置），
 调用 \texttt{collapse\_edge\_at}（保留 QEM 接口的可定制位置）。
+涉及边界顶点的边\textbf{跳过}（见「边界保持」）。
 
 \paragraph{非流形防护}
 每轮迭代开始先扫描网格得到非流形顶点集合（判定依据：outgoing 环绕长度 $\neq$
@@ -121,6 +124,20 @@ Modeling''（2004）。
 对涉及非流形端点的边\textbf{统一跳过}，避免 \texttt{VertexRing} 只遍历一个扇区
 导致链接条件误判、残留悬空引用、破坏拓扑。\texttt{collapse} 阶段还会在每次折叠
 后重新校验合并出的新顶点，若其变为非流形则同步加入跳过集合。
+
+\paragraph{边界保持}
+参数 \texttt{preserve\_boundary}（默认 \texttt{true}）控制是否保持开放网格的边界不变：
+\texttt{split} 跳过边界边（\texttt{is\_boundary\_edge}），避免在边界环上插入中点；
+\texttt{collapse} 跳过任一端点为边界顶点的边（\texttt{edge\_touches\_boundary}），
+既覆盖边界边，也覆盖「一个边界 + 一个内部」的内部边——折叠后者会移动/合并边界顶点、
+破坏边界环。\texttt{flip} 本就要求两侧都有面（边界边不参与），\texttt{smooth} 本就
+跳过边界顶点，故无需额外处理。设为 \texttt{false} 时允许 split/collapse 修改边界
+（拓扑操作本身会维护边界环的 \texttt{next/prev} 链，见 \texttt{split\_edge} 文档）。
+
+\paragraph{表面投影（reproject）}
+当 \texttt{reproject = true} 时，迭代前快照原始表面为三角形列表；每轮平滑后，
+对每个顶点求其到原始表面的最近点（点到三角面最近点，暴力 $O(VF)$）并投影回该点，
+避免切向平滑导致体积收缩/形状漂移。
 
 \subsection{步骤 3：翻转均衡度数 \texttt{flip\_for\_valence}}
 
@@ -262,6 +279,9 @@ $\vec{t}$ 是位移在切平面的投影，保证顶点沿曲面滑动而非偏�
   \texttt{isotropic\_remesh\_negative\_target\_length\_returns\_early} & \texttt{target=-1} 早退：同上 \\
   \texttt{compute\_target\_length\_empty\_mesh\_returns\_zero} & 空网格目标长度 $= 0$（无半边） \\
   \texttt{remesh\_on\_open\_grid\_does\_not\_panic} & \texttt{build\_grid} 开放网格重网格化不 panic，校验通过 \\
+  \texttt{remesh\_preserves\_boundary\_vertices\_on\_open\_grid} & 开放网格 split/collapse 均不改动边界顶点集合 \\
+  \texttt{remesh\_preserve\_boundary\_false\_allows\_boundary\_split} & \texttt{preserve\_boundary=false} 允许分裂边界边 \\
+  \texttt{remesh\_reproject\_keeps\_vertices\_on\_unit\_sphere} & \texttt{reproject=true} 顶点投影回单位球面（半径 $\approx 1$）\\
   \texttt{target\_valence\_boundary\_is\_4}   & 开放网格边界顶点目标度数 $= 4$，内部 $= 6$ \\
   \texttt{tangential\_smooth\_on\_isolated\_vertex\_is\_noop} & 孤立顶点切向平滑不 panic，位置不变 \\
   \texttt{isotropic\_remesh\_zero\_iterations\_is\_noop} & \texttt{iter=0} 所有计数为 0 \\

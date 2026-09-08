@@ -508,6 +508,11 @@ pub fn flip_edge(mesh: &mut MeshStorage, he: HalfEdgeId) -> Result<(), TopologyE
         return Err(TopologyError::DegenerateTriangle);
     }
 
+    // 翻转会把对角线 (a,b) 换成 (c,d)。若 (c,d) 已相连，翻转会产生重复边 → 非流形
+    if VertexAdjacentVerts::new(mesh, c).any(|n| n == d) {
+        return Err(TopologyError::FlipCreatesNonManifoldEdge { c, d });
+    }
+
     // ---------- 2. 翻转 h / twin ----------
 
     // h: A→B → D→C (vertex=C)

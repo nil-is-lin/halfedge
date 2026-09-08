@@ -14,9 +14,12 @@
 
 use crate::geometry::{edge_length, vertex_normal};
 use crate::ids::{HalfEdgeId, VertexId};
+use crate::linalg::vec3::{add, dot, scale, sub};
 use crate::storage::MeshStorage;
 use crate::topology_ops::{collapse_edge_at, flip_edge, split_edge};
-use crate::traversal::{FaceHalfEdges, VertexAdjacentVerts, VertexRing, is_boundary_vertex};
+use crate::traversal::{
+    FaceHalfEdges, VertexAdjacentVerts, VertexRing, is_boundary_edge, is_boundary_vertex,
+};
 
 use std::collections::{HashMap, HashSet};
 
@@ -79,6 +82,117 @@ fn compute_tangential_smooth(mesh: &MeshStorage, v: VertexId) -> Option<[f64; 3]
 }
 
 // ============================================================
+// 表面投影（reproject）
+// ============================================================
+
+/// 点到三角面 `(a, b, c)` 的最近点（Ericson 的 barycentric 区域法）。
+fn closest_point_on_triangle(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+
+    let bp = sub(p, b);
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let denom = d1 - d3;
+        if denom <= 1e-12 {
+            return a;
+        }
+        return add(a, scale(ab, d1 / denom));
+    }
+
+    let cp = sub(p, c);
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let denom = d2 - d6;
+        if denom <= 1e-12 {
+            return a;
+        }
+        return add(a, scale(ac, d2 / denom));
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let denom = (d4 - d3) + (d5 - d6);
+        if denom <= 1e-12 {
+            return b;
+        }
+        return add(b, scale(sub(c, b), (d4 - d3) / denom));
+    }
+
+    let denom = va + vb + vc;
+    if denom <= 1e-12 {
+        return a; // 退化三角形
+    }
+    let v = vb / denom;
+    let w = vc / denom;
+    add(a, add(scale(ab, v), scale(ac, w)))
+}
+
+/// 快照原始表面为三角形列表（reproject 投影目标）。
+fn snapshot_surface(mesh: &MeshStorage) -> Vec<[[f64; 3]; 3]> {
+    mesh.face_ids()
+        .filter_map(|f| {
+            let hes: Vec<HalfEdgeId> = FaceHalfEdges::new(mesh, f).collect();
+            if hes.len() != 3 {
+                return None;
+            }
+            let pos = |he: HalfEdgeId| {
+                mesh.get_halfedge(he)
+                    .and_then(|h| mesh.get_vertex(h.vertex))
+                    .map(|v| v.position)
+            };
+            Some([pos(hes[0])?, pos(hes[1])?, pos(hes[2])?])
+        })
+        .collect()
+}
+
+/// 将顶点投影到原始表面最近三角面。
+fn project_to_surface(pos: [f64; 3], surface: &[[[f64; 3]; 3]]) -> [f64; 3] {
+    let mut best = pos;
+    let mut best_d2 = f64::INFINITY;
+    for tri in surface {
+        let q = closest_point_on_triangle(pos, tri[0], tri[1], tri[2]);
+        let d = sub(q, pos);
+        let d2 = dot(d, d);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best = q;
+        }
+    }
+    best
+}
+
+/// 将所有顶点投影回原始表面。
+fn reproject_to_surface(mesh: &mut MeshStorage, surface: &[[[f64; 3]; 3]]) {
+    let verts: Vec<VertexId> = mesh.vertex_ids().collect();
+    for v in verts {
+        if let Some(p) = mesh.get_vertex(v).map(|vt| vt.position) {
+            let q = project_to_surface(p, surface);
+            mesh.set_position(v, q);
+        }
+    }
+}
+
+// ============================================================
 // 主接口
 // ============================================================
 
@@ -103,7 +217,9 @@ pub struct RemeshStats {
 /// 若 `target_length` 为 `None`，则使用当前网格边长的中位数作为目标。
 ///
 /// `iterations`：split/collapse/flip/smooth 循环的执行次数（建议 3-10）。
-/// `reproject`：若为 `true`，每轮平滑后将顶点投影回原始表面（保形）。
+/// `reproject`：若为 `true`，每轮平滑后将顶点投影回原始表面最近点（保形）。
+/// `preserve_boundary`：若为 `true`，split 跳过边界边、collapse 跳过涉及边界顶点的边，
+/// 保持开放网格的边界不变。
 ///
 /// 返回操作统计信息。
 pub fn isotropic_remesh(
@@ -111,6 +227,7 @@ pub fn isotropic_remesh(
     target_length: Option<f64>,
     iterations: usize,
     reproject: bool,
+    preserve_boundary: bool,
 ) -> RemeshStats {
     let target_len = target_length.unwrap_or_else(|| compute_target_length(mesh));
     if target_len <= 0.0 {
@@ -124,6 +241,13 @@ pub fn isotropic_remesh(
     let min_len = target_len * 0.8; // 4/5
     let max_len = target_len * 1.333; // 4/3
 
+    // reproject 目标表面在迭代前快照（独立于后续拓扑变化）
+    let surface = if reproject {
+        Some(snapshot_surface(mesh))
+    } else {
+        None
+    };
+
     let mut stats = RemeshStats {
         iterations,
         target_length: target_len,
@@ -136,11 +260,11 @@ pub fn isotropic_remesh(
         let nonmanifold = nonmanifold_vertices(mesh);
 
         // 1. Split long edges
-        let split_count = split_long_edges(mesh, max_len, &nonmanifold);
+        let split_count = split_long_edges(mesh, max_len, &nonmanifold, preserve_boundary);
         stats.splits += split_count;
 
         // 2. Collapse short edges
-        let collapse_count = collapse_short_edges(mesh, min_len, &nonmanifold);
+        let collapse_count = collapse_short_edges(mesh, min_len, &nonmanifold, preserve_boundary);
         stats.collapses += collapse_count;
 
         // 3. Flip to improve valence
@@ -151,9 +275,8 @@ pub fn isotropic_remesh(
         smooth_vertices(mesh);
 
         // 5. Reproject（可选的保形投影）
-        if reproject {
-            // reproject 需要原始表面作为参考，这里暂用简单实现：
-            // 不再额外操作（切向平滑本身已保形较好）
+        if let Some(surf) = &surface {
+            reproject_to_surface(mesh, surf);
         }
     }
 
@@ -249,6 +372,20 @@ fn edge_touches_nonmanifold(
         .unwrap_or(false)
 }
 
+/// 判断一条边的任一端点是否为边界顶点。
+fn edge_touches_boundary(mesh: &MeshStorage, he: HalfEdgeId) -> bool {
+    let Some(h) = mesh.get_halfedge(he) else {
+        return false;
+    };
+    if is_boundary_vertex(mesh, h.vertex) {
+        return true;
+    }
+    h.twin
+        .and_then(|t| mesh.get_halfedge(t))
+        .map(|t| is_boundary_vertex(mesh, t.vertex))
+        .unwrap_or(false)
+}
+
 /// 判断两个顶点之间是否已存在一条边（O(degree)）。
 fn are_vertices_connected(mesh: &MeshStorage, a: VertexId, b: VertexId) -> bool {
     VertexAdjacentVerts::new(mesh, a).any(|n| n == b)
@@ -259,6 +396,7 @@ fn split_long_edges(
     mesh: &mut MeshStorage,
     max_len: f64,
     nonmanifold: &HashSet<VertexId>,
+    preserve_boundary: bool,
 ) -> usize {
     let mut count = 0;
     // 收集需要分裂的边（twin 对只取一个代表）
@@ -273,6 +411,10 @@ fn split_long_edges(
             if let Some(twin) = h.twin
                 && he > twin
             {
+                return false;
+            }
+            // 跳过边界边：分裂边界边会在边界环上插入中点，改变边界拓扑
+            if preserve_boundary && is_boundary_edge(mesh, he) {
                 return false;
             }
             // 跳过涉及非流形端点的边，避免在非流形区域分裂破坏拓扑
@@ -302,6 +444,7 @@ fn collapse_short_edges(
     mesh: &mut MeshStorage,
     min_len: f64,
     nonmanifold: &HashSet<VertexId>,
+    preserve_boundary: bool,
 ) -> usize {
     let mut count = 0;
     // 用可变的本地副本：折叠过程中若合并出新的非流形顶点，也一并加入跳过集合。
@@ -317,6 +460,11 @@ fn collapse_short_edges(
             if let Some(twin) = h.twin
                 && he > twin
             {
+                return false;
+            }
+            // 跳过涉及边界顶点的边：折叠会移动/合并边界顶点，破坏边界环
+            // （覆盖边界边，以及「一个边界 + 一个内部」的内部边）
+            if preserve_boundary && edge_touches_boundary(mesh, he) {
                 return false;
             }
             edge_length(mesh, he).is_some_and(|l| l < min_len && l > 1e-10)
@@ -511,12 +659,12 @@ fn smooth_vertices(mesh: &mut MeshStorage) {
 
 /// 快速重网格化：使用中位数作为目标边长，3 次迭代。
 pub fn quick_remesh(mesh: &mut MeshStorage) -> RemeshStats {
-    isotropic_remesh(mesh, None, 3, false)
+    isotropic_remesh(mesh, None, 3, false, true)
 }
 
 /// 均匀重网格化到指定边长。
 pub fn remesh_to_length(mesh: &mut MeshStorage, target_length: f64) -> RemeshStats {
-    isotropic_remesh(mesh, Some(target_length), 5, false)
+    isotropic_remesh(mesh, Some(target_length), 5, false, true)
 }
 
 // ============================================================
@@ -586,7 +734,7 @@ mod tests {
     #[test]
     fn isotropic_remesh_zero_target_length_returns_early() {
         let mut mesh = crate::test_util::build_icosphere(1);
-        let stats = isotropic_remesh(&mut mesh, Some(0.0), 5, false);
+        let stats = isotropic_remesh(&mut mesh, Some(0.0), 5, false, true);
         // 早退时 iterations 报告请求值，splits/collapses/flips 均为 0
         assert_eq!(stats.iterations, 5);
         assert_eq!(stats.splits, 0);
@@ -597,7 +745,7 @@ mod tests {
     #[test]
     fn isotropic_remesh_negative_target_length_returns_early() {
         let mut mesh = crate::test_util::build_icosphere(1);
-        let stats = isotropic_remesh(&mut mesh, Some(-1.0), 5, false);
+        let stats = isotropic_remesh(&mut mesh, Some(-1.0), 5, false, true);
         assert_eq!(stats.iterations, 5);
         assert_eq!(stats.splits, 0);
         assert_eq!(stats.collapses, 0);
@@ -613,8 +761,73 @@ mod tests {
     #[test]
     fn remesh_on_open_grid_does_not_panic() {
         let mut mesh = crate::primitives::build_grid(2.0, 2.0, 3, 3);
-        let _stats = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
+        let _stats = isotropic_remesh(&mut mesh, Some(0.5), 3, false, true);
         validate_mesh(&mesh).unwrap();
+    }
+
+    #[test]
+    fn remesh_preserves_boundary_vertices_on_open_grid() {
+        // split 阶段：目标长度远小于边长，边界边若被分裂会新增边界顶点
+        let mut mesh = crate::primitives::build_grid(2.0, 2.0, 3, 3);
+        let before: HashSet<VertexId> = mesh
+            .vertex_ids()
+            .filter(|&v| is_boundary_vertex(&mesh, v))
+            .collect();
+        let _stats = isotropic_remesh(&mut mesh, Some(0.3), 3, false, true);
+        crate::validate::check_topology(&mesh).unwrap();
+        let after: HashSet<VertexId> = mesh
+            .vertex_ids()
+            .filter(|&v| is_boundary_vertex(&mesh, v))
+            .collect();
+        assert_eq!(after, before, "split 不应改变边界顶点集合");
+
+        // collapse 阶段：目标长度远大于边长，边界边若被折叠会破坏边界环
+        let mut mesh = crate::primitives::build_grid(2.0, 2.0, 3, 3);
+        let before: HashSet<VertexId> = mesh
+            .vertex_ids()
+            .filter(|&v| is_boundary_vertex(&mesh, v))
+            .collect();
+        isotropic_remesh(&mut mesh, Some(3.0), 3, false, true);
+        crate::validate::check_topology(&mesh).unwrap();
+        let after: HashSet<VertexId> = mesh
+            .vertex_ids()
+            .filter(|&v| is_boundary_vertex(&mesh, v))
+            .collect();
+        assert_eq!(after, before, "collapse 不应改变边界顶点集合");
+    }
+
+    #[test]
+    fn remesh_preserve_boundary_false_allows_boundary_split() {
+        // preserve_boundary=false 时，split 允许分裂边界边，边界顶点集合应改变。
+        let mut mesh = crate::primitives::build_grid(2.0, 2.0, 3, 3);
+        let before: HashSet<VertexId> = mesh
+            .vertex_ids()
+            .filter(|&v| is_boundary_vertex(&mesh, v))
+            .collect();
+        isotropic_remesh(&mut mesh, Some(0.3), 1, false, false);
+        crate::validate::check_topology(&mesh).unwrap();
+        let after: HashSet<VertexId> = mesh
+            .vertex_ids()
+            .filter(|&v| is_boundary_vertex(&mesh, v))
+            .collect();
+        assert_ne!(after, before, "preserve_boundary=false 应允许分裂边界边");
+    }
+
+    #[test]
+    fn remesh_reproject_keeps_vertices_on_unit_sphere() {
+        // reproject=true 时，顶点应被投影回原始单位球面（半径 ≈ 1）。
+        let mut mesh = crate::test_util::build_icosphere(2);
+        let _stats = isotropic_remesh(&mut mesh, None, 3, true, true);
+        crate::validate::check_topology(&mesh).unwrap();
+        for v in mesh.vertex_ids() {
+            let p = mesh.get_vertex(v).unwrap().position;
+            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!(
+                (r - 1.0).abs() < 0.15,
+                "顶点应投影回单位球面，实际半径 {}",
+                r
+            );
+        }
     }
 
     #[test]
@@ -648,7 +861,7 @@ mod tests {
     #[test]
     fn isotropic_remesh_zero_iterations_is_noop() {
         let mut mesh = crate::test_util::build_icosphere(1);
-        let stats = isotropic_remesh(&mut mesh, None, 0, false);
+        let stats = isotropic_remesh(&mut mesh, None, 0, false, true);
         assert_eq!(stats.iterations, 0);
         assert_eq!(stats.splits, 0);
         assert_eq!(stats.collapses, 0);
@@ -709,7 +922,7 @@ mod tests {
         ];
         let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
         // target=1.5 只折叠长度为 1 的边；涉及 pinch 顶点的边应被跳过
-        let _ = isotropic_remesh(&mut mesh, Some(1.5), 3, false);
+        let _ = isotropic_remesh(&mut mesh, Some(1.5), 3, false, true);
         // 折叠后不应引入新的非流形边或悬空引用
         check_topology(&mesh).unwrap();
     }
@@ -738,7 +951,7 @@ mod tests {
         ];
         let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
         // target=0.5 会触发 split + collapse + flip，均应跳过非流形顶点
-        let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
+        let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false, true);
         check_topology(&mesh).unwrap();
     }
 

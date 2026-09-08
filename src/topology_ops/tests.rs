@@ -112,8 +112,8 @@ fn build_two_triangles() -> (MeshStorage, [VertexId; 4], [HalfEdgeId; 10], FaceI
     }
     mesh.get_vertex_mut(v0).unwrap().halfedge = Some(h0);
     mesh.get_vertex_mut(v1).unwrap().halfedge = Some(g0);
-    mesh.get_vertex_mut(v2).unwrap().halfedge = Some(h1);
-    mesh.get_vertex_mut(v3).unwrap().halfedge = Some(g1);
+    mesh.get_vertex_mut(v2).unwrap().halfedge = Some(h2);
+    mesh.get_vertex_mut(v3).unwrap().halfedge = Some(g2);
     mesh.get_face_mut(f1).unwrap().halfedge = Some(h0);
     mesh.get_face_mut(f2).unwrap().halfedge = Some(g0);
 
@@ -322,7 +322,84 @@ fn split_boundary_edge_maintains_boundary_loop() {
     crate::validate::check_topology(&mesh).expect("分裂后边界环应保持完整");
 }
 
+#[test]
+fn collapse_interior_edge_with_one_boundary_vertex() {
+    // 扇形网格：中心顶点 B 内部，四周 A/C/D/E 边界。辐条 A-B 是
+    // 「一个边界 + 一个内部」的内部边，折叠后边界环应保持完整。
+    let verts = vec![
+        [0.0, 0.0, 0.0], // 0 = A（边界）
+        [0.5, 0.5, 0.0], // 1 = B（内部）
+        [1.0, 0.0, 0.0], // 2 = C（边界）
+        [1.0, 1.0, 0.0], // 3 = D（边界）
+        [0.0, 1.0, 0.0], // 4 = E（边界）
+    ];
+    let faces = vec![[0u32, 1, 2], [2, 1, 3], [3, 1, 4], [4, 1, 0]];
+    let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+    // 找辐条 A-B（内部边，一端 A 边界、一端 B 内部）
+    let he = mesh
+        .halfedge_ids()
+        .find(|&h| {
+            let hh = mesh.get_halfedge(h).unwrap();
+            let interior = hh.face.is_some()
+                && hh
+                    .twin
+                    .and_then(|t| mesh.get_halfedge(t))
+                    .map(|t| t.face.is_some())
+                    .unwrap_or(false);
+            if !interior {
+                return false;
+            }
+            let tip = hh.vertex;
+            let Some(origin) = hh.twin.and_then(|t| mesh.get_halfedge(t)).map(|t| t.vertex) else {
+                return false;
+            };
+            (is_boundary_vertex(&mesh, tip) && !is_boundary_vertex(&mesh, origin))
+                || (!is_boundary_vertex(&mesh, tip) && is_boundary_vertex(&mesh, origin))
+        })
+        .expect("辐条 A-B 应存在");
+
+    collapse_edge(&mut mesh, he).expect("折叠一个边界 + 一个内部应成功");
+
+    crate::validate::check_topology(&mesh).expect("折叠后边界环应保持完整");
+}
+
 // ---------- flip_edge 测试 ----------
+
+#[test]
+fn flip_edge_rejects_when_opposite_vertices_connected() {
+    // 四面体：任意内部边 (a,b) 的对边 (c,d) 已相连（K4 完全图），翻转会产生重复边。
+    let verts = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    let faces = vec![[0u32, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
+    let mut mesh = crate::build_mesh_from_vertices_and_faces(&verts, &faces).unwrap();
+
+    let he = mesh
+        .halfedge_ids()
+        .find(|&h| {
+            let hh = mesh.get_halfedge(h).unwrap();
+            hh.face.is_some()
+                && hh
+                    .twin
+                    .and_then(|t| mesh.get_halfedge(t))
+                    .map(|t| t.face.is_some())
+                    .unwrap_or(false)
+        })
+        .expect("内部边应存在");
+
+    let err = flip_edge(&mut mesh, he).unwrap_err();
+    assert!(
+        matches!(err, TopologyError::FlipCreatesNonManifoldEdge { .. }),
+        "应返回 FlipCreatesNonManifoldEdge，实际 {:?}",
+        err
+    );
+    // 网格未被修改
+    assert!(validate_mesh(&mesh).is_ok());
+}
 
 #[test]
 fn flip_interior_edge_of_two_triangles() {

@@ -158,7 +158,7 @@ fn regression_remesh_on_empty_mesh_no_panic() {
 fn regression_remesh_on_cube_preserves_topology() {
     use halfedge::isotropic_remesh;
     let mut mesh = build_cube(1.0);
-    let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false);
+    let _ = isotropic_remesh(&mut mesh, Some(0.5), 3, false, true);
     assert!(
         validate_topology(&mesh).is_empty(),
         "remesh 后拓扑应保持有效"

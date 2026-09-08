@@ -23,6 +23,8 @@ pub enum TopologyError {
     NoFace(HalfEdgeId),
     /// 操作会产生退化三角形（三个顶点共线或重合）。
     DegenerateTriangle,
+    /// 翻转会使对角线两端（c、d）已相连，从而产生重复边/非流形。
+    FlipCreatesNonManifoldEdge { c: VertexId, d: VertexId },
     /// 链接条件不满足，折叠会产生非流形。
     LinkConditionViolated { a: VertexId, b: VertexId },
     /// 折叠边的两个端点均为边界顶点（会破坏边界拓扑）。
@@ -40,6 +42,9 @@ impl fmt::Display for TopologyError {
             Self::NoTwin(h) => write!(f, "半边 {:?} 没有 twin", h),
             Self::NoFace(h) => write!(f, "半边 {:?} 两侧均无面", h),
             Self::DegenerateTriangle => write!(f, "操作会产生退化三角形"),
+            Self::FlipCreatesNonManifoldEdge { c, d } => {
+                write!(f, "禁止翻转：{:?} 与 {:?} 已相连，翻转会产生非流形边", c, d)
+            }
             Self::LinkConditionViolated { a, b } => {
                 write!(f, "链接条件不满足：折叠 {:?}-{:?} 会产生非流形", a, b)
             }

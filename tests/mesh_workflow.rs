@@ -77,7 +77,7 @@ fn workflow_topology_operations_chain() {
     }
 
     // remesh 后校验
-    let _stats = isotropic_remesh(&mut mesh, None, 2, false);
+    let _stats = isotropic_remesh(&mut mesh, None, 2, false, true);
     assert!(validate_mesh(&mesh).is_ok());
     assert!(is_closed(&mesh));
 }
